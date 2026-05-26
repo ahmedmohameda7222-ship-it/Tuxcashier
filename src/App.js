@@ -8078,8 +8078,7 @@ const endedStr   = m.endedAt   ? fmtDateTime(m.endedAt)   : "—";
   const btnBorder = "#ccc";
   const isDesktopWidth = typeof window !== "undefined" && window.innerWidth >= 1024;
   const containerStyle = {
-    width: isDesktopWidth ? "100%" : "auto",
-    maxWidth: isDesktopWidth ? "none" : 1024,
+    maxWidth: isDesktopWidth ? "100%" : 1024,
     margin: isDesktopWidth ? "0" : "0 auto",
     padding: 16,
     background: dark ? "#121212" : "white",
