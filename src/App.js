@@ -1,31 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
-import { initializeApp, getApps, getApp } from "firebase/app";
-import { getAuth, onAuthStateChanged, signInAnonymously } from "firebase/auth";
-import {
-  getFirestore,
-  serverTimestamp,
-  Timestamp,
-  collection,
-  addDoc,
-  updateDoc,
-  getDoc,
-  setDoc,
-  getDocs,
-  onSnapshot,
-  query,
-  orderBy,
-  where,
-  doc as fsDoc,
-  writeBatch,
-  runTransaction, // <-- atomic counter
-} from "firebase/firestore";
+import { supabase } from "./supabaseClient";
 
 export const toIso = (v) => {
   if (!v) return null;
   if (v instanceof Date) return v.toISOString();
-  if (v instanceof Timestamp) return v.toDate().toISOString();
+  if (v && typeof v.toDate === "function") return v.toDate().toISOString();
   const d = new Date(v);
   return isNaN(d) ? null : d.toISOString();
 };
@@ -33,13 +14,12 @@ export const toIso = (v) => {
 function toMillis(value) {
   if (!value) return undefined;
   if (value instanceof Date) return value.getTime();
-  if (value instanceof Timestamp) return value.toMillis();
+  if (value && typeof value.toMillis === "function") return value.toMillis();
   const parsed = new Date(value);
   return Number.isNaN(+parsed) ? undefined : parsed.getTime();
 }
 
-const FIRESTORE_SENTINEL_KEY = "_methodName";
-export function sanitizeForFirestore(value) {
+export function sanitizeForSupabase(value) {
   if (value === undefined) return undefined;
   if (value === null) return null;
   if (typeof value === "number") {
@@ -48,17 +28,15 @@ export function sanitizeForFirestore(value) {
   }
   if (Array.isArray(value)) {
     const cleaned = value
-      .map((item) => sanitizeForFirestore(item))
+      .map((item) => sanitizeForSupabase(item))
       .filter((item) => item !== undefined);
     return cleaned;
   }
   if (value instanceof Date) return value.toISOString();
-  if (value instanceof Timestamp) return value;
   if (typeof value === "object") {
-    if (value && typeof value[FIRESTORE_SENTINEL_KEY] === "string") return value;
     const out = {};
     for (const [key, inner] of Object.entries(value || {})) {
-      const cleaned = sanitizeForFirestore(inner);
+      const cleaned = sanitizeForSupabase(inner);
       if (cleaned !== undefined) out[key] = cleaned;
     }
     return out;
@@ -443,27 +421,6 @@ function summarizePaymentParts(parts = [], fallbackMethod = "Online") {
   }
   return normalizePaymentMethodName(fallbackMethod) || fallbackMethod || "Online";
 }
-const firebaseConfig = {
-  apiKey: process.env.REACT_APP_CASHIER_FIREBASE_API_KEY,
-  authDomain: process.env.REACT_APP_CASHIER_FIREBASE_AUTH_DOMAIN,
-  projectId: process.env.REACT_APP_CASHIER_FIREBASE_PROJECT_ID,
-  storageBucket: process.env.REACT_APP_CASHIER_FIREBASE_STORAGE_BUCKET,
-  messagingSenderId: process.env.REACT_APP_CASHIER_FIREBASE_MESSAGING_SENDER_ID,
-  appId: process.env.REACT_APP_CASHIER_FIREBASE_APP_ID,
-};
-
-const onlineFirebaseConfig = {
-  apiKey: process.env.REACT_APP_MENU_FIREBASE_API_KEY,
-  authDomain: process.env.REACT_APP_MENU_FIREBASE_AUTH_DOMAIN,
-  projectId: process.env.REACT_APP_MENU_FIREBASE_PROJECT_ID,
-  storageBucket: process.env.REACT_APP_MENU_FIREBASE_STORAGE_BUCKET,
-  messagingSenderId: process.env.REACT_APP_MENU_FIREBASE_MESSAGING_SENDER_ID,
-  appId: process.env.REACT_APP_MENU_FIREBASE_APP_ID,
-  measurementId: process.env.REACT_APP_MENU_FIREBASE_MEASUREMENT_ID,
-};
-
-const ONLINE_FIREBASE_APP_NAME = process.env.REACT_APP_ONLINE_FIREBASE_APP_NAME;
-
 // For EmailJS
 const EMAILJS_SERVICE_ID = process.env.REACT_APP_EMAILJS_SERVICE_ID;
 const EMAILJS_TEMPLATE_ID = process.env.REACT_APP_EMAILJS_TEMPLATE_ID;
@@ -525,40 +482,10 @@ async function sendEmailJsEmail(templateParams = {}) {
   }
 }
 
-function ensureFirebase() {
-  const theApp = getApps().length ? getApp() : initializeApp(firebaseConfig);
-  const auth = getAuth(theApp);
-  const db = getFirestore(theApp);
-  return { auth, db };
-}
-
-function ensureOnlineFirebase() {
-  if (!onlineFirebaseConfig?.projectId) return null;
-  try {
-    return getApp(ONLINE_FIREBASE_APP_NAME);
-  } catch (err) {
-    try {
-      return initializeApp(onlineFirebaseConfig, ONLINE_FIREBASE_APP_NAME);
-    } catch (initErr) {
-      console.error("Failed to initialize online orders Firebase app", initErr);
-      return null;
-    }
-  }
-}
-function getOnlineServices() {
-  const app = ensureOnlineFirebase();
-  if (!app) return { onlineAuth: null, onlineDb: null };
-  return {
-    onlineAuth: getAuth(app),
-    onlineDb: getFirestore(app),
-  };
-}
-
-
 const SHOP_ID = "tux";
-// In your React POS app code (App.js)
-
+const POS_STATE_ID = "pos";
 const ONLINE_ORDER_COLLECTIONS = [];
+
 const LS_KEY = "tux_pos_local_state_v1";
 function loadLocal() {
 
@@ -717,48 +644,7 @@ function SundayWeekPicker({ selectedSunday, onSelect, dark = false, btnBorder = 
     const base = selectedStart || new Date();
     return new Date(base.getFullYear(), base.getMonth(), 1);
   });
-const [onlineFbUser, setOnlineFbUser] = useState(null);
 
-useEffect(() => {
-  const { onlineAuth } = getOnlineServices();
-  if (!onlineAuth) return;
-
-  // Keep session observed
-  const unsub = onAuthStateChanged(onlineAuth, (u) => {
-    setOnlineFbUser(u || null);
-    if (u) console.log("✅ tux-menu anonymous user:", u.uid);
-  });
-
-  // Ensure we are signed in anonymously
-  signInAnonymously(onlineAuth).catch((err) => {
-    console.error("❌ Anonymous sign-in to tux-menu failed:", err);
-  });
-
-  return () => unsub();
-}, []);
-function getDbForSource(source) {
-  if (source === "menu") {
-    const { onlineDb } = getOnlineServices();
-    return onlineDb;        // tux-menu Firestore
-  }
-  const { db } = ensureFirebase();
-  return db;                // primary POS Firestore
-}
-
-// Example when wiring listeners:
-ONLINE_ORDER_COLLECTIONS.forEach((def) => {
-  const dbForThis = getDbForSource(def.source);
-  if (!dbForThis) return;
-
-  // (Optional) gate menu listeners until anonymous auth is ready
-  if (def.source === "menu" && !onlineFbUser) return;
-
-  const colRef = collection(dbForThis, ...def.path);
-  const q = query(colRef, orderBy("createdAt", "desc"));
-  onSnapshot(q, (snap) => {
-    // merge/dedupe as you already do
-  });
-});
 
   useEffect(() => {
     if (!selectedStart) return;
@@ -1269,7 +1155,7 @@ export function packStateForCloud(state) {
     })),
     realtimeOrders: typeof realtimeOrders === "boolean" ? realtimeOrders : undefined,
     version: 1,
-    updatedAt: serverTimestamp(),
+    updatedAt: new Date().toISOString(),
     menu,
     extras: extraList,
     orders: (orders || []).map((o) => ({
@@ -1381,7 +1267,7 @@ export function packStateForCloud(state) {
     reportDay: typeof reportDay === "string" ? reportDay : undefined,
     reportMonth: typeof reportMonth === "string" ? reportMonth : undefined,
   };
-  return sanitizeForFirestore(payload);
+  return sanitizeForSupabase(payload);
 }
 
 function computeCostBreakdown(def, invMap, ctx = {}) {
@@ -1608,87 +1494,90 @@ if (Array.isArray(data.workerSessions)) {
   return out;
 }
 
-function normalizeOrderForCloud(order) {
+function normalizeOrderForSupabase(order) {
   const normalized = enrichOrderWithChannel(order);
-  return sanitizeForFirestore({
-    orderNo: normalized.orderNo,
+  return sanitizeForSupabase({
+    shop_id: SHOP_ID,
+    order_no: normalized.orderNo,
     worker: normalized.worker,
     payment: normalized.payment,
-    paymentParts: Array.isArray(normalized.paymentParts)
+    payment_parts: Array.isArray(normalized.paymentParts)
       ? normalized.paymentParts.map((p) => ({ method: p.method, amount: Number(p.amount || 0) }))
       : [],
-    orderType: normalized.orderType,
-    deliveryFee: normalized.deliveryFee,
-   deliveryName: normalized.deliveryName || "",
-    deliveryPhone: normalized.deliveryPhone || "",
-    deliveryEmail: normalized.deliveryEmail || "",
-    deliveryAddress: normalized.deliveryAddress || "",
-    deliveryZoneId: normalized.deliveryZoneId || "",
-    deliveryZoneName: normalized.deliveryZoneName || "",
-    notifyViaWhatsapp: !!normalized.notifyViaWhatsapp,
-    whatsappSentAt: toIso(normalized.whatsappSentAt),
+    order_type: normalized.orderType,
+    delivery_fee: normalized.deliveryFee,
+   delivery_name: normalized.deliveryName || "",
+    delivery_phone: normalized.deliveryPhone || "",
+    delivery_email: normalized.deliveryEmail || "",
+    delivery_address: normalized.deliveryAddress || "",
+    delivery_zone_id: normalized.deliveryZoneId || "",
+    delivery_zone_name: normalized.deliveryZoneName || "",
+    notify_via_whatsapp: !!normalized.notifyViaWhatsapp,
+    whatsapp_sent_at: toIso(normalized.whatsappSentAt),
     total: normalized.total,
-    itemsTotal: normalized.itemsTotal,
-    cashReceived: normalized.cashReceived ?? null,
-    changeDue: normalized.changeDue ?? null,
+    items_total: normalized.itemsTotal,
+    cash_received: normalized.cashReceived ?? null,
+    change_due: normalized.changeDue ?? null,
     done: !!normalized.done,
     voided: !!normalized.voided,
-    voidReason: normalized.voidReason || "",
+    void_reason: normalized.voidReason || "",
     note: normalized.note || "",
     date: toIso(normalized.date) || new Date().toISOString(),
-    restockedAt: toIso(normalized.restockedAt),
+    restocked_at: toIso(normalized.restockedAt),
     cart: normalized.cart || [],
-    idemKey: normalized.idemKey || "",
+    idem_key: normalized.idemKey || "",
     source: normalized.source || "",
-    onlineOrderId: normalized.onlineOrderId || "",
-    onlineOrderKey: normalized.onlineOrderKey || "",
-    onlineSourceCollection: normalized.onlineSourceCollection || "",
-    onlineSourceDocId: normalized.onlineSourceDocId || "",
+    online_order_id: normalized.onlineOrderId || "",
+    online_order_key: normalized.onlineOrderKey || "",
+    online_source_collection: normalized.onlineSourceCollection || "",
+    online_source_doc_id: normalized.onlineSourceDocId || "",
     channel: normalized.channel || "",
-    channelOrderNo: normalized.channelOrderNo || "",
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
+    channel_order_no: normalized.channelOrderNo || "",
+    created_at: toIso(normalized.createdAt) || new Date().toISOString(),
+    updated_at: new Date().toISOString(),
   });
 }
-function orderFromCloudDoc(id, d) {
+function orderFromSupabaseRow(row = {}) {
   const asDate = (v) =>
-    v instanceof Timestamp ? v.toDate() : v ? new Date(v) : new Date();
+    v && typeof v.toDate === "function" ? v.toDate() : v ? new Date(v) : new Date();
   const order = {
-    cloudId: id,
+    cloudId: row.id,
 
-    orderNo: d.orderNo,
-    worker: d.worker,
-    payment: d.payment,
-    paymentParts: Array.isArray(d.paymentParts)
-      ? d.paymentParts.map((p) => ({ method: p.method, amount: Number(p.amount || 0) }))
+    orderNo: row.order_no,
+    worker: row.worker,
+    payment: row.payment,
+    paymentParts: Array.isArray(row.payment_parts)
+      ? row.payment_parts.map((p) => ({ method: p.method, amount: Number(p.amount || 0) }))
       : [],
-    orderType: d.orderType,
-    deliveryFee: Number(d.deliveryFee || 0),
-      deliveryName: d.deliveryName || "",
-    deliveryPhone: d.deliveryPhone || "",
-    deliveryEmail: d.deliveryEmail || "",
-    deliveryAddress: d.deliveryAddress || "",
-    deliveryZoneId: d.deliveryZoneId || "",
-    deliveryZoneName: d.deliveryZoneName || "",
-    notifyViaWhatsapp: !!d.notifyViaWhatsapp,
-    whatsappSentAt: d.whatsappSentAt ? asDate(d.whatsappSentAt) : null,
-    total: Number(d.total || 0),
-    itemsTotal: Number(d.itemsTotal || 0),
-    cashReceived: d.cashReceived != null ? Number(d.cashReceived) : null,
-  changeDue: d.changeDue != null ? Number(d.changeDue) : null,
-    done: !!d.done,
-    voided: !!d.voided,
-    voidReason: d.voidReason || "",
-    note: d.note || "",
-    date: asDate(d.date || d.createdAt),
-    restockedAt: d.restockedAt ? asDate(d.restockedAt) : undefined,
-    cart: Array.isArray(d.cart) ? d.cart : [],
-     idemKey: d.idemKey || "",
-    source: d.source || "",
-    onlineOrderId: d.onlineOrderId || "",
- onlineOrderKey: d.onlineOrderKey || "",
-    onlineSourceCollection: d.onlineSourceCollection || "",
-    onlineSourceDocId: d.onlineSourceDocId || "",
+    orderType: row.order_type,
+    deliveryFee: Number(row.delivery_fee || 0),
+      deliveryName: row.delivery_name || "",
+    deliveryPhone: row.delivery_phone || "",
+    deliveryEmail: row.delivery_email || "",
+    deliveryAddress: row.delivery_address || "",
+    deliveryZoneId: row.delivery_zone_id || "",
+    deliveryZoneName: row.delivery_zone_name || "",
+    notifyViaWhatsapp: !!row.notify_via_whatsapp,
+    whatsappSentAt: row.whatsapp_sent_at ? asDate(row.whatsapp_sent_at) : null,
+    total: Number(row.total || 0),
+    itemsTotal: Number(row.items_total || 0),
+    cashReceived: row.cash_received != null ? Number(row.cash_received) : null,
+  changeDue: row.change_due != null ? Number(row.change_due) : null,
+    done: !!row.done,
+    voided: !!row.voided,
+    voidReason: row.void_reason || "",
+    note: row.note || "",
+    date: asDate(row.date || row.created_at),
+    restockedAt: row.restocked_at ? asDate(row.restocked_at) : undefined,
+    cart: Array.isArray(row.cart) ? row.cart : [],
+     idemKey: row.idem_key || "",
+    source: row.source || "",
+    onlineOrderId: row.online_order_id || "",
+ onlineOrderKey: row.online_order_key || "",
+    onlineSourceCollection: row.online_source_collection || "",
+    onlineSourceDocId: row.online_source_doc_id || "",
+    channel: row.channel || "",
+    channelOrderNo: row.channel_order_no || "",
   };
   return enrichOrderWithChannel(order);
 }
@@ -1782,10 +1671,11 @@ function enrichOrderWithChannel(order) {
   return { ...order, channel, channelOrderNo };
 }
 
+// eslint-disable-next-line no-unused-vars
 function onlineOrderFromDoc(id, data = {}) {
   const asDate = (value) => {
     if (!value) return null;
-    if (value instanceof Timestamp) return value.toDate();
+    if (value && typeof value.toDate === "function") return value.toDate();
     if (value instanceof Date) return value;
     const parsed = new Date(value);
     return Number.isNaN(+parsed) ? null : parsed;
@@ -2666,46 +2556,258 @@ const isExpenseVoidEligible = (t) => {
   const k = norm(t).toLowerCase();
   return !!k && k !== "take-away" && k !== "take away" && k !== "dine-in" && k !== "dine in";
 };
-async function purgeOrdersInCloud(db, ordersColRef, startDate, endDate) {
-  try {
-    const startTs = Timestamp.fromDate(startDate);
-    const endTs = Timestamp.fromDate(endDate);
-    const qy = query(
-      ordersColRef,
-      where("createdAt", ">=", startTs),
-      where("createdAt", "<=", endTs)
-    );
-    const ss = await getDocs(qy);
-    if (ss.empty) return 0;
+function posStateFromRow(row) {
+  if (!row) return null;
+  const state = row.state && typeof row.state === "object" ? row.state : {};
+  return {
+    ...state,
+    updatedAt: row.updated_at || state.updatedAt,
+    writerId: row.writer_id || state.writerId,
+    writeSeq: Number(row.write_seq || state.writeSeq || 0),
+    clientTime: row.client_time ?? state.clientTime,
+  };
+}
 
-    const docs = ss.docs;
-    let removed = 0;
-    for (let i = 0; i < docs.length; i += 400) {
-      const chunk = docs.slice(i, i + 400);
-      const batch = writeBatch(db);
-      for (const d of chunk) batch.delete(d.ref);
-      await batch.commit();
-      removed += chunk.length;
+async function loadPosState() {
+  const { data, error } = await supabase
+    .from("pos_state")
+    .select("state, updated_at, writer_id, write_seq, client_time")
+    .eq("id", POS_STATE_ID)
+    .eq("shop_id", SHOP_ID)
+    .maybeSingle();
+  if (error) throw error;
+  return posStateFromRow(data);
+}
+
+async function savePosState(state) {
+  const safeState = sanitizeForSupabase(state || {});
+  const row = {
+    id: POS_STATE_ID,
+    shop_id: SHOP_ID,
+    state: safeState,
+    writer_id: safeState?.writerId || null,
+    write_seq: Number(safeState?.writeSeq || 0),
+    client_time: safeState?.clientTime != null ? Number(safeState.clientTime) : null,
+    updated_at: new Date().toISOString(),
+  };
+  const { error } = await supabase.from("pos_state").upsert(row, { onConflict: "id" });
+  if (error) throw error;
+}
+
+function subscribeToPosState(callback) {
+  const channel = supabase
+    .channel(`pos-state-${SHOP_ID}`)
+    .on(
+      "postgres_changes",
+      {
+        event: "*",
+        schema: "public",
+        table: "pos_state",
+        filter: `shop_id=eq.${SHOP_ID}`,
+      },
+      (payload) => callback(posStateFromRow(payload.new), payload)
+    )
+    .subscribe();
+
+  return () => {
+    supabase.removeChannel(channel);
+  };
+}
+
+async function loadOrders(startDate, endDate) {
+  let request = supabase
+    .from("orders")
+    .select("*")
+    .eq("shop_id", SHOP_ID)
+    .order("created_at", { ascending: false });
+
+  const startIso = toIso(startDate);
+  const endIso = toIso(endDate);
+  if (startIso) request = request.gte("created_at", startIso);
+  if (endIso) request = request.lte("created_at", endIso);
+
+  const { data, error } = await request;
+  if (error) throw error;
+  return (data || []).map(orderFromSupabaseRow);
+}
+
+function subscribeToOrders(callback) {
+  const channel = supabase
+    .channel(`orders-${SHOP_ID}`)
+    .on(
+      "postgres_changes",
+      {
+        event: "*",
+        schema: "public",
+        table: "orders",
+        filter: `shop_id=eq.${SHOP_ID}`,
+      },
+      callback
+    )
+    .subscribe();
+
+  return () => {
+    supabase.removeChannel(channel);
+  };
+}
+
+async function addOrder(order) {
+  const { data, error } = await supabase
+    .from("orders")
+    .insert(normalizeOrderForSupabase(order))
+    .select("id")
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+function normalizeOrderPatchForSupabase(patch = {}) {
+  const map = {
+    orderNo: "order_no",
+    paymentParts: "payment_parts",
+    orderType: "order_type",
+    deliveryFee: "delivery_fee",
+    deliveryName: "delivery_name",
+    deliveryPhone: "delivery_phone",
+    deliveryEmail: "delivery_email",
+    deliveryAddress: "delivery_address",
+    deliveryZoneId: "delivery_zone_id",
+    deliveryZoneName: "delivery_zone_name",
+    notifyViaWhatsapp: "notify_via_whatsapp",
+    whatsappSentAt: "whatsapp_sent_at",
+    itemsTotal: "items_total",
+    cashReceived: "cash_received",
+    changeDue: "change_due",
+    voidReason: "void_reason",
+    restockedAt: "restocked_at",
+    idemKey: "idem_key",
+    onlineOrderId: "online_order_id",
+    onlineOrderKey: "online_order_key",
+    onlineSourceCollection: "online_source_collection",
+    onlineSourceDocId: "online_source_doc_id",
+    channelOrderNo: "channel_order_no",
+    createdAt: "created_at",
+    updatedAt: "updated_at",
+  };
+  const row = {};
+  for (const [key, value] of Object.entries(patch || {})) {
+    const column = map[key] || key;
+    if (column === "updated_at" && value == null) continue;
+    if (
+      [
+        "date",
+        "created_at",
+        "updated_at",
+        "restocked_at",
+        "whatsapp_sent_at",
+      ].includes(column)
+    ) {
+      row[column] = toIso(value);
+    } else {
+      row[column] = value;
     }
-    return removed;
+  }
+  if (!row.updated_at) row.updated_at = new Date().toISOString();
+  return sanitizeForSupabase(row);
+}
+
+async function updateOrderById(id, patch) {
+  if (!id) return null;
+  const { data, error } = await supabase
+    .from("orders")
+    .update(normalizeOrderPatchForSupabase(patch))
+    .eq("shop_id", SHOP_ID)
+    .eq("id", id)
+    .select("*")
+    .maybeSingle();
+  if (error) throw error;
+  return data ? orderFromSupabaseRow(data) : null;
+}
+
+async function updateOrderByOrderNo(orderNo, patch) {
+  const { data, error } = await supabase
+    .from("orders")
+    .update(normalizeOrderPatchForSupabase(patch))
+    .eq("shop_id", SHOP_ID)
+    .eq("order_no", Number(orderNo))
+    .select("*");
+  if (error) throw error;
+  return (data || []).map(orderFromSupabaseRow);
+}
+
+async function purgeOrdersInRange(startDate, endDate) {
+  try {
+    let selectReq = supabase
+      .from("orders")
+      .select("id", { count: "exact", head: true })
+      .eq("shop_id", SHOP_ID);
+    let deleteReq = supabase.from("orders").delete().eq("shop_id", SHOP_ID);
+    const startIso = toIso(startDate);
+    const endIso = toIso(endDate);
+    if (startIso) {
+      selectReq = selectReq.gte("created_at", startIso);
+      deleteReq = deleteReq.gte("created_at", startIso);
+    }
+    if (endIso) {
+      selectReq = selectReq.lte("created_at", endIso);
+      deleteReq = deleteReq.lte("created_at", endIso);
+    }
+    const { count, error: countError } = await selectReq;
+    if (countError) throw countError;
+    const { error } = await deleteReq;
+    if (error) throw error;
+    return count || 0;
   } catch (e) {
-    console.warn("purgeOrdersInCloud failed:", e);
+    console.warn("purgeOrdersInRange failed:", e);
     return 0;
   }
 }
-async function allocateOrderNoAtomic(db, counterDocRef) {
-  const next = await runTransaction(db, async (tx) => {
-    const snap = await tx.get(counterDocRef);
-    const current = snap.exists() ? Number(snap.data().lastOrderNo || 0) : 0;
-    const n = current + 1;
-    tx.set(
-      counterDocRef,
-      { lastOrderNo: n, updatedAt: serverTimestamp() },
-      { merge: true }
-    );
-    return n;
+
+async function allocateOrderNoAtomic() {
+  const { data, error } = await supabase.rpc("allocate_order_no", {
+    p_shop_id: SHOP_ID,
   });
-  return next;
+  if (error) throw error;
+  return Number(data || 0);
+}
+
+async function resetOrderCounter(lastOrderNo = 0) {
+  const { data, error } = await supabase.rpc("reset_order_counter", {
+    p_shop_id: SHOP_ID,
+    p_last_order_no: Number(lastOrderNo || 0),
+  });
+  if (error) throw error;
+  return Number(data || 0);
+}
+
+async function loadCounter() {
+  const { data, error } = await supabase
+    .from("counters")
+    .select("last_order_no")
+    .eq("shop_id", SHOP_ID)
+    .maybeSingle();
+  if (error) throw error;
+  return Number(data?.last_order_no || 0);
+}
+
+function subscribeToCounter(callback) {
+  const channel = supabase
+    .channel(`counter-${SHOP_ID}`)
+    .on(
+      "postgres_changes",
+      {
+        event: "*",
+        schema: "public",
+        table: "counters",
+        filter: `shop_id=eq.${SHOP_ID}`,
+      },
+      (payload) => callback(Number(payload.new?.last_order_no || 0), payload)
+    )
+    .subscribe();
+
+  return () => {
+    supabase.removeChannel(channel);
+  };
 }
 function escHtml(s) {
   return String(s ?? "")
@@ -3656,7 +3758,7 @@ const activeWorkers = useMemo(() => {
   return names;
 }, [workerSessions]);
 const [orders, setOrders] = useState([]);
-const [onlineFbUser, setOnlineFbUser] = useState(null);const [orderBoardFilter, setOrderBoardFilter] = useState("onsite");
+const [orderBoardFilter, setOrderBoardFilter] = useState("onsite");
 const [lastSeenOnlineOrderTs, setLastSeenOnlineOrderTs] = useState(() => {
   const l = loadLocal();
   const v = Number(l?.lastSeenOnlineOrderTs);
@@ -3978,7 +4080,7 @@ const removeBankTx = (id) => {
   const [newExtraPrice, setNewExtraPrice] = useState(0);
   const [localHydrated, setLocalHydrated] = useState(false);
 const [lastLocalEditAt, setLastLocalEditAt] = useState(0);
-  /* --------------------------- FIREBASE STATE --------------------------- */
+  /* --------------------------- SUPABASE STATE --------------------------- */
   const [fbReady, setFbReady] = useState(false);
   const [fbUser, setFbUser] = useState(null);
   const [cloudEnabled, setCloudEnabled] = useState(true);
@@ -4007,20 +4109,8 @@ const writeSeqRef = useRef(0);
 }, [dayMeta.startedAt, paymentMethods]);
   useEffect(() => {
     try {
-      const { auth } = ensureFirebase();
       setFbReady(true);
-      const unsub = onAuthStateChanged(auth, async (u) => {
-        if (!u) {
-          try {
-            await signInAnonymously(auth);
-          } catch (e) {
-            setCloudStatus((s) => ({ ...s, error: String(e) }));
-          }
-        } else {
-          setFbUser(u);
-        }
-      });
-      return () => unsub();
+      setFbUser({ uid: clientIdRef.current });
     } catch (e) {
       setCloudStatus((s) => ({ ...s, error: String(e) }));
     }
@@ -4341,92 +4431,37 @@ useEffect(() => {
     return changed ? next : current;
   });
 }, [purchases, purchaseCategories, syncCostsFromPurchases]);
-const db = useMemo(() => (fbReady ? ensureFirebase().db : null), [fbReady]);
-  const onlineFirebaseApp = useMemo(
-    () => (fbReady ? ensureOnlineFirebase() : null),
-    [fbReady]
-  );
-  const onlineDb = useMemo(() => {
-    if (!onlineFirebaseApp) return null;
-    try {
-      return getFirestore(onlineFirebaseApp);
-    } catch (err) {
-      console.error("Failed to access online orders Firestore", err);
-      return null;
-    }
-  }, [onlineFirebaseApp]);
+const supabaseReady = fbReady;
+const stateDocRef = supabaseReady;
+const ordersColRef = supabaseReady;
+const counterDocRef = supabaseReady;
+const onlineOrderCollections = useMemo(() => ONLINE_ORDER_COLLECTIONS, []);
+
   useEffect(() => {
-    if (!onlineFirebaseApp) {
-      setOnlineFbUser(null);
-      return undefined;
-    }
-    const auth = getAuth(onlineFirebaseApp);
+    if (!counterDocRef || !fbUser) return;
     let active = true;
-    const unsubscribe = onAuthStateChanged(auth, async (user) => {
-      if (!active) return;
-      if (user) {
-        setOnlineFbUser(user);
-      } else {
-        try {
-          await signInAnonymously(auth);
-        } catch (err) {
-          console.error("Failed to sign in to online orders Firebase auth", err);
-        }
-      }
+    loadCounter()
+      .then((last) => {
+        if (active) setNextOrderNo(last + 1);
+      })
+      .catch((err) => {
+        console.warn("Counter load failed:", err);
+        setCloudStatus((s) => ({ ...s, error: String(err) }));
+      });
+    const unsub = subscribeToCounter((last) => {
+      if (active) setNextOrderNo(last + 1);
     });
     return () => {
       active = false;
-      setOnlineFbUser(null);
-      unsubscribe();
+      unsub();
     };
-  }, [onlineFirebaseApp]);
-  const stateDocRef = useMemo(
-    () => (db ? fsDoc(db, "shops", SHOP_ID, "state", "pos") : null),
-    [db]
-  );
-  const ordersColRef = useMemo(
-    () => (db ? collection(db, "shops", SHOP_ID, "orders") : null),
-    [db]
-  );
-  
-const onlineOrderCollections = useMemo(() => {
-    if (!db && !onlineDb) return [];
-    return ONLINE_ORDER_COLLECTIONS.flatMap(
-      ({ name, source, path, constraints = [] }) => {
-        const targetDb = source === "menu" ? onlineDb : db;
-        if (!targetDb) return [];
-        try {
-          const baseRef = collection(targetDb, ...path);
-          const ref = constraints.length ? query(baseRef, ...constraints) : baseRef;
-          return [{ name, source, ref, pathSegments: [...path] }];
-        } catch (err) {
-          console.error(`Failed to build online order ref for ${name}`, err);
-          return [];
-        }
-      }
-    );
-  }, [db, onlineDb]);
-
-  
-  const counterDocRef = useMemo(
-    () => (db ? fsDoc(db, "shops", SHOP_ID, "state", "counters") : null),
-    [db]
-  );
-  useEffect(() => {
-    if (!counterDocRef || !fbUser) return;
-    const unsub = onSnapshot(counterDocRef, (snap) => {
-      const last = snap.exists() ? Number(snap.data().lastOrderNo || 0) : 0;
-      setNextOrderNo(last + 1);
-    });
-    return () => unsub();
   }, [counterDocRef, fbUser]);
   useEffect(() => {
     if (!stateDocRef || !fbUser || hydrated) return;
     (async () => {
       try {
-        const snap = await getDoc(stateDocRef);
-        if (snap.exists()) {
-          const data = snap.data() || {};
+        const data = await loadPosState();
+        if (data) {
           const unpacked = unpackStateFromCloud(data, dayMeta);
           if (!realtimeOrders && unpacked.orders) setOrders(unpacked.orders);
           if (unpacked.menu) setMenu(unpacked.menu);
@@ -4487,20 +4522,15 @@ const onlineOrderCollections = useMemo(() => {
   }, [stateDocRef, fbUser, hydrated, dayMeta, realtimeOrders, applyBulkInventoryFromCloud]);
   useEffect(() => {
   if (!cloudEnabled || !stateDocRef || !fbUser) return;
-  const unsub = onSnapshot(stateDocRef, (snap) => {
+  const unsub = subscribeToPosState((data) => {
     try {
-      if (!snap.exists()) return;
-      if (snap.metadata.hasPendingWrites) return; 
-      const data = snap.data() || {};
+      if (!data) return;
       if (data.writerId === clientIdRef.current) {
         const seq = Number(data.writeSeq || 0);
         if (seq && seq <= writeSeqRef.current) return; 
         writeSeqRef.current = Math.max(writeSeqRef.current, seq);
       }
-      const ts =
-        data.updatedAt instanceof Timestamp
-          ? data.updatedAt.toMillis()
-          : (data.updatedAt ? new Date(data.updatedAt).getTime() : 0);
+      const ts = data.updatedAt ? new Date(data.updatedAt).getTime() : 0;
       if (ts && ts <= (lastAppliedCloudAt || 0)) return;
 if (ts && lastLocalEditAt && ts < lastLocalEditAt) return;
       const unpacked = unpackStateFromCloud(data, dayMeta);
@@ -4540,11 +4570,10 @@ if (ts && lastLocalEditAt && ts < lastLocalEditAt) return;
 }, [cloudEnabled, stateDocRef, fbUser, dayMeta, lastAppliedCloudAt, lastLocalEditAt, applyBulkInventoryFromCloud]);
   // Manual pull
   const loadFromCloud = async () => {
-    if (!stateDocRef || !fbUser) return alert("Firebase not ready.");
+    if (!stateDocRef || !fbUser) return alert("Supabase not ready.");
     try {
-      const snap = await getDoc(stateDocRef);
-      if (!snap.exists()) return alert("No cloud state yet to load.");
-      const data = snap.data() || {};
+      const data = await loadPosState();
+      if (!data) return alert("No cloud state yet to load.");
       const unpacked = unpackStateFromCloud(data, dayMeta);
       if (!realtimeOrders && unpacked.orders) setOrders(unpacked.orders);
       if (unpacked.menu) setMenu(unpacked.menu);
@@ -4596,9 +4625,9 @@ if (unpacked.workerSessions) setWorkerSessions(unpacked.workerSessions);
       setCloudStatus((s) => ({ ...s, error: String(e) }));
       alert("Cloud load failed: " + e);
     }
-  };
+ };
  const saveToCloudNow = async () => {
-  if (!stateDocRef || !fbUser) return alert("Firebase not ready.");
+  if (!stateDocRef || !fbUser) return alert("Supabase not ready.");
   try {
     const bodyBase = packStateForCloud({
       menu,
@@ -4648,7 +4677,7 @@ if (unpacked.workerSessions) setWorkerSessions(unpacked.workerSessions);
       writeSeq: writeSeqRef.current,
       clientTime: Date.now(),
     };
-    await setDoc(stateDocRef, body, { merge: true });
+    await savePosState(body);
     const now = Date.now();
    setLastLocalEditAt(now);
     setLastAppliedCloudAt(now);
@@ -4715,7 +4744,7 @@ useEffect(() => {
         clientTime: Date.now(),
       };
 
-      await setDoc(stateDocRef, body, { merge: true });
+      await savePosState(body);
       if (cancelled) return;
       const now = Date.now();
       setLastAppliedCloudAt(now);
@@ -4787,17 +4816,22 @@ useEffect(() => {
       setOrders([]);
       return;
     }
-    const startTs = Timestamp.fromMillis(startedAtMs);
-    const constraints = [where("createdAt", ">=", startTs), orderBy("createdAt", "desc")];
-    if (endedAtMs)
-      constraints.unshift(where("createdAt", "<=", Timestamp.fromMillis(endedAtMs)));
-    const qy = query(ordersColRef, ...constraints);
-    const unsub = onSnapshot(qy, (snap) => {
-      const arr = [];
-      snap.forEach((d) => arr.push(orderFromCloudDoc(d.id, d.data())));
-      setOrders(dedupeOrders(arr).map(enrichOrderWithChannel));
-    });
-   return () => unsub();
+    let active = true;
+    const refreshOrders = async () => {
+      try {
+        const arr = await loadOrders(new Date(startedAtMs), endedAtMs ? new Date(endedAtMs) : null);
+        if (active) setOrders(dedupeOrders(arr).map(enrichOrderWithChannel));
+      } catch (err) {
+        console.warn("Realtime orders load failed:", err);
+        setCloudStatus((s) => ({ ...s, error: String(err) }));
+      }
+    };
+    refreshOrders();
+    const unsub = subscribeToOrders(refreshOrders);
+   return () => {
+      active = false;
+      unsub();
+    };
   }, [realtimeOrders, ordersColRef, fbUser, startedAtMs, endedAtMs]);
 const recomputeOnlineOrders = useCallback(() => {
     const sources = onlineOrderSourcesRef.current || {};
@@ -4822,90 +4856,30 @@ const recomputeOnlineOrders = useCallback(() => {
   const updateOnlineOrderDoc = useCallback(
     async (onlineOrder, patch) => {
       if (!onlineOrder || !patch) return;
-      const segments = Array.isArray(onlineOrder.sourcePathSegments)
-        ? [...onlineOrder.sourcePathSegments]
-        : [];
-      const docId = onlineOrder.sourceDocId || onlineOrder.id;
-      if (!segments.length || !docId) return;
-      const origin = onlineOrder.sourceOrigin || onlineOrder.sourceCollection || "";
-      const targetDb = origin === "menu" ? onlineDb : db;
-      if (!targetDb) return;
-      try {
-        const ref = fsDoc(targetDb, ...segments, docId);
-        const body = { ...patch };
-        if (body.updatedAt === undefined) body.updatedAt = serverTimestamp();
-        await updateDoc(ref, sanitizeForFirestore(body));
-      } catch (err) {
-        console.error("Failed to update online order doc", err);
-      }
+      const key = getOnlineOrderDedupeKey(onlineOrder);
+      setOnlineOrderStatus((prev) => ({
+        ...prev,
+        [key]: {
+          ...(prev[key] || {}),
+          ...sanitizeForSupabase(patch),
+          lastUpdateAt: Date.now(),
+        },
+      }));
     },
-    [db, onlineDb]
+    []
   );
  useEffect(() => {
-    const requiresOnlineAuth = onlineOrderCollections.some(
-      (col) => col.source === "menu"
-    );
-    if (
-      !fbUser ||
-      onlineOrderCollections.length === 0 ||
-      (requiresOnlineAuth && !onlineFbUser)
-    ) {
+    if (!fbUser || onlineOrderCollections.length === 0) {
       onlineOrderSourcesRef.current = {};
       setOnlineOrdersRaw([]);
       return undefined;
     }
 
-    let active = true;
-const unsubscribers = onlineOrderCollections.map(({ name, ref, pathSegments, source }) =>
-      onSnapshot(
-        ref,
-        (snap) => {
-          if (!active) return;
-          const arr = [];
-          snap.forEach((doc) => {
-            try {
-              const parsed = onlineOrderFromDoc(doc.id, doc.data());
-              arr.push({
-                ...parsed,
-                id: parsed?.id || doc.id,
-                sourceCollection: name,
-                sourceDocId: doc.id,
-                sourcePathSegments: Array.isArray(pathSegments) ? [...pathSegments] : [],
-                sourceOrigin: source,
-              });
-            } catch (err) {
-              console.error(
-                "Failed to parse online order",
-                `${name}/${doc.id}`,
-                err
-              );
-            }
-          });
-          onlineOrderSourcesRef.current = {
-            ...onlineOrderSourcesRef.current,
-            [name]: arr,
-          };
-          recomputeOnlineOrders();
-        },
-        (error) => {
-          console.error(`Online orders listener error [${name}]`, error);
-        }
-      )
-    );
-
     return () => {
-      active = false;
-      unsubscribers.forEach((fn) => {
-        try {
-          if (typeof fn === "function") fn();
-        } catch (err) {
-          console.error("Error cleaning up online order listener", err);
-        }
-      });
       onlineOrderSourcesRef.current = {};
       setOnlineOrdersRaw([]);
     };
-  }, [onlineOrderCollections, fbUser, onlineFbUser, recomputeOnlineOrders]);
+  }, [onlineOrderCollections, fbUser, recomputeOnlineOrders]);
 const onlineOrders = useMemo(() => {
     const filtered = onlineOrdersRaw.filter((order) => {
       const ts = Number(order?.createdAtMs || 0);
@@ -6021,20 +5995,20 @@ const endDay = async () => {
     const metaForReport = { ...dayMeta, endedAt: endTime, endedBy: endBy };
     generatePDF(false, metaForReport);
 
-    if (cloudEnabled && ordersColRef && fbUser && db) {
+    if (cloudEnabled && ordersColRef && fbUser) {
       try {
         const start = dayMeta.startedAt
           ? new Date(dayMeta.startedAt)
           : orders.length
           ? new Date(Math.min(...orders.map((o) => +o.date)))
           : endTime;
-        await purgeOrdersInCloud(db, ordersColRef, start, endTime);
+        await purgeOrdersInRange(start, endTime);
       } catch (e) {
         console.warn("Cloud purge on endDay failed:", e);
       }
       try {
         if (counterDocRef) {
-          await setDoc(counterDocRef, { lastOrderNo: 0, updatedAt: serverTimestamp() }, { merge: true });
+          await resetOrderCounter(0);
         }
       } catch (e) {
         console.warn("Counter reset failed:", e);
@@ -6166,7 +6140,7 @@ const endDay = async () => {
           writeSeq: writeSeqRef.current,
           clientTime: Date.now(),
         };
-        await setDoc(stateDocRef, body, { merge: true });
+        await savePosState(body);
         const now = Date.now();
         setLastAppliedCloudAt(now);
         setCloudStatus((s) => ({ ...s, lastSaveAt: new Date(now), error: null }));
@@ -6431,9 +6405,9 @@ const checkout = async () => {
     }
     setNextOrderNo(optimisticNo + 1);
     let allocatedNo = optimisticNo;
-    if (cloudEnabled && counterDocRef && fbUser && db) {
+    if (cloudEnabled && counterDocRef && fbUser) {
       try {
-      allocatedNo = await allocateOrderNoAtomic(db, counterDocRef);
+      allocatedNo = await allocateOrderNoAtomic();
         if (allocatedNo !== optimisticNo) {
           order = {
             ...order,
@@ -6449,7 +6423,7 @@ const checkout = async () => {
     if (!realtimeOrders) setOrders((o) => [order, ...o]);
     if (cloudEnabled && ordersColRef && fbUser) {
       try {
-        const ref = await addDoc(ordersColRef, normalizeOrderForCloud(order));
+        const ref = await addOrder(order);
         if (!realtimeOrders) {
           setOrders((prev) =>
             prev.map((oo) =>
@@ -6547,9 +6521,9 @@ const integrateOnlineOrder = async (onlineOrder) => {
   let optimisticNo = nextOrderNo;
   let orderNo = optimisticNo;
   setNextOrderNo(optimisticNo + 1);
-  if (cloudEnabled && counterDocRef && fbUser && db) {
+  if (cloudEnabled && counterDocRef && fbUser) {
     try {
-      const allocated = await allocateOrderNoAtomic(db, counterDocRef);
+      const allocated = await allocateOrderNoAtomic();
       orderNo = allocated;
       if (allocated !== optimisticNo) {
         setNextOrderNo(allocated + 1);
@@ -6921,7 +6895,7 @@ const onlineFallbackId =
   if (!realtimeOrders) setOrders((o) => [posOrder, ...o]);
   if (cloudEnabled && ordersColRef && fbUser) {
     try {
-      const ref = await addDoc(ordersColRef, normalizeOrderForCloud(posOrder));
+      const ref = await addOrder(posOrder);
       posOrder.cloudId = ref.id;
       if (!realtimeOrders) {
         setOrders((prev) =>
@@ -6949,7 +6923,7 @@ const onlineFallbackId =
     await updateOnlineOrderDoc(onlineOrder, {
       status: "accepted",
       posOrderNo: posOrder.orderNo,
-      posIntegratedAt: serverTimestamp(),
+      posIntegratedAt: new Date().toISOString(),
     });
   } catch (err) {
     console.warn("Failed to update online order status in source", err);
@@ -6972,17 +6946,12 @@ const markOrderDone = async (orderNo) => {
   try {
     if (!cloudEnabled || !ordersColRef || !fbUser) return;
     let targetId = orders.find((o) => o.orderNo === orderNo)?.cloudId;
-    if (!targetId) {
-      const ss = await getDocs(query(ordersColRef, where("orderNo", "==", orderNo)));
-      if (!ss.empty) targetId = ss.docs[0].id;
-   }
-    if (targetId) {
-      const payload = {
-        done: true,
-        updatedAt: serverTimestamp(),
-      };
-      await updateDoc(fsDoc(db, "shops", SHOP_ID, "orders", targetId), payload);
-    }
+    const payload = {
+      done: true,
+      updatedAt: new Date().toISOString(),
+    };
+    if (targetId) await updateOrderById(targetId, payload);
+    else await updateOrderByOrderNo(orderNo, payload);
   } catch (e) {
     console.warn("Cloud update (done) failed:", e);
    }
@@ -6994,7 +6963,7 @@ const markOnlineOrderDone = async (onlineOrder) => {
   try {
     await updateOnlineOrderDoc(onlineOrder, {
       status: "completed",
-      posCompletedAt: serverTimestamp(),
+      posCompletedAt: new Date().toISOString(),
     });
   } catch (err) {
     console.warn("Failed to update online order to completed", err);
@@ -7018,7 +6987,7 @@ const voidOnlineOrderAndRestock = async (onlineOrder) => {
   try {
     await updateOnlineOrderDoc(onlineOrder, {
       status: "cancelled",
-      posCancelledAt: serverTimestamp(),
+      posCancelledAt: new Date().toISOString(),
     });
   } catch (err) {
     console.warn("Failed to update online order cancel status", err);
@@ -7034,7 +7003,7 @@ const voidOnlineOrderToExpense = async (onlineOrder) => {
   try {
     await updateOnlineOrderDoc(onlineOrder, {
       status: "cancelled",
-      posCancelledAt: serverTimestamp(),
+      posCancelledAt: new Date().toISOString(),
     });
   } catch (err) {
     console.warn("Failed to update online order return status", err);
@@ -7081,18 +7050,14 @@ const voidOrderAndRestock = async (orderNo) => {
   try {
     if (!cloudEnabled || !ordersColRef || !fbUser) return;
     let targetId = ord.cloudId;
-    if (!targetId) {
-      const ss = await getDocs(query(ordersColRef, where("orderNo", "==", orderNo)));
-      if (!ss.empty) targetId = ss.docs[0].id;
-    }
-    if (targetId) {
-      await updateDoc(fsDoc(db, "shops", SHOP_ID, "orders", targetId), {
-        voided: true,
-        voidReason: reason,
-        restockedAt: toIso(when),
-        updatedAt: serverTimestamp(),
-      });
-    }
+    const payload = {
+      voided: true,
+      voidReason: reason,
+      restockedAt: toIso(when),
+      updatedAt: new Date().toISOString(),
+    };
+    if (targetId) await updateOrderById(targetId, payload);
+    else await updateOrderByOrderNo(orderNo, payload);
   } catch (e) {
     console.warn("Cloud update (cancel/restock) failed:", e);
   }
@@ -7146,17 +7111,13 @@ const voidOrderToExpense = async (orderNo) => {
   try {
     if (cloudEnabled && ordersColRef && fbUser) {
       let targetId = ord.cloudId;
-      if (!targetId) {
-        const ss = await getDocs(query(ordersColRef, where("orderNo", "==", orderNo)));
-        if (!ss.empty) targetId = ss.docs[0].id;
-      }
-      if (targetId) {
-        await updateDoc(fsDoc(db, "shops", SHOP_ID, "orders", targetId), {
-          voided: true,
-          voidReason: reason,
-          updatedAt: serverTimestamp(),
-        });
-      }
+      const payload = {
+        voided: true,
+        voidReason: reason,
+        updatedAt: new Date().toISOString(),
+      };
+      if (targetId) await updateOrderById(targetId, payload);
+      else await updateOrderByOrderNo(orderNo, payload);
     }
   } catch (e) {
     console.warn("Cloud update (void→expense) failed:", e);
