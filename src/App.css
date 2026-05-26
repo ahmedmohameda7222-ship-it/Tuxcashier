@@ -28,6 +28,34 @@
   color: #61dafb;
 }
 
+@media (min-width: 1024px) {
+  .orders-layout {
+    width: 100%;
+  }
+
+  .orders-main-row {
+    display: grid !important;
+    grid-template-columns: minmax(0, 2fr) minmax(420px, 1fr);
+    align-items: start !important;
+  }
+
+  .items-pane {
+    min-width: 0 !important;
+  }
+
+  .cart-pane {
+    margin-top: 0;
+  }
+
+  .order-meta-grid {
+    grid-template-columns: 1fr !important;
+  }
+
+  .order-meta-card {
+    min-height: auto;
+  }
+}
+
 @keyframes App-logo-spin {
   from {
     transform: rotate(0deg);

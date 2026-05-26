@@ -8076,9 +8076,10 @@ const endedStr   = m.endedAt   ? fmtDateTime(m.endedAt)   : "—";
   const cardBorder = dark ? "#555" : "#ddd";
   const softBg = dark ? "#1e1e1e" : "#f5f5f5";
   const btnBorder = "#ccc";
+  const isDesktopWidth = typeof window !== "undefined" && window.innerWidth >= 1024;
   const containerStyle = {
-    maxWidth: 1024,
-    margin: "0 auto",
+    maxWidth: isDesktopWidth ? "100%" : 1024,
+    margin: isDesktopWidth ? "0" : "0 auto",
     padding: 16,
     background: dark ? "#121212" : "white",
     color: dark ? "#eee" : "black",
@@ -9461,11 +9462,11 @@ const cogs = Number(
 
       {/* ORDERS */}
       {activeTab === "orders" && (
-        <div>
+        <div className="orders-layout">
           <h2>Select item</h2>
 
-          <div style={{ display: "flex", gap: 24, alignItems: "flex-start", flexWrap: "wrap" }}>
-            <div style={{ flex: 1, minWidth: 300 }}>
+          <div className="orders-main-row" style={{ display: "flex", gap: 24, alignItems: "flex-start", flexWrap: "wrap" }}>
+            <div className="items-pane" style={{ flex: 1, minWidth: 300 }}>
               <h3>Burgers & Items</h3>
               {/* TILE GRID (small icon-like cards) */}
               <div
@@ -9575,6 +9576,7 @@ const cogs = Number(
           </div>
 
           {/* Cart */}
+          <div className="cart-pane">
           <h3 style={{ marginTop: 16 }}>Cart</h3>
           {cart.length === 0 && <p>No items yet.</p>}
           <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
@@ -9694,6 +9696,7 @@ const cogs = Number(
           <div style={{ display: "grid", gap: 12 }}>
             {/* Button groups row */}
             <div
+              className="order-meta-grid"
               style={{
                 display: "grid",
                 gridTemplateColumns: "1fr 1fr 1fr",
@@ -9702,6 +9705,7 @@ const cogs = Number(
             >
            {/* Worker group (only on-duty) */}
 <div
+  className="order-meta-card"
   style={{
     border: `1px solid ${btnBorder}`,
     borderRadius: 8,
@@ -9736,6 +9740,7 @@ const cogs = Number(
 
               {/* Payment group */}
               <div
+                className="order-meta-card"
                 style={{
                   border: `1px solid ${btnBorder}`,
                   borderRadius: 8,
@@ -9879,6 +9884,7 @@ const cogs = Number(
 
               {/* Order type group */}
               <div
+                className="order-meta-card"
                 style={{
                   border: `1px solid ${btnBorder}`,
                   borderRadius: 8,
@@ -10101,6 +10107,7 @@ const cogs = Number(
                 </small>
               </div>
             </div>
+          </div>
           </div>
         </div>
       )}
