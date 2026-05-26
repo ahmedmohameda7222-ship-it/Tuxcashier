@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
 import { supabase } from "./supabaseClient";
-import "./App.css";
 
 export const toIso = (v) => {
   if (!v) return null;
@@ -3907,7 +3906,7 @@ const hasMeaningfulActualCounts = useMemo(
       const raw = reconCounts[m];
       if (raw == null || raw === "") return false;
       const numeric = Number(raw);
-      return Number.isFinite(numeric);
+      return Number.isFinite(numeric) && numeric !== 0;
     }),
   [paymentMethods, reconCounts]
 );
@@ -3922,7 +3921,7 @@ const saveReconciliation = () => {
     return alert("Enter the counted amount for each payment method before saving.");
   }
 if (!hasMeaningfulActualCounts) {
-    return alert("Enter a valid counted amount for each payment method before saving.");
+    return alert("Enter a non-zero counted amount for each payment method before saving.");
   }
   const breakdown = {};
   for (const m of paymentMethods || []) {
@@ -8226,7 +8225,7 @@ const generatePurchasesPDF = () => {
   /* --------------------------- UI --------------------------- */
 
   return (
-    <div className="tux-app-shell" style={containerStyle}>
+    <div style={containerStyle}>
    {/* Header */}
 <div
   style={{
@@ -9469,16 +9468,6 @@ const cogs = Number(
           <div className="orders-main-row" style={{ display: "flex", gap: 24, alignItems: "flex-start", flexWrap: "wrap" }}>
             <div className="items-pane" style={{ flex: 1, minWidth: 300 }}>
               <h3>Burgers & Items</h3>
-      {/* ORDERS */}
-     {activeTab === "orders" && (
-        <div>
-          <h2>Select item</h2>
-
-          <div className="tux-pos-desktop-grid">
-            <div className="tux-pos-menu-panel">
-          <div style={{ display: "flex", gap: 24, alignItems: "flex-start", flexWrap: "wrap" }}>
-            <div style={{ flex: 1, minWidth: 300 }}>
-              <h3>Burgers & Items</h3>
               {/* TILE GRID (small icon-like cards) */}
               <div
                 style={{
@@ -9588,13 +9577,6 @@ const cogs = Number(
 
           {/* Cart */}
           <div className="cart-pane">
-              </div>
-            </div>
-          </div>
-            </div>
-
-            <div className="tux-pos-cart-panel">
-          {/* Cart */}
           <h3 style={{ marginTop: 16 }}>Cart</h3>
           {cart.length === 0 && <p>No items yet.</p>}
           <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
@@ -10126,9 +10108,6 @@ const cogs = Number(
               </div>
             </div>
           </div>
-            </div>
-          </div>
-            </div>
           </div>
         </div>
       )}
