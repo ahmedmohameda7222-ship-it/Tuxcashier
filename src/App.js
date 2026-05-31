@@ -1102,7 +1102,6 @@ export function packStateForCloud(state) {
     dark,
     workers,
     paymentMethods,
-    discountOptions,
     inventoryLocked,
     inventorySnapshot,
     inventoryLockedAt,
@@ -1171,7 +1170,6 @@ export function packStateForCloud(state) {
     dark,
     workers,
     paymentMethods,
-    discountOptions: normalizeDiscountOptions(discountOptions),
     inventoryLocked,
     inventorySnapshot,
     inventoryLockedAt: toIso(inventoryLockedAt),
@@ -1413,8 +1411,6 @@ if (Array.isArray(data.orders)) {
   if (typeof data.dark === "boolean") out.dark = data.dark;
   if (Array.isArray(data.workers)) out.workers = data.workers;
   if (Array.isArray(data.paymentMethods)) out.paymentMethods = data.paymentMethods;
-  if (Array.isArray(data.discountOptions))
-    out.discountOptions = normalizeDiscountOptions(data.discountOptions);
   if (typeof data.inventoryLocked === "boolean") out.inventoryLocked = data.inventoryLocked;
   if (Array.isArray(data.inventorySnapshot)) out.inventorySnapshot = data.inventorySnapshot;
   if (data.adminPins) out.adminPins = data.adminPins;
@@ -2348,75 +2344,40 @@ const DEFAULT_LABOR_PROFILE = { payout: 0, productiveHours: 0 };
 const BASE_EQUIPMENT = [];
 const BASE_WORKERS = ["Hassan","Andiel", "Warda", "Ahmed", "Hazem",];
 const DEFAULT_PAYMENT_METHODS = ["Cash", "Card", "Instapay"];
-const DEFAULT_DISCOUNT_OPTIONS = [
-  { id: "discount-10", percentage: 10 },
-  { id: "discount-20", percentage: 20 },
-  { id: "discount-30", percentage: 30 },
-];
 const DEFAULT_ORDER_TYPES = ["Take-Away", "Dine-in", "Delivery"];
 const DEFAULT_DELIVERY_FEE = 20;
 const roundMoney = (value) => {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? Number(numeric.toFixed(2)) : 0;
 };
-const normalizeDiscountPercentage = (value) => {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) return null;
-  const safe = Math.abs(numeric);
-  if (safe <= 0 || safe > 100) return null;
-  return Number(safe.toFixed(2));
-};
-function normalizeDiscountOptions(options = DEFAULT_DISCOUNT_OPTIONS) {
-  const source = Array.isArray(options) ? options : DEFAULT_DISCOUNT_OPTIONS;
-  const seen = new Set();
-  const normalized = [];
-  source.forEach((option, idx) => {
-    const raw =
-      option && typeof option === "object"
-        ? option
-        : { percentage: option };
-    const percentage = normalizeDiscountPercentage(raw.percentage ?? raw.value ?? raw.percent);
-    if (percentage == null) return;
-    const key = `discount-${percentage}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    normalized.push({
-      id: String(raw.id || key || `discount-${idx}`),
-      percentage,
-    });
-  });
-  return normalized;
-}
-function calculateDiscountAmount(baseAmount, percentage) {
-  const base = Math.max(0, Number(baseAmount || 0));
-  const safePercentage = normalizeDiscountPercentage(percentage);
-  if (!safePercentage || !Number.isFinite(base)) return 0;
-  return roundMoney(base * (safePercentage / 100) * -1);
+function normalizeFixedDiscountAmount(value, subtotal = Infinity) {
+  const numeric = Number(value || 0);
+  if (!Number.isFinite(numeric) || numeric <= 0) return 0;
+  const max = Number.isFinite(Number(subtotal))
+    ? Math.max(0, Number(subtotal))
+    : Infinity;
+  return roundMoney(Math.min(numeric, max));
 }
 function getOrderDiscountAmount(order = {}) {
-  const raw = Number(order?.discountAmount || 0);
-  return Number.isFinite(raw) ? Math.min(0, roundMoney(raw)) : 0;
+  const raw = Number(order?.discountAmount ?? order?.discount ?? 0);
+  return Number.isFinite(raw) ? Math.abs(roundMoney(raw)) : 0;
 }
 function getOrderDiscountPercentage(order = {}) {
-  return normalizeDiscountPercentage(order?.discountPercentage) || 0;
+  return 0;
 }
 function getOrderNetItemsAmount(order = {}) {
   const delivery = Math.max(0, Number(order?.deliveryFee || 0));
-  const baseItems =
-    order?.itemsTotal != null
-      ? Number(order.itemsTotal || 0)
-      : Number(order?.total || 0) - delivery - getOrderDiscountAmount(order);
-  const net = Number(baseItems || 0) + getOrderDiscountAmount(order);
+  const rawDiscount = Number(order?.discountAmount ?? order?.discount ?? 0);
+  if (order?.itemsTotal != null) {
+    const storedItems = Number(order.itemsTotal || 0);
+    const netItems =
+      Number.isFinite(rawDiscount) && rawDiscount < 0
+        ? storedItems + rawDiscount
+        : storedItems;
+    return roundMoney(Math.max(0, Number.isFinite(netItems) ? netItems : 0));
+  }
+  const net = Number(order?.total || 0) - delivery;
   return roundMoney(Math.max(0, Number.isFinite(net) ? net : 0));
-}
-function formatDiscountPercentage(order = {}) {
-  const percentage = getOrderDiscountPercentage(order);
-  if (!percentage) return "";
-  return `${percentage}%`;
-}
-function formatDiscountOptionLabel(option, includeType = false) {
-  const percentage = normalizeDiscountPercentage(option?.percentage) || 0;
-  return includeType ? `Discount ${percentage}%` : `${percentage}%`;
 }
 const UTILITY_UNIT_LABELS = {
   electricity: { amount: "Bill amount (E£)", units: "Usage on bill (kWh)", per: "E£ / kWh" },
@@ -2961,31 +2922,34 @@ function buildReceiptHTML(order, widthMm = 80) {
   const orderDateStr = fmtDate(dt);
   const orderTimeStr = dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
-  const itemsSubtotal =
-    order.itemsTotal != null
-      ? Number(order.itemsTotal || 0)
-      : (order.cart || []).reduce((sum, line) => {
-          const base = Number(line.price || 0);
-          const extrasSum = (line.extras || []).reduce(
-            (s, e) => s + Number(e.price || 0),
-            0
-          );
-          const q = Number(line.qty || 1);
-          return sum + (base + extrasSum) * q;
-        }, 0);
+  const cartSubtotal = (order.cart || []).reduce((sum, line) => {
+    const base = Number(line.price || 0);
+    const extrasSum = (line.extras || []).reduce(
+      (s, e) => s + Number(e.price || 0),
+      0
+    );
+    const q = Number(line.qty || 1);
+    return sum + (base + extrasSum) * q;
+  }, 0);
 
   const deliveryFee =
     order.orderType === "Delivery"
       ? Math.max(0, Number(order.deliveryFee || 0))
       : 0;
   const discountAmount = getOrderDiscountAmount(order);
+  const itemsSubtotal =
+    cartSubtotal > 0
+      ? cartSubtotal
+      : Number(order.itemsTotal || 0) + discountAmount;
   const discountPercentage = getOrderDiscountPercentage(order);
   const discountLabel = discountPercentage
     ? `Discount (${discountPercentage}%)`
     : "Discount";
 
   const grandTotal =
-    order.total != null ? Number(order.total || 0) : itemsSubtotal + deliveryFee;
+    order.total != null
+      ? Number(order.total || 0)
+      : Math.max(0, itemsSubtotal - discountAmount) + deliveryFee;
   const paymentBreakdownHtml =
   Array.isArray(order.paymentParts) && order.paymentParts.length
     ? order.paymentParts
@@ -3397,10 +3361,6 @@ const [adminSubTab, setAdminSubTab] = useState("inventory");
 const [newWorker, setNewWorker] = useState("");
 const [paymentMethods, setPaymentMethods] = useState(DEFAULT_PAYMENT_METHODS);
 const [newPayment, setNewPayment] = useState("");
-const [discountOptions, setDiscountOptions] = useState(() =>
-  normalizeDiscountOptions(loadLocal().discountOptions || DEFAULT_DISCOUNT_OPTIONS)
-);
-const [newDiscountPercentage, setNewDiscountPercentage] = useState("");
 const [targetMarginPct, setTargetMarginPct] = useState(() => {
   const l = loadLocal();
   const v = Number(l?.targetMarginPct);
@@ -4041,11 +4001,11 @@ if (!hasMeaningfulActualCounts) {
   const [selectedBurger, setSelectedBurger] = useState(null);
   const [selectedExtras, setSelectedExtras] = useState([]);
   const [selectedQty, setSelectedQty] = useState(1);
-  const [cart, setCart] = useState([]);
-  const [newCategoryUnit, setNewCategoryUnit] = useState("piece");
-  const [worker, setWorker] = useState("");
-  const [payment, setPayment] = useState("");
-const [selectedDiscountId, setSelectedDiscountId] = useState("");
+const [cart, setCart] = useState([]);
+const [newCategoryUnit, setNewCategoryUnit] = useState("piece");
+const [worker, setWorker] = useState("");
+const [payment, setPayment] = useState("");
+const [orderDiscountInput, setOrderDiscountInput] = useState("");
 const [splitPay, setSplitPay] = useState(false);
 const [payA, setPayA] = useState("");
 const [payB, setPayB] = useState("");
@@ -4082,22 +4042,30 @@ const cartItemsSubtotal = useMemo(
 );
 const currentDeliveryFee =
   orderType === "Delivery" ? Math.max(0, Number(deliveryFee || 0)) : 0;
-const selectedDiscountOption = useMemo(
-  () =>
-    normalizeDiscountOptions(discountOptions).find(
-      (option) => option.id === selectedDiscountId
-    ) || null,
-  [discountOptions, selectedDiscountId]
+const requestedOrderDiscount = Number(orderDiscountInput || 0);
+const safeRequestedOrderDiscount =
+  Number.isFinite(requestedOrderDiscount) && requestedOrderDiscount > 0
+    ? requestedOrderDiscount
+    : 0;
+const currentDiscountAmount = normalizeFixedDiscountAmount(
+  safeRequestedOrderDiscount,
+  cartItemsSubtotal
 );
-const currentDiscountAmount = selectedDiscountOption
-  ? calculateDiscountAmount(
-      cartItemsSubtotal + currentDeliveryFee,
-      selectedDiscountOption.percentage
-    )
-  : 0;
+const discountExceedsSubtotal = safeRequestedOrderDiscount > cartItemsSubtotal;
 const currentOrderTotal = roundMoney(
-  Math.max(0, cartItemsSubtotal + currentDeliveryFee + currentDiscountAmount)
+  Math.max(0, cartItemsSubtotal + currentDeliveryFee - currentDiscountAmount)
 );
+const handleOrderDiscountChange = (value) => {
+  const next = String(value || "");
+  if (next === "" || /^\d*(?:\.\d{0,2})?$/.test(next)) {
+    setOrderDiscountInput(next);
+  }
+};
+const clampOrderDiscountInput = () => {
+  if (!orderDiscountInput) return;
+  const clamped = normalizeFixedDiscountAmount(orderDiscountInput, cartItemsSubtotal);
+  setOrderDiscountInput(clamped > 0 ? String(clamped) : "");
+};
 const [customerSearch, setCustomerSearch] = useState("");
 const [newZoneName, setNewZoneName] = useState("");
 const [newZoneFee, setNewZoneFee] = useState(0);
@@ -4341,8 +4309,6 @@ useEffect(() => {
   if (l.extraList) setExtraList(l.extraList);
   if (l.workers) setWorkers(l.workers);
  if (l.paymentMethods) setPaymentMethods(l.paymentMethods);
-  if (Array.isArray(l.discountOptions))
-    setDiscountOptions(normalizeDiscountOptions(l.discountOptions));
   if (l.orderTypes) setOrderTypes(l.orderTypes);
   if (typeof l.defaultDeliveryFee === "number") setDefaultDeliveryFee(l.defaultDeliveryFee);
   if (l.inventory) setInventory(l.inventory);
@@ -4451,7 +4417,6 @@ useEffect(() => { saveLocalPartial({ deliveryZones }); }, [deliveryZones]);     
 useEffect(() => { saveLocalPartial({ extraList }); }, [extraList]);
 useEffect(() => { saveLocalPartial({ workers }); }, [workers]);
 useEffect(() => { saveLocalPartial({ paymentMethods }); }, [paymentMethods]);
-useEffect(() => { saveLocalPartial({ discountOptions }); }, [discountOptions]);
 useEffect(() => { saveLocalPartial({ orderTypes }); }, [orderTypes]);
 useEffect(() => { saveLocalPartial({ defaultDeliveryFee }); }, [defaultDeliveryFee]);
 useEffect(() => { saveLocalPartial({ utilityBills }); }, [utilityBills]);
@@ -4464,12 +4429,6 @@ useEffect(() => { saveLocalPartial({ adminPins }); }, [adminPins]);
 useEffect(() => { saveLocalPartial({ dark }); }, [dark]);
 useEffect(() => { saveLocalPartial({ targetMarginPct }); }, [targetMarginPct]);
 useEffect(() => { saveLocalPartial({ showLowMarginOnly }); }, [showLowMarginOnly]);
-useEffect(() => {
-  if (!selectedDiscountId) return;
-  if (!normalizeDiscountOptions(discountOptions).some((option) => option.id === selectedDiscountId)) {
-    setSelectedDiscountId("");
-  }
-}, [discountOptions, selectedDiscountId]);
 useEffect(() => {
   if (orderType !== "Delivery") return;
   const p = String(deliveryPhone || "").trim();
@@ -4517,7 +4476,7 @@ useEffect(() => {
   setLastLocalEditAt(Date.now());
   // eslint-disable-next-line react-hooks/exhaustive-deps
 }, [
-  menu, extraList, workers, paymentMethods, discountOptions, orderTypes, defaultDeliveryFee,
+  menu, extraList, workers, paymentMethods, orderTypes, defaultDeliveryFee,
  inventory, adminPins, dark,
   bulkInventoryItems, bulkInventoryHistory,
   expenses, bankTx, dayMeta, inventoryLocked, inventorySnapshot, inventoryLockedAt,
@@ -4610,8 +4569,6 @@ const onlineOrderCollections = useMemo(() => ONLINE_ORDER_COLLECTIONS, []);
           if (unpacked.dark != null) setDark(unpacked.dark);
           if (unpacked.workers) setWorkers(unpacked.workers);
           if (unpacked.paymentMethods) setPaymentMethods(unpacked.paymentMethods);
-          if (unpacked.discountOptions)
-            setDiscountOptions(normalizeDiscountOptions(unpacked.discountOptions));
           if (unpacked.customers) setCustomers(dedupeCustomers(unpacked.customers));
           if (unpacked.inventoryLocked != null)
             setInventoryLocked(unpacked.inventoryLocked);
@@ -4679,8 +4636,6 @@ if (ts && lastLocalEditAt && ts < lastLocalEditAt) return;
       if (typeof unpacked.dark === "boolean") setDark(unpacked.dark);
       if (unpacked.workers) setWorkers(unpacked.workers);
       if (unpacked.paymentMethods) setPaymentMethods(unpacked.paymentMethods);
-      if (unpacked.discountOptions)
-        setDiscountOptions(normalizeDiscountOptions(unpacked.discountOptions));
       if (typeof unpacked.inventoryLocked === "boolean") setInventoryLocked(unpacked.inventoryLocked);
       if (unpacked.inventorySnapshot) setInventorySnapshot(unpacked.inventorySnapshot);
       if (unpacked.inventoryLockedAt != null) setInventoryLockedAt(unpacked.inventoryLockedAt);
@@ -4724,8 +4679,6 @@ if (unpacked.workerSessions) setWorkerSessions(unpacked.workerSessions);
       if (unpacked.dark != null) setDark(unpacked.dark);
       if (unpacked.workers) setWorkers(unpacked.workers);
       if (unpacked.paymentMethods) setPaymentMethods(unpacked.paymentMethods);
-      if (unpacked.discountOptions)
-        setDiscountOptions(normalizeDiscountOptions(unpacked.discountOptions));
       if (unpacked.inventoryLocked != null)
         setInventoryLocked(unpacked.inventoryLocked);
       if (unpacked.inventorySnapshot)
@@ -4783,7 +4736,6 @@ if (unpacked.workerSessions) setWorkerSessions(unpacked.workerSessions);
       dark,
       workers,
       paymentMethods,
-      discountOptions,
       inventoryLocked,
       inventorySnapshot,
       inventoryLockedAt,
@@ -4847,7 +4799,6 @@ useEffect(() => {
         dark,
         workers,
         paymentMethods,
-        discountOptions,
         inventoryLocked,
         inventorySnapshot,
         inventoryLockedAt,
@@ -4918,7 +4869,6 @@ useEffect(() => {
   dark,
   workers,
   paymentMethods,
-  discountOptions,
   inventoryLocked,
   inventorySnapshot,
   inventoryLockedAt,
@@ -6161,7 +6111,7 @@ const endDay = async () => {
     const validOrders = orders.filter((o) => !o.voided);
     const revenueExclDelivery = validOrders.reduce(
       (sum, order) =>
-        sum + Number(order.itemsTotal != null ? order.itemsTotal : order.total - (order.deliveryFee || 0)),
+        sum + getOrderNetItemsAmount(order),
       0
     );
     const expensesTotal = expenses.reduce((sum, expense) => sum + Number((expense.qty || 0) * (expense.unitPrice || 0)), 0);
@@ -6248,7 +6198,6 @@ const endDay = async () => {
           dark,
           workers,
           paymentMethods,
-          discountOptions,
           inventoryLocked,
           inventorySnapshot,
           inventoryLockedAt,
@@ -6473,9 +6422,9 @@ const checkout = async () => {
       })
     );
 
-    const itemsTotal = cartItemsSubtotal;
+    const itemsTotal = roundMoney(Math.max(0, cartItemsSubtotal - currentDiscountAmount));
     const delFee = currentDeliveryFee;
-    const discountPercentage = selectedDiscountOption?.percentage || 0;
+    const discountPercentage = 0;
     const discountAmount = currentDiscountAmount;
     const total = currentOrderTotal;
     let paymentLabel = payment;
@@ -6582,7 +6531,7 @@ const checkout = async () => {
     setCart([]);
     setWorker("");
     setPayment("");
-    setSelectedDiscountId("");
+    setOrderDiscountInput("");
     setOrderNote("");
     const defaultType = orderTypes[0] || "Take-Away";
     setOrderType(defaultType);
@@ -8055,13 +8004,12 @@ const endedStr   = m.endedAt   ? fmtDateTime(m.endedAt)   : "—";
       y = doc.lastAutoTable ? doc.lastAutoTable.finalY + 8 : 28;
       doc.text("Orders", 14, y);
       autoTable(doc, {
-   head: [["#", "Date", "Worker", "Payment", "Discount", "Discount (E£)", "Type", "Delivery (E£)", "Total (E£)", "Status", "Reason"]],
+   head: [["#", "Date", "Worker", "Payment", "Discount (E£)", "Type", "Delivery (E£)", "Total (E£)", "Status", "Reason"]],
    body: getSortedOrders().map((o) => [
   o.orderNo,
   fmtDateTime(o.date),
   o.worker,
   o.payment,
-  formatDiscountPercentage(o) || "0%",
   getOrderDiscountAmount(o).toFixed(2),
   o.orderType || "",
   (o.deliveryFee || 0).toFixed(2),
@@ -10037,7 +9985,7 @@ const cogs = Number(
 
               </div>
 
-              {/* Discounts group */}
+              {/* Discount */}
               <div
                 className="order-meta-card"
                 style={{
@@ -10047,43 +9995,37 @@ const cogs = Number(
                   background: dark ? "#191919" : "#fafafa",
                 }}
               >
-                <div style={{ fontWeight: 700, marginBottom: 6 }}>Discounts</div>
-                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                  {normalizeDiscountOptions(discountOptions).map((option) => {
-                    const active = selectedDiscountId === option.id;
-                    return (
-                      <button
-                        key={option.id}
-                        onClick={() =>
-                          setSelectedDiscountId((current) =>
-                            current === option.id ? "" : option.id
-                          )
-                        }
-                        style={{
-                          padding: "8px 10px",
-                          borderRadius: 8,
-                          border: `1px solid ${btnBorder}`,
-                          background: active ? "#c8e6c9" : "#fff",
-                          cursor: "pointer",
-                          fontWeight: active ? 800 : 600,
-                        }}
-                      >
-                        {formatDiscountOptionLabel(option)}
-                      </button>
-                    );
-                  })}
-                </div>
-                {discountOptions.length === 0 && (
-                  <div style={{ opacity: 0.8 }}>No discounts configured.</div>
-                )}
-                <div style={{ marginTop: 8, fontSize: 13, opacity: 0.85 }}>
-                  Applied:{" "}
-                  <b>
-                    {selectedDiscountOption
-                      ? `${formatDiscountOptionLabel(selectedDiscountOption, true)} (-E£${Math.abs(currentDiscountAmount).toFixed(2)})`
-                      : "0%"}
-                  </b>
-                </div>
+                <label style={{ display: "grid", gap: 4 }}>
+                  <span style={{ fontWeight: 700 }}>Discount</span>
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    placeholder="Enter discount amount"
+                    value={orderDiscountInput}
+                    onChange={(e) => handleOrderDiscountChange(e.target.value)}
+                    onBlur={clampOrderDiscountInput}
+                    style={{
+                      width: "100%",
+                      padding: 6,
+                      borderRadius: 6,
+                      border: `1px solid ${btnBorder}`,
+                      background: dark ? "#1e1e1e" : "white",
+                      color: dark ? "#eee" : "#000",
+                    }}
+                  />
+                </label>
+                <small
+                  style={{
+                    display: "block",
+                    marginTop: 6,
+                    color: discountExceedsSubtotal ? "#b71c1c" : undefined,
+                    opacity: 0.85,
+                  }}
+                >
+                  {discountExceedsSubtotal
+                    ? `Discount is capped at the subtotal (${cartItemsSubtotal.toFixed(2)}).`
+                    : "Fixed amount subtracted from the order subtotal."}
+                </small>
               </div>
 
               {/* Order type group */}
@@ -13694,7 +13636,6 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
                       <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>POS #</th>
                       <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Worker</th>
                       <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Payment</th>
-                      <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Discount</th>
                       <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Discount (E£)</th>
                       <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Type</th>
                       <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Items (E£)</th>
@@ -13709,7 +13650,6 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
                       const rawDelivery = Number(order.deliveryFee || 0);
                       const deliveryFeeValue = Number.isFinite(rawDelivery) ? rawDelivery : 0;
                       const discountAmount = getOrderDiscountAmount(order);
-                      const discountDisplay = formatDiscountPercentage(order) || "0%";
                       const rawTotal = Number(
                         order.total != null ? order.total : itemsOnly + deliveryFeeValue
                       );
@@ -13746,7 +13686,6 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
                           <td style={{ padding: 6, textAlign: "right" }}>{posDisplay}</td>
                           <td style={{ padding: 6 }}>{order.worker || "—"}</td>
                           <td style={{ padding: 6 }}>{paymentDisplay}</td>
-                          <td style={{ padding: 6 }}>{discountDisplay}</td>
                           <td style={{ padding: 6, textAlign: "right" }}>{discountAmount.toFixed(2)}</td>
                           <td style={{ padding: 6 }}>{order.orderType || "—"}</td>
                           <td style={{ padding: 6, textAlign: "right" }}>{itemsOnly.toFixed(2)}</td>
@@ -13758,7 +13697,7 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
                     })}
                     {reportOrdersDetailed.length === 0 && (
                       <tr>
-                        <td colSpan={11} style={{ padding: 8, opacity: 0.8 }}>
+                        <td colSpan={10} style={{ padding: 8, opacity: 0.8 }}>
                           No orders recorded for the selected period.
                         </td>
                       </tr>
@@ -14579,122 +14518,6 @@ setExtraList((arr) => [
             return alert("Payment method already exists.");
           setPaymentMethods((arr) => [...arr, v]);
           setNewPayment("");
-        }}
-        style={{
-          background: "#1976d2",
-          color: "#fff",
-          border: "none",
-          borderRadius: 6,
-          padding: "8px 12px",
-          cursor: "pointer",
-        }}
-      >
-        Add
-      </button>
-    </div>
-  </div>
-
-  {/* Discounts */}
-  <div
-    style={{
-      border: `1px solid ${btnBorder}`,
-      borderRadius: 8,
-      padding: 10,
-      background: dark ? "#191919" : "#fafafa",
-    }}
-  >
-    <div style={{ fontWeight: 700, marginBottom: 8 }}>Discounts</div>
-
-    <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
-      {discountOptions.map((option, idx) => (
-        <li
-          key={option.id || `discount-${option.percentage}-${idx}`}
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: 8,
-            padding: 6,
-            border: `1px solid ${btnBorder}`,
-            borderRadius: 6,
-            background: dark ? "#1e1e1e" : "#fff",
-            marginBottom: 6,
-            flexWrap: "wrap",
-          }}
-        >
-          <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
-            <input
-              type="number"
-              min="0.01"
-              max="100"
-              step="0.01"
-              value={option.percentage}
-              onChange={(e) => {
-                const raw = Number(e.target.value || 0);
-                const safe = Number.isFinite(raw)
-                  ? Number(Math.min(100, Math.max(0, raw)).toFixed(2))
-                  : 0;
-                setDiscountOptions((arr) =>
-                  arr.map((item) =>
-                    item.id === option.id ? { ...item, percentage: safe } : item
-                  )
-                );
-              }}
-              onBlur={() =>
-                setDiscountOptions((arr) => normalizeDiscountOptions(arr))
-              }
-              style={{ width: 90, padding: 6, borderRadius: 6, border: `1px solid ${btnBorder}` }}
-            />
-            %
-          </label>
-          <button
-            onClick={() =>
-              setDiscountOptions((arr) => arr.filter((item) => item.id !== option.id))
-            }
-            style={{
-              background: "#c62828",
-              color: "#fff",
-              border: "none",
-              borderRadius: 6,
-              padding: "4px 8px",
-              cursor: "pointer",
-            }}
-          >
-            Remove
-          </button>
-        </li>
-      ))}
-      {discountOptions.length === 0 && (
-        <li style={{ opacity: 0.8, padding: 6 }}>No discounts yet.</li>
-      )}
-    </ul>
-    <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
-      <input
-        type="number"
-        min="0.01"
-        max="100"
-        step="0.01"
-        placeholder="Percent"
-        value={newDiscountPercentage}
-        onChange={(e) => setNewDiscountPercentage(e.target.value)}
-        style={{ padding: 6, borderRadius: 6, border: `1px solid ${btnBorder}`, flex: 1 }}
-      />
-      <button
-        onClick={() => {
-          const percentage = normalizeDiscountPercentage(newDiscountPercentage);
-          if (percentage == null) return alert("Enter a percentage between 0.01 and 100.");
-          if (
-            discountOptions.some(
-              (option) => Number(option.percentage) === percentage
-            )
-          ) {
-            return alert("This discount already exists.");
-          }
-          setDiscountOptions((arr) => [
-            ...arr,
-            { id: `discount-${Date.now()}`, percentage },
-          ]);
-          setNewDiscountPercentage("");
         }}
         style={{
           background: "#1976d2",

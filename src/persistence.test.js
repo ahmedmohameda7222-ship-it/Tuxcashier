@@ -37,7 +37,6 @@ describe("state persistence helpers", () => {
       dark: true,
       workers: [{ id: "w1", name: "Alice" }],
       paymentMethods: ["Cash", "Card"],
-      discountOptions: [{ id: "discount-10", percentage: 10 }],
       inventoryLocked: false,
       inventorySnapshot: [{ id: "i1", qty: 3 }],
       inventoryLockedAt: sampleDate,
@@ -104,10 +103,6 @@ describe("state persistence helpers", () => {
   expect(packed.workerSessions[0].signInAt).toEqual(sampleDate.toISOString());
     expect(packed.onlineOrders[0].createdAt).toEqual(sampleDate.toISOString());
     expect(packed.lastSeenOnlineOrderTs).toBe(sampleDate.getTime());
-    expect(packed.discountOptions[0]).toEqual({
-      id: "discount-10",
-      percentage: 10,
-    });
 
     const unpacked = unpackStateFromCloud(packed);
 
@@ -115,7 +110,6 @@ describe("state persistence helpers", () => {
     expect(unpacked.workerSessions[0].signInAt).toBeInstanceOf(Date);
     expect(unpacked.orders[0].date).toBeInstanceOf(Date);
     expect(unpacked.orders[0].discountAmount).toBe(-1.2);
-    expect(unpacked.discountOptions[0].percentage).toBe(10);
     expect(unpacked.onlineOrdersRaw[0].createdAt).toBeInstanceOf(Date);
     expect(unpacked.onlineOrderStatus.o1.state).toBe("imported");
     expect(unpacked.lastSeenOnlineOrderTs).toBe(sampleDate.getTime());
