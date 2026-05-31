@@ -1102,6 +1102,7 @@ export function packStateForCloud(state) {
     dark,
     workers,
     paymentMethods,
+    discountFeeOptions,
     inventoryLocked,
     inventorySnapshot,
     inventoryLockedAt,
@@ -1170,6 +1171,7 @@ export function packStateForCloud(state) {
     dark,
     workers,
     paymentMethods,
+    discountFeeOptions: normalizeDiscountFeeOptions(discountFeeOptions),
     inventoryLocked,
     inventorySnapshot,
     inventoryLockedAt: toIso(inventoryLockedAt),
@@ -1411,6 +1413,8 @@ if (Array.isArray(data.orders)) {
   if (typeof data.dark === "boolean") out.dark = data.dark;
   if (Array.isArray(data.workers)) out.workers = data.workers;
   if (Array.isArray(data.paymentMethods)) out.paymentMethods = data.paymentMethods;
+  if (Array.isArray(data.discountFeeOptions))
+    out.discountFeeOptions = normalizeDiscountFeeOptions(data.discountFeeOptions);
   if (typeof data.inventoryLocked === "boolean") out.inventoryLocked = data.inventoryLocked;
   if (Array.isArray(data.inventorySnapshot)) out.inventorySnapshot = data.inventorySnapshot;
   if (data.adminPins) out.adminPins = data.adminPins;
@@ -1516,6 +1520,9 @@ function normalizeOrderForSupabase(order) {
     whatsapp_sent_at: toIso(normalized.whatsappSentAt),
     total: normalized.total,
     items_total: normalized.itemsTotal,
+    discount_fee_percentage: getOrderDiscountFeePercentage(normalized),
+    discount_fee_amount: getOrderDiscountFeeAmount(normalized),
+    discount_fee_type: getOrderDiscountFeeType(normalized),
     cash_received: normalized.cashReceived ?? null,
     change_due: normalized.changeDue ?? null,
     done: !!normalized.done,
@@ -1561,6 +1568,9 @@ function orderFromSupabaseRow(row = {}) {
     whatsappSentAt: row.whatsapp_sent_at ? asDate(row.whatsapp_sent_at) : null,
     total: Number(row.total || 0),
     itemsTotal: Number(row.items_total || 0),
+    discountFeePercentage: Number(row.discount_fee_percentage || 0),
+    discountFeeAmount: Number(row.discount_fee_amount || 0),
+    discountFeeType: row.discount_fee_type || "discount",
     cashReceived: row.cash_received != null ? Number(row.cash_received) : null,
   changeDue: row.change_due != null ? Number(row.change_due) : null,
     done: !!row.done,
@@ -1655,6 +1665,10 @@ function deriveOrderChannel(order) {
 function enrichOrderWithChannel(order) {
   if (!order) return order;
   const channel = deriveOrderChannel(order);
+  const discountFeeAmount = getOrderDiscountFeeAmount(order);
+  const discountFeePercentage = getOrderDiscountFeePercentage(order);
+  const discountFeeType =
+    discountFeeAmount > 0 ? "fee" : normalizeDiscountFeeType(order.discountFeeType);
   let channelOrderNo = order.channelOrderNo;
   if (channel === "onsite") {
     const baseNo = order.orderNo != null ? order.orderNo : channelOrderNo;
@@ -1668,7 +1682,14 @@ function enrichOrderWithChannel(order) {
     channelOrderNo =
       channelOrderNo || formatOnlineChannelOrderNo(order.orderNo, fallbackId, createdAtMs);
   }
-  return { ...order, channel, channelOrderNo };
+  return {
+    ...order,
+    channel,
+    channelOrderNo,
+    discountFeePercentage,
+    discountFeeAmount,
+    discountFeeType,
+  };
 }
 
 // eslint-disable-next-line no-unused-vars
@@ -2332,8 +2353,89 @@ const DEFAULT_LABOR_PROFILE = { payout: 0, productiveHours: 0 };
 const BASE_EQUIPMENT = [];
 const BASE_WORKERS = ["Hassan","Andiel", "Warda", "Ahmed", "Hazem",];
 const DEFAULT_PAYMENT_METHODS = ["Cash", "Card", "Instapay"];
+const DEFAULT_DISCOUNT_FEE_OPTIONS = [
+  { id: "discount-10", type: "discount", percentage: 10 },
+  { id: "discount-20", type: "discount", percentage: 20 },
+  { id: "discount-30", type: "discount", percentage: 30 },
+];
 const DEFAULT_ORDER_TYPES = ["Take-Away", "Dine-in", "Delivery"];
 const DEFAULT_DELIVERY_FEE = 20;
+const roundMoney = (value) => {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? Number(numeric.toFixed(2)) : 0;
+};
+const normalizeDiscountFeeType = (type) => (type === "fee" ? "fee" : "discount");
+const normalizeDiscountFeePercentage = (value) => {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return null;
+  const safe = Math.abs(numeric);
+  if (safe <= 0 || safe > 100) return null;
+  return Number(safe.toFixed(2));
+};
+function normalizeDiscountFeeOptions(options = DEFAULT_DISCOUNT_FEE_OPTIONS) {
+  const source = Array.isArray(options) ? options : DEFAULT_DISCOUNT_FEE_OPTIONS;
+  const seen = new Set();
+  const normalized = [];
+  source.forEach((option, idx) => {
+    const raw =
+      option && typeof option === "object"
+        ? option
+        : { percentage: option, type: "discount" };
+    const percentage = normalizeDiscountFeePercentage(raw.percentage ?? raw.value ?? raw.percent);
+    if (percentage == null) return;
+    const type = normalizeDiscountFeeType(raw.type);
+    const key = `${type}-${percentage}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    normalized.push({
+      id: String(raw.id || key || `discount-fee-${idx}`),
+      type,
+      percentage,
+    });
+  });
+  return normalized;
+}
+function calculateDiscountFeeAmount(baseAmount, percentage, type = "discount") {
+  const base = Math.max(0, Number(baseAmount || 0));
+  const safePercentage = normalizeDiscountFeePercentage(percentage);
+  if (!safePercentage || !Number.isFinite(base)) return 0;
+  const sign = normalizeDiscountFeeType(type) === "fee" ? 1 : -1;
+  return roundMoney(base * (safePercentage / 100) * sign);
+}
+function getOrderDiscountFeeAmount(order = {}) {
+  const raw = Number(order?.discountFeeAmount || 0);
+  return Number.isFinite(raw) ? roundMoney(raw) : 0;
+}
+function getOrderDiscountFeePercentage(order = {}) {
+  return normalizeDiscountFeePercentage(order?.discountFeePercentage) || 0;
+}
+function getOrderDiscountFeeType(order = {}) {
+  const amount = getOrderDiscountFeeAmount(order);
+  if (amount > 0) return "fee";
+  return normalizeDiscountFeeType(order?.discountFeeType);
+}
+function getOrderNetItemsAmount(order = {}) {
+  const delivery = Math.max(0, Number(order?.deliveryFee || 0));
+  const baseItems =
+    order?.itemsTotal != null
+      ? Number(order.itemsTotal || 0)
+      : Number(order?.total || 0) - delivery - getOrderDiscountFeeAmount(order);
+  const net = Number(baseItems || 0) + getOrderDiscountFeeAmount(order);
+  return roundMoney(Math.max(0, Number.isFinite(net) ? net : 0));
+}
+function formatDiscountFeePercentage(order = {}) {
+  const percentage = getOrderDiscountFeePercentage(order);
+  if (!percentage) return "";
+  const prefix = getOrderDiscountFeeType(order) === "fee" ? "+" : "-";
+  return `${prefix}${percentage}%`;
+}
+function formatDiscountFeeOptionLabel(option, includeType = false) {
+  const percentage = normalizeDiscountFeePercentage(option?.percentage) || 0;
+  const type = normalizeDiscountFeeType(option?.type);
+  const value = `${percentage}%`;
+  if (!includeType) return type === "fee" ? `+${value}` : value;
+  return type === "fee" ? `Fee +${value}` : `Discount ${value}`;
+}
 const UTILITY_UNIT_LABELS = {
   electricity: { amount: "Bill amount (E£)", units: "Usage on bill (kWh)", per: "E£ / kWh" },
   gas: { amount: "Bill amount (E£)", units: "Usage on bill (m³)", per: "E£ / m³" },
@@ -2458,13 +2560,7 @@ function sumPaymentsByMethod(orders = []) {
       continue;
     }
 
-    const rawDelivery = Number(order?.deliveryFee || 0);
-    const deliveryFee = Number.isFinite(rawDelivery) && rawDelivery > 0 ? rawDelivery : 0;
-    const baseItemsTotal =
-      order?.itemsTotal != null
-        ? Number(order.itemsTotal || 0)
-        : Number(order?.total || 0) - deliveryFee;
-    const itemsOnly = Number.isFinite(baseItemsTotal) ? Math.max(0, baseItemsTotal) : 0;
+    const itemsOnly = getOrderNetItemsAmount(order);
 
     if (!itemsOnly) continue;
 
@@ -2676,6 +2772,9 @@ function normalizeOrderPatchForSupabase(patch = {}) {
     notifyViaWhatsapp: "notify_via_whatsapp",
     whatsappSentAt: "whatsapp_sent_at",
     itemsTotal: "items_total",
+    discountFeePercentage: "discount_fee_percentage",
+    discountFeeAmount: "discount_fee_amount",
+    discountFeeType: "discount_fee_type",
     cashReceived: "cash_received",
     changeDue: "change_due",
     voidReason: "void_reason",
@@ -2898,6 +2997,9 @@ function buildReceiptHTML(order, widthMm = 80) {
     order.orderType === "Delivery"
       ? Math.max(0, Number(order.deliveryFee || 0))
       : 0;
+  const discountFeeAmount = getOrderDiscountFeeAmount(order);
+  const discountFeeLabel =
+    getOrderDiscountFeeType(order) === "fee" ? "Fee" : "Discount";
 
   const grandTotal =
     order.total != null ? Number(order.total || 0) : itemsSubtotal + deliveryFee;
@@ -3057,9 +3159,10 @@ const cashBlock = (() => {
       ${rowsHtml}
     </div>
     <div class="sep"></div>
-    <div class="totals">
+  <div class="totals">
   <div class="row"><div>Items Subtotal</div><div>${currency(itemsSubtotal)}</div></div>
   ${deliveryFee > 0 ? `<div class="row"><div>Delivery Fee</div><div>${currency(deliveryFee)}</div></div>` : ``}
+  ${discountFeeAmount !== 0 ? `<div class="row"><div>${discountFeeLabel}</div><div>${discountFeeAmount >= 0 ? "+" : "-"}${currency(Math.abs(discountFeeAmount))}</div></div>` : ``}
   <div class="row total"><div>TOTAL</div><div>${currency(grandTotal)}</div></div>
   ${paymentBreakdownHtml ? `<div class="row"><div style="font-weight:700">Paid by</div><div></div></div>` : ``}
   ${paymentBreakdownHtml}
@@ -3311,6 +3414,11 @@ const [adminSubTab, setAdminSubTab] = useState("inventory");
 const [newWorker, setNewWorker] = useState("");
 const [paymentMethods, setPaymentMethods] = useState(DEFAULT_PAYMENT_METHODS);
 const [newPayment, setNewPayment] = useState("");
+const [discountFeeOptions, setDiscountFeeOptions] = useState(() =>
+  normalizeDiscountFeeOptions(loadLocal().discountFeeOptions || DEFAULT_DISCOUNT_FEE_OPTIONS)
+);
+const [newDiscountFeePercentage, setNewDiscountFeePercentage] = useState("");
+const [newDiscountFeeType, setNewDiscountFeeType] = useState("discount");
 const [targetMarginPct, setTargetMarginPct] = useState(() => {
   const l = loadLocal();
   const v = Number(l?.targetMarginPct);
@@ -3955,6 +4063,7 @@ if (!hasMeaningfulActualCounts) {
   const [newCategoryUnit, setNewCategoryUnit] = useState("piece");
   const [worker, setWorker] = useState("");
   const [payment, setPayment] = useState("");
+const [selectedDiscountFeeId, setSelectedDiscountFeeId] = useState("");
 const [splitPay, setSplitPay] = useState(false);
 const [payA, setPayA] = useState("");
 const [payB, setPayB] = useState("");
@@ -3973,6 +4082,41 @@ const [customerName, setCustomerName] = useState("");
 const [customerPhone, setCustomerPhone] = useState("");
 const [customers, setCustomers] = useState([]);                         
 const [deliveryZones, setDeliveryZones] = useState(DEFAULT_ZONES);
+const cartItemsSubtotal = useMemo(
+  () =>
+    roundMoney(
+      cart.reduce((sum, item) => {
+        const extrasTotal = (item.extras || []).reduce(
+          (inner, extra) => inner + Number(extra.price || 0),
+          0
+        );
+        return (
+          sum +
+          (Number(item.price || 0) + extrasTotal) * Math.max(1, Number(item.qty || 1))
+        );
+      }, 0)
+    ),
+  [cart]
+);
+const currentDeliveryFee =
+  orderType === "Delivery" ? Math.max(0, Number(deliveryFee || 0)) : 0;
+const selectedDiscountFeeOption = useMemo(
+  () =>
+    normalizeDiscountFeeOptions(discountFeeOptions).find(
+      (option) => option.id === selectedDiscountFeeId
+    ) || null,
+  [discountFeeOptions, selectedDiscountFeeId]
+);
+const currentDiscountFeeAmount = selectedDiscountFeeOption
+  ? calculateDiscountFeeAmount(
+      cartItemsSubtotal + currentDeliveryFee,
+      selectedDiscountFeeOption.percentage,
+      selectedDiscountFeeOption.type
+    )
+  : 0;
+const currentOrderTotal = roundMoney(
+  Math.max(0, cartItemsSubtotal + currentDeliveryFee + currentDiscountFeeAmount)
+);
 const [customerSearch, setCustomerSearch] = useState("");
 const [newZoneName, setNewZoneName] = useState("");
 const [newZoneFee, setNewZoneFee] = useState(0);
@@ -4216,6 +4360,8 @@ useEffect(() => {
   if (l.extraList) setExtraList(l.extraList);
   if (l.workers) setWorkers(l.workers);
  if (l.paymentMethods) setPaymentMethods(l.paymentMethods);
+  if (Array.isArray(l.discountFeeOptions))
+    setDiscountFeeOptions(normalizeDiscountFeeOptions(l.discountFeeOptions));
   if (l.orderTypes) setOrderTypes(l.orderTypes);
   if (typeof l.defaultDeliveryFee === "number") setDefaultDeliveryFee(l.defaultDeliveryFee);
   if (l.inventory) setInventory(l.inventory);
@@ -4324,6 +4470,7 @@ useEffect(() => { saveLocalPartial({ deliveryZones }); }, [deliveryZones]);     
 useEffect(() => { saveLocalPartial({ extraList }); }, [extraList]);
 useEffect(() => { saveLocalPartial({ workers }); }, [workers]);
 useEffect(() => { saveLocalPartial({ paymentMethods }); }, [paymentMethods]);
+useEffect(() => { saveLocalPartial({ discountFeeOptions }); }, [discountFeeOptions]);
 useEffect(() => { saveLocalPartial({ orderTypes }); }, [orderTypes]);
 useEffect(() => { saveLocalPartial({ defaultDeliveryFee }); }, [defaultDeliveryFee]);
 useEffect(() => { saveLocalPartial({ utilityBills }); }, [utilityBills]);
@@ -4336,6 +4483,12 @@ useEffect(() => { saveLocalPartial({ adminPins }); }, [adminPins]);
 useEffect(() => { saveLocalPartial({ dark }); }, [dark]);
 useEffect(() => { saveLocalPartial({ targetMarginPct }); }, [targetMarginPct]);
 useEffect(() => { saveLocalPartial({ showLowMarginOnly }); }, [showLowMarginOnly]);
+useEffect(() => {
+  if (!selectedDiscountFeeId) return;
+  if (!normalizeDiscountFeeOptions(discountFeeOptions).some((option) => option.id === selectedDiscountFeeId)) {
+    setSelectedDiscountFeeId("");
+  }
+}, [discountFeeOptions, selectedDiscountFeeId]);
 useEffect(() => {
   if (orderType !== "Delivery") return;
   const p = String(deliveryPhone || "").trim();
@@ -4383,7 +4536,7 @@ useEffect(() => {
   setLastLocalEditAt(Date.now());
   // eslint-disable-next-line react-hooks/exhaustive-deps
 }, [
-  menu, extraList, workers, paymentMethods, orderTypes, defaultDeliveryFee,
+  menu, extraList, workers, paymentMethods, discountFeeOptions, orderTypes, defaultDeliveryFee,
  inventory, adminPins, dark,
   bulkInventoryItems, bulkInventoryHistory,
   expenses, bankTx, dayMeta, inventoryLocked, inventorySnapshot, inventoryLockedAt,
@@ -4476,6 +4629,8 @@ const onlineOrderCollections = useMemo(() => ONLINE_ORDER_COLLECTIONS, []);
           if (unpacked.dark != null) setDark(unpacked.dark);
           if (unpacked.workers) setWorkers(unpacked.workers);
           if (unpacked.paymentMethods) setPaymentMethods(unpacked.paymentMethods);
+          if (unpacked.discountFeeOptions)
+            setDiscountFeeOptions(normalizeDiscountFeeOptions(unpacked.discountFeeOptions));
           if (unpacked.customers) setCustomers(dedupeCustomers(unpacked.customers));
           if (unpacked.inventoryLocked != null)
             setInventoryLocked(unpacked.inventoryLocked);
@@ -4543,6 +4698,8 @@ if (ts && lastLocalEditAt && ts < lastLocalEditAt) return;
       if (typeof unpacked.dark === "boolean") setDark(unpacked.dark);
       if (unpacked.workers) setWorkers(unpacked.workers);
       if (unpacked.paymentMethods) setPaymentMethods(unpacked.paymentMethods);
+      if (unpacked.discountFeeOptions)
+        setDiscountFeeOptions(normalizeDiscountFeeOptions(unpacked.discountFeeOptions));
       if (typeof unpacked.inventoryLocked === "boolean") setInventoryLocked(unpacked.inventoryLocked);
       if (unpacked.inventorySnapshot) setInventorySnapshot(unpacked.inventorySnapshot);
       if (unpacked.inventoryLockedAt != null) setInventoryLockedAt(unpacked.inventoryLockedAt);
@@ -4586,6 +4743,8 @@ if (unpacked.workerSessions) setWorkerSessions(unpacked.workerSessions);
       if (unpacked.dark != null) setDark(unpacked.dark);
       if (unpacked.workers) setWorkers(unpacked.workers);
       if (unpacked.paymentMethods) setPaymentMethods(unpacked.paymentMethods);
+      if (unpacked.discountFeeOptions)
+        setDiscountFeeOptions(normalizeDiscountFeeOptions(unpacked.discountFeeOptions));
       if (unpacked.inventoryLocked != null)
         setInventoryLocked(unpacked.inventoryLocked);
       if (unpacked.inventorySnapshot)
@@ -4643,6 +4802,7 @@ if (unpacked.workerSessions) setWorkerSessions(unpacked.workerSessions);
       dark,
       workers,
       paymentMethods,
+      discountFeeOptions,
       inventoryLocked,
       inventorySnapshot,
       inventoryLockedAt,
@@ -4706,6 +4866,7 @@ useEffect(() => {
         dark,
         workers,
         paymentMethods,
+        discountFeeOptions,
         inventoryLocked,
         inventorySnapshot,
         inventoryLockedAt,
@@ -4776,6 +4937,7 @@ useEffect(() => {
   dark,
   workers,
   paymentMethods,
+  discountFeeOptions,
   inventoryLocked,
   inventorySnapshot,
   inventoryLockedAt,
@@ -6105,6 +6267,7 @@ const endDay = async () => {
           dark,
           workers,
           paymentMethods,
+          discountFeeOptions,
           inventoryLocked,
           inventorySnapshot,
           inventoryLockedAt,
@@ -6329,13 +6492,12 @@ const checkout = async () => {
       })
     );
 
-    const itemsTotal = cartWithUses.reduce((s, b) => {
-      const ex = (b.extras || []).reduce((t, e) => t + Number(e.price || 0), 0);
-      return s + (Number(b.price || 0) + ex) * Number(b.qty || 1);
-    }, 0);
-    const delFee =
-      orderType === "Delivery" ? Math.max(0, Number(deliveryFee || 0)) : 0;
-    const total = itemsTotal + delFee;
+    const itemsTotal = cartItemsSubtotal;
+    const delFee = currentDeliveryFee;
+    const discountFeePercentage = selectedDiscountFeeOption?.percentage || 0;
+    const discountFeeType = selectedDiscountFeeOption?.type || "discount";
+    const discountFeeAmount = currentDiscountFeeAmount;
+    const total = currentOrderTotal;
     let paymentLabel = payment;
     let paymentParts = [];
     if (splitPay) {
@@ -6387,6 +6549,9 @@ const checkout = async () => {
       whatsappSentAt: null,
       total,
       itemsTotal,
+      discountFeePercentage,
+      discountFeeAmount,
+      discountFeeType,
       cashReceived: cashVal,
       changeDue,
       cart: cartWithUses,
@@ -6438,6 +6603,7 @@ const checkout = async () => {
     setCart([]);
     setWorker("");
     setPayment("");
+    setSelectedDiscountFeeId("");
     setOrderNote("");
     const defaultType = orderTypes[0] || "Take-Away";
     setOrderType(defaultType);
@@ -6667,6 +6833,9 @@ const onlineFallbackId =
     whatsappSentAt: null,
     total,
     itemsTotal,
+    discountFeePercentage: 0,
+    discountFeeAmount: 0,
+    discountFeeType: "discount",
     cashReceived: null,
     changeDue: null,
     cart: cartWithUses,
@@ -7542,6 +7711,15 @@ const totals = useMemo(() => {
   ]);
 
 
+  const reportDiscountFeeTotal = useMemo(
+    () =>
+      reportOrders.reduce(
+        (sum, order) => (order?.voided ? sum : sum + getOrderDiscountFeeAmount(order)),
+        0
+      ),
+    [reportOrders]
+  );
+
   const salesStats = useMemo(() => {
     const itemMap = new Map();
     const extraMap = new Map();
@@ -7899,12 +8077,14 @@ const endedStr   = m.endedAt   ? fmtDateTime(m.endedAt)   : "—";
       y = doc.lastAutoTable ? doc.lastAutoTable.finalY + 8 : 28;
       doc.text("Orders", 14, y);
       autoTable(doc, {
-   head: [["#", "Date", "Worker", "Payment", "Type", "Delivery (E£)", "Total (E£)", "Status", "Reason"]],
+   head: [["#", "Date", "Worker", "Payment", "Discount/Fee", "Disc/Fee (E£)", "Type", "Delivery (E£)", "Total (E£)", "Status", "Reason"]],
    body: getSortedOrders().map((o) => [
   o.orderNo,
   fmtDateTime(o.date),
   o.worker,
   o.payment,
+  formatDiscountFeePercentage(o) || "0%",
+  getOrderDiscountFeeAmount(o).toFixed(2),
   o.orderType || "",
   (o.deliveryFee || 0).toFixed(2),
   o.total.toFixed(2),
@@ -7921,6 +8101,7 @@ const endedStr   = m.endedAt   ? fmtDateTime(m.endedAt)   : "—";
      const totalsBody = [
         ["Revenue (Shift, excl. delivery)", totals.revenueTotal.toFixed(2)],
         ["Delivery Fees (not in revenue)", totals.deliveryFeesTotal.toFixed(2)],
+        ["Discounts / Fees", reportDiscountFeeTotal.toFixed(2)],
         ["Purchases (Shift)", totals.purchasesTotal.toFixed(2)],
         ["Expenses (Shift)", totals.expensesTotal.toFixed(2)],
         [
@@ -9699,7 +9880,7 @@ const cogs = Number(
               className="order-meta-grid"
               style={{
                 display: "grid",
-                gridTemplateColumns: "1fr 1fr 1fr",
+                gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
                 gap: 8,
               }}
             >
@@ -9844,11 +10025,7 @@ const cogs = Number(
         {(
           Math.max(
             0,
-            Number(cashReceived || 0) -
-              (cart.reduce((s, b) => {
-                const ex = (b.extras || []).reduce((t, e) => t + Number(e.price || 0), 0);
-                return s + (Number(b.price || 0) + ex) * Number(b.qty || 1);
-              }, 0) + (orderType === "Delivery" ? Number(deliveryFee || 0) : 0))
+            Number(cashReceived || 0) - currentOrderTotal
           ) || 0
         ).toFixed(2)}
       </b>
@@ -9880,6 +10057,55 @@ const cogs = Number(
   </div>
 )}
 
+              </div>
+
+              {/* Discounts / Fees group */}
+              <div
+                className="order-meta-card"
+                style={{
+                  border: `1px solid ${btnBorder}`,
+                  borderRadius: 8,
+                  padding: 8,
+                  background: dark ? "#191919" : "#fafafa",
+                }}
+              >
+                <div style={{ fontWeight: 700, marginBottom: 6 }}>Discounts / Fees</div>
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  {normalizeDiscountFeeOptions(discountFeeOptions).map((option) => {
+                    const active = selectedDiscountFeeId === option.id;
+                    return (
+                      <button
+                        key={option.id}
+                        onClick={() =>
+                          setSelectedDiscountFeeId((current) =>
+                            current === option.id ? "" : option.id
+                          )
+                        }
+                        style={{
+                          padding: "8px 10px",
+                          borderRadius: 8,
+                          border: `1px solid ${btnBorder}`,
+                          background: active ? "#c8e6c9" : "#fff",
+                          cursor: "pointer",
+                          fontWeight: active ? 800 : 600,
+                        }}
+                      >
+                        {formatDiscountFeeOptionLabel(option)}
+                      </button>
+                    );
+                  })}
+                </div>
+                {discountFeeOptions.length === 0 && (
+                  <div style={{ opacity: 0.8 }}>No discounts or fees configured.</div>
+                )}
+                <div style={{ marginTop: 8, fontSize: 13, opacity: 0.85 }}>
+                  Applied:{" "}
+                  <b>
+                    {selectedDiscountFeeOption
+                      ? `${formatDiscountFeeOptionLabel(selectedDiscountFeeOption, true)} (${currentDiscountFeeAmount >= 0 ? "+" : "-"}E£${Math.abs(currentDiscountFeeAmount).toFixed(2)})`
+                      : "0%"}
+                  </b>
+                </div>
               </div>
 
               {/* Order type group */}
@@ -10067,23 +10293,33 @@ const cogs = Number(
                 flexWrap: "wrap",
               }}
             >
-              <div>
-                <strong>Order Total (incl. delivery):</strong>{" "}
-                E£
-                {(
-                  cart.reduce((s, b) => {
-                    const ex = (b.extras || []).reduce(
-                      (t, e) => t + Number(e.price || 0),
-                      0
-                    );
-                    return (
-                      s + (Number(b.price || 0) + ex) * Number(b.qty || 1)
-                    );
-                  }, 0) +
-                  (orderType === "Delivery"
-                    ? Number(deliveryFee || 0)
-                    : 0)
-                ).toFixed(2)}
+              <div style={{ display: "grid", gap: 3 }}>
+                <div>
+                  <strong>Subtotal:</strong> E£{cartItemsSubtotal.toFixed(2)}
+                </div>
+                {currentDeliveryFee > 0 && (
+                  <div>
+                    <strong>Delivery:</strong> E£{currentDeliveryFee.toFixed(2)}
+                  </div>
+                )}
+                {currentDiscountFeeAmount !== 0 && (
+                  <div>
+                    <strong>
+                      {getOrderDiscountFeeType({
+                        discountFeeAmount: currentDiscountFeeAmount,
+                        discountFeeType: selectedDiscountFeeOption?.type,
+                      }) === "fee"
+                        ? "Fee"
+                        : "Discount"}
+                      :
+                    </strong>{" "}
+                    {currentDiscountFeeAmount >= 0 ? "+" : "-"}E£
+                    {Math.abs(currentDiscountFeeAmount).toFixed(2)}
+                  </div>
+                )}
+                <div>
+                  <strong>Final Total:</strong> E£{currentOrderTotal.toFixed(2)}
+                </div>
               </div>
 
               <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -13453,6 +13689,9 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
                 label: "Delivery Fees:",
                 value: totals.deliveryFeesTotal.toFixed(2),
               }, {
+                label: "Discounts / Fees:",
+                value: reportDiscountFeeTotal.toFixed(2),
+              }, {
                 label: "Purchases:",
                 value: totals.purchasesTotal.toFixed(2),
               }, {
@@ -13487,6 +13726,8 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
                       <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>POS #</th>
                       <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Worker</th>
                       <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Payment</th>
+                      <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Discount/Fee</th>
+                      <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Disc/Fee (E£)</th>
                       <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Type</th>
                       <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Items (E£)</th>
                       <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Delivery (E£)</th>
@@ -13496,14 +13737,11 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
                   </thead>
                   <tbody>
                     {reportOrdersDetailed.map((order, idx) => {
-                      const rawItemsOnly = Number(
-                        order.itemsTotal != null
-                          ? order.itemsTotal
-                          : (order.total || 0) - (order.deliveryFee || 0)
-                      );
-                      const itemsOnly = Number.isFinite(rawItemsOnly) ? rawItemsOnly : 0;
+                      const itemsOnly = getOrderNetItemsAmount(order);
                       const rawDelivery = Number(order.deliveryFee || 0);
                       const deliveryFeeValue = Number.isFinite(rawDelivery) ? rawDelivery : 0;
+                      const discountFeeAmount = getOrderDiscountFeeAmount(order);
+                      const discountFeeDisplay = formatDiscountFeePercentage(order) || "0%";
                       const rawTotal = Number(
                         order.total != null ? order.total : itemsOnly + deliveryFeeValue
                       );
@@ -13540,6 +13778,8 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
                           <td style={{ padding: 6, textAlign: "right" }}>{posDisplay}</td>
                           <td style={{ padding: 6 }}>{order.worker || "—"}</td>
                           <td style={{ padding: 6 }}>{paymentDisplay}</td>
+                          <td style={{ padding: 6 }}>{discountFeeDisplay}</td>
+                          <td style={{ padding: 6, textAlign: "right" }}>{discountFeeAmount.toFixed(2)}</td>
                           <td style={{ padding: 6 }}>{order.orderType || "—"}</td>
                           <td style={{ padding: 6, textAlign: "right" }}>{itemsOnly.toFixed(2)}</td>
                           <td style={{ padding: 6, textAlign: "right" }}>{deliveryFeeValue.toFixed(2)}</td>
@@ -13550,7 +13790,7 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
                     })}
                     {reportOrdersDetailed.length === 0 && (
                       <tr>
-                        <td colSpan={9} style={{ padding: 8, opacity: 0.8 }}>
+                        <td colSpan={11} style={{ padding: 8, opacity: 0.8 }}>
                           No orders recorded for the selected period.
                         </td>
                       </tr>
@@ -14371,6 +14611,149 @@ setExtraList((arr) => [
             return alert("Payment method already exists.");
           setPaymentMethods((arr) => [...arr, v]);
           setNewPayment("");
+        }}
+        style={{
+          background: "#1976d2",
+          color: "#fff",
+          border: "none",
+          borderRadius: 6,
+          padding: "8px 12px",
+          cursor: "pointer",
+        }}
+      >
+        Add
+      </button>
+    </div>
+  </div>
+
+  {/* Discounts / Fees */}
+  <div
+    style={{
+      border: `1px solid ${btnBorder}`,
+      borderRadius: 8,
+      padding: 10,
+      background: dark ? "#191919" : "#fafafa",
+    }}
+  >
+    <div style={{ fontWeight: 700, marginBottom: 8 }}>Discounts / Fees</div>
+
+    <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+      {discountFeeOptions.map((option, idx) => (
+        <li
+          key={option.id || `${option.type}-${option.percentage}-${idx}`}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 8,
+            padding: 6,
+            border: `1px solid ${btnBorder}`,
+            borderRadius: 6,
+            background: dark ? "#1e1e1e" : "#fff",
+            marginBottom: 6,
+            flexWrap: "wrap",
+          }}
+        >
+          <select
+            value={normalizeDiscountFeeType(option.type)}
+            onChange={(e) =>
+              setDiscountFeeOptions((arr) =>
+                normalizeDiscountFeeOptions(
+                  arr.map((item) =>
+                    item.id === option.id ? { ...item, type: e.target.value } : item
+                  )
+                )
+              )
+            }
+            style={{ padding: 6, borderRadius: 6, border: `1px solid ${btnBorder}` }}
+          >
+            <option value="discount">Discount</option>
+            <option value="fee">Fee</option>
+          </select>
+          <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <input
+              type="number"
+              min="0.01"
+              max="100"
+              step="0.01"
+              value={option.percentage}
+              onChange={(e) => {
+                const raw = Number(e.target.value || 0);
+                const safe = Number.isFinite(raw)
+                  ? Number(Math.min(100, Math.max(0, raw)).toFixed(2))
+                  : 0;
+                setDiscountFeeOptions((arr) =>
+                  arr.map((item) =>
+                    item.id === option.id ? { ...item, percentage: safe } : item
+                  )
+                );
+              }}
+              onBlur={() =>
+                setDiscountFeeOptions((arr) => normalizeDiscountFeeOptions(arr))
+              }
+              style={{ width: 90, padding: 6, borderRadius: 6, border: `1px solid ${btnBorder}` }}
+            />
+            %
+          </label>
+          <button
+            onClick={() =>
+              setDiscountFeeOptions((arr) => arr.filter((item) => item.id !== option.id))
+            }
+            style={{
+              background: "#c62828",
+              color: "#fff",
+              border: "none",
+              borderRadius: 6,
+              padding: "4px 8px",
+              cursor: "pointer",
+            }}
+          >
+            Remove
+          </button>
+        </li>
+      ))}
+      {discountFeeOptions.length === 0 && (
+        <li style={{ opacity: 0.8, padding: 6 }}>No discounts or fees yet.</li>
+      )}
+    </ul>
+    <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+      <select
+        value={newDiscountFeeType}
+        onChange={(e) => setNewDiscountFeeType(normalizeDiscountFeeType(e.target.value))}
+        style={{ padding: 6, borderRadius: 6, border: `1px solid ${btnBorder}` }}
+      >
+        <option value="discount">Discount</option>
+        <option value="fee">Fee</option>
+      </select>
+      <input
+        type="number"
+        min="0.01"
+        max="100"
+        step="0.01"
+        placeholder="Percent"
+        value={newDiscountFeePercentage}
+        onChange={(e) => setNewDiscountFeePercentage(e.target.value)}
+        style={{ padding: 6, borderRadius: 6, border: `1px solid ${btnBorder}`, flex: 1 }}
+      />
+      <button
+        onClick={() => {
+          const percentage = normalizeDiscountFeePercentage(newDiscountFeePercentage);
+          if (percentage == null) return alert("Enter a percentage between 0.01 and 100.");
+          const type = normalizeDiscountFeeType(newDiscountFeeType);
+          if (
+            discountFeeOptions.some(
+              (option) =>
+                normalizeDiscountFeeType(option.type) === type &&
+                Number(option.percentage) === percentage
+            )
+          ) {
+            return alert("This discount/fee already exists.");
+          }
+          setDiscountFeeOptions((arr) => [
+            ...arr,
+            { id: `discount-fee-${Date.now()}`, type, percentage },
+          ]);
+          setNewDiscountFeePercentage("");
         }}
         style={{
           background: "#1976d2",
