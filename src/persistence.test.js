@@ -16,9 +16,8 @@ describe("state persistence helpers", () => {
           deliveryFee: 0,
           total: 12,
           itemsTotal: 12,
-          discountFeePercentage: 10,
-          discountFeeAmount: -1.2,
-          discountFeeType: "discount",
+          discountPercentage: 10,
+          discountAmount: -1.2,
           cashReceived: 20,
           changeDue: 8,
           done: true,
@@ -38,7 +37,7 @@ describe("state persistence helpers", () => {
       dark: true,
       workers: [{ id: "w1", name: "Alice" }],
       paymentMethods: ["Cash", "Card"],
-      discountFeeOptions: [{ id: "discount-10", type: "discount", percentage: 10 }],
+      discountOptions: [{ id: "discount-10", percentage: 10 }],
       inventoryLocked: false,
       inventorySnapshot: [{ id: "i1", qty: 3 }],
       inventoryLockedAt: sampleDate,
@@ -105,9 +104,8 @@ describe("state persistence helpers", () => {
   expect(packed.workerSessions[0].signInAt).toEqual(sampleDate.toISOString());
     expect(packed.onlineOrders[0].createdAt).toEqual(sampleDate.toISOString());
     expect(packed.lastSeenOnlineOrderTs).toBe(sampleDate.getTime());
-    expect(packed.discountFeeOptions[0]).toEqual({
+    expect(packed.discountOptions[0]).toEqual({
       id: "discount-10",
-      type: "discount",
       percentage: 10,
     });
 
@@ -116,8 +114,8 @@ describe("state persistence helpers", () => {
     expect(unpacked.realtimeOrders).toBe(false);
     expect(unpacked.workerSessions[0].signInAt).toBeInstanceOf(Date);
     expect(unpacked.orders[0].date).toBeInstanceOf(Date);
-    expect(unpacked.orders[0].discountFeeAmount).toBe(-1.2);
-    expect(unpacked.discountFeeOptions[0].percentage).toBe(10);
+    expect(unpacked.orders[0].discountAmount).toBe(-1.2);
+    expect(unpacked.discountOptions[0].percentage).toBe(10);
     expect(unpacked.onlineOrdersRaw[0].createdAt).toBeInstanceOf(Date);
     expect(unpacked.onlineOrderStatus.o1.state).toBe("imported");
     expect(unpacked.lastSeenOnlineOrderTs).toBe(sampleDate.getTime());
