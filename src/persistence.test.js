@@ -16,7 +16,7 @@ describe("state persistence helpers", () => {
           deliveryFee: 0,
           total: 10.8,
           itemsTotal: 10.8,
-          discountPercentage: 10,
+          discountPercentage: 0,
           discountAmount: 1.2,
           cashReceived: 20,
           changeDue: 9.2,
@@ -109,7 +109,7 @@ describe("state persistence helpers", () => {
     expect(unpacked.realtimeOrders).toBe(false);
     expect(unpacked.workerSessions[0].signInAt).toBeInstanceOf(Date);
     expect(unpacked.orders[0].date).toBeInstanceOf(Date);
-    expect(unpacked.orders[0].discountPercentage).toBe(10);
+    expect(unpacked.orders[0].discountPercentage).toBe(0);
     expect(unpacked.orders[0].discountAmount).toBe(1.2);
     expect(unpacked.onlineOrdersRaw[0].createdAt).toBeInstanceOf(Date);
     expect(unpacked.onlineOrderStatus.o1.state).toBe("imported");
