@@ -11,15 +11,15 @@ describe("state persistence helpers", () => {
           orderNo: 1,
           worker: "Alice",
           payment: "Cash",
-          paymentParts: [{ method: "Cash", amount: 12 }],
+          paymentParts: [{ method: "Cash", amount: 10.8 }],
           orderType: "dine_in",
           deliveryFee: 0,
-          total: 12,
-          itemsTotal: 12,
+          total: 10.8,
+          itemsTotal: 10.8,
           discountPercentage: 10,
-          discountAmount: -1.2,
+          discountAmount: 1.2,
           cashReceived: 20,
-          changeDue: 8,
+          changeDue: 9.2,
           done: true,
           voided: false,
           note: "Thanks",
@@ -109,7 +109,8 @@ describe("state persistence helpers", () => {
     expect(unpacked.realtimeOrders).toBe(false);
     expect(unpacked.workerSessions[0].signInAt).toBeInstanceOf(Date);
     expect(unpacked.orders[0].date).toBeInstanceOf(Date);
-    expect(unpacked.orders[0].discountAmount).toBe(-1.2);
+    expect(unpacked.orders[0].discountPercentage).toBe(10);
+    expect(unpacked.orders[0].discountAmount).toBe(1.2);
     expect(unpacked.onlineOrdersRaw[0].createdAt).toBeInstanceOf(Date);
     expect(unpacked.onlineOrderStatus.o1.state).toBe("imported");
     expect(unpacked.lastSeenOnlineOrderTs).toBe(sampleDate.getTime());

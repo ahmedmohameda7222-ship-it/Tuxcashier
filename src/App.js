@@ -2350,20 +2350,23 @@ const roundMoney = (value) => {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? Number(numeric.toFixed(2)) : 0;
 };
-function normalizeFixedDiscountAmount(value, subtotal = Infinity) {
+const normalizeDiscountPercentage = (value) => {
   const numeric = Number(value || 0);
   if (!Number.isFinite(numeric) || numeric <= 0) return 0;
-  const max = Number.isFinite(Number(subtotal))
-    ? Math.max(0, Number(subtotal))
-    : Infinity;
-  return roundMoney(Math.min(numeric, max));
+  return roundMoney(Math.min(numeric, 100));
+};
+function calculatePercentageDiscountAmount(subtotal, percentage) {
+  const base = Math.max(0, Number(subtotal || 0));
+  const safePercentage = normalizeDiscountPercentage(percentage);
+  if (!base || !safePercentage) return 0;
+  return roundMoney(base * (safePercentage / 100));
 }
 function getOrderDiscountAmount(order = {}) {
   const raw = Number(order?.discountAmount ?? order?.discount ?? 0);
   return Number.isFinite(raw) ? Math.abs(roundMoney(raw)) : 0;
 }
 function getOrderDiscountPercentage(order = {}) {
-  return 0;
+  return normalizeDiscountPercentage(order?.discountPercentage);
 }
 function getOrderNetItemsAmount(order = {}) {
   const delivery = Math.max(0, Number(order?.deliveryFee || 0));
@@ -4042,16 +4045,14 @@ const cartItemsSubtotal = useMemo(
 );
 const currentDeliveryFee =
   orderType === "Delivery" ? Math.max(0, Number(deliveryFee || 0)) : 0;
-const requestedOrderDiscount = Number(orderDiscountInput || 0);
-const safeRequestedOrderDiscount =
-  Number.isFinite(requestedOrderDiscount) && requestedOrderDiscount > 0
-    ? requestedOrderDiscount
-    : 0;
-const currentDiscountAmount = normalizeFixedDiscountAmount(
-  safeRequestedOrderDiscount,
-  cartItemsSubtotal
+const requestedDiscountPercent = Number(orderDiscountInput || 0);
+const currentDiscountPercent = normalizeDiscountPercentage(requestedDiscountPercent);
+const discountPercentExceedsLimit =
+  Number.isFinite(requestedDiscountPercent) && requestedDiscountPercent > 100;
+const currentDiscountAmount = calculatePercentageDiscountAmount(
+  cartItemsSubtotal,
+  currentDiscountPercent
 );
-const discountExceedsSubtotal = safeRequestedOrderDiscount > cartItemsSubtotal;
 const currentOrderTotal = roundMoney(
   Math.max(0, cartItemsSubtotal + currentDeliveryFee - currentDiscountAmount)
 );
@@ -4063,7 +4064,7 @@ const handleOrderDiscountChange = (value) => {
 };
 const clampOrderDiscountInput = () => {
   if (!orderDiscountInput) return;
-  const clamped = normalizeFixedDiscountAmount(orderDiscountInput, cartItemsSubtotal);
+  const clamped = normalizeDiscountPercentage(orderDiscountInput);
   setOrderDiscountInput(clamped > 0 ? String(clamped) : "");
 };
 const [customerSearch, setCustomerSearch] = useState("");
@@ -6424,7 +6425,7 @@ const checkout = async () => {
 
     const itemsTotal = roundMoney(Math.max(0, cartItemsSubtotal - currentDiscountAmount));
     const delFee = currentDeliveryFee;
-    const discountPercentage = 0;
+    const discountPercentage = currentDiscountPercent;
     const discountAmount = currentDiscountAmount;
     const total = currentOrderTotal;
     let paymentLabel = payment;
@@ -8004,12 +8005,13 @@ const endedStr   = m.endedAt   ? fmtDateTime(m.endedAt)   : "—";
       y = doc.lastAutoTable ? doc.lastAutoTable.finalY + 8 : 28;
       doc.text("Orders", 14, y);
       autoTable(doc, {
-   head: [["#", "Date", "Worker", "Payment", "Discount (E£)", "Type", "Delivery (E£)", "Total (E£)", "Status", "Reason"]],
+   head: [["#", "Date", "Worker", "Payment", "Discount (%)", "Discount (E£)", "Type", "Delivery (E£)", "Total (E£)", "Status", "Reason"]],
    body: getSortedOrders().map((o) => [
   o.orderNo,
   fmtDateTime(o.date),
   o.worker,
   o.payment,
+  `${getOrderDiscountPercentage(o)}%`,
   getOrderDiscountAmount(o).toFixed(2),
   o.orderType || "",
   (o.deliveryFee || 0).toFixed(2),
@@ -9996,16 +9998,19 @@ const cogs = Number(
                 }}
               >
                 <label style={{ display: "grid", gap: 4 }}>
-                  <span style={{ fontWeight: 700 }}>Discount</span>
+                  <span style={{ fontWeight: 700 }}>Discount (%)</span>
                   <input
                     type="text"
                     inputMode="decimal"
-                    placeholder="Enter discount amount"
+                    placeholder="Enter discount percentage"
                     value={orderDiscountInput}
                     onChange={(e) => handleOrderDiscountChange(e.target.value)}
                     onBlur={clampOrderDiscountInput}
                     style={{
                       width: "100%",
+                      maxWidth: "100%",
+                      minWidth: 0,
+                      boxSizing: "border-box",
                       padding: 6,
                       borderRadius: 6,
                       border: `1px solid ${btnBorder}`,
@@ -10014,18 +10019,18 @@ const cogs = Number(
                     }}
                   />
                 </label>
-                <small
-                  style={{
-                    display: "block",
-                    marginTop: 6,
-                    color: discountExceedsSubtotal ? "#b71c1c" : undefined,
-                    opacity: 0.85,
-                  }}
-                >
-                  {discountExceedsSubtotal
-                    ? `Discount is capped at the subtotal (${cartItemsSubtotal.toFixed(2)}).`
-                    : "Fixed amount subtracted from the order subtotal."}
-                </small>
+                {discountPercentExceedsLimit && (
+                  <small
+                    style={{
+                      display: "block",
+                      marginTop: 6,
+                      color: "#b71c1c",
+                      opacity: 0.85,
+                    }}
+                  >
+                    Max 100%.
+                  </small>
+                )}
               </div>
 
               {/* Order type group */}
@@ -10224,7 +10229,7 @@ const cogs = Number(
                 )}
                 {currentDiscountAmount !== 0 && (
                   <div>
-                    <strong>Discount:</strong> -E£{Math.abs(currentDiscountAmount).toFixed(2)}
+                    <strong>Discount ({currentDiscountPercent}%):</strong> -E£{Math.abs(currentDiscountAmount).toFixed(2)}
                   </div>
                 )}
                 <div>
@@ -13636,6 +13641,7 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
                       <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>POS #</th>
                       <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Worker</th>
                       <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Payment</th>
+                      <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Discount (%)</th>
                       <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Discount (E£)</th>
                       <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Type</th>
                       <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Items (E£)</th>
@@ -13649,6 +13655,7 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
                       const itemsOnly = getOrderNetItemsAmount(order);
                       const rawDelivery = Number(order.deliveryFee || 0);
                       const deliveryFeeValue = Number.isFinite(rawDelivery) ? rawDelivery : 0;
+                      const discountPercent = getOrderDiscountPercentage(order);
                       const discountAmount = getOrderDiscountAmount(order);
                       const rawTotal = Number(
                         order.total != null ? order.total : itemsOnly + deliveryFeeValue
@@ -13686,6 +13693,7 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
                           <td style={{ padding: 6, textAlign: "right" }}>{posDisplay}</td>
                           <td style={{ padding: 6 }}>{order.worker || "—"}</td>
                           <td style={{ padding: 6 }}>{paymentDisplay}</td>
+                          <td style={{ padding: 6, textAlign: "right" }}>{discountPercent.toFixed(2).replace(/\.00$/, "")}%</td>
                           <td style={{ padding: 6, textAlign: "right" }}>{discountAmount.toFixed(2)}</td>
                           <td style={{ padding: 6 }}>{order.orderType || "—"}</td>
                           <td style={{ padding: 6, textAlign: "right" }}>{itemsOnly.toFixed(2)}</td>
@@ -13697,7 +13705,7 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
                     })}
                     {reportOrdersDetailed.length === 0 && (
                       <tr>
-                        <td colSpan={10} style={{ padding: 8, opacity: 0.8 }}>
+                        <td colSpan={11} style={{ padding: 8, opacity: 0.8 }}>
                           No orders recorded for the selected period.
                         </td>
                       </tr>
