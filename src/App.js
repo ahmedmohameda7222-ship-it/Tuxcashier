@@ -1707,6 +1707,7 @@ function onlineOrderFromDoc(id, data = {}) {
         `extra-${idx}`,
       name: String(extra?.name || extra?.title || extra?.label || "Extra"),
       price: asNumber(extra?.price ?? extra?.amount ?? extra?.cost ?? 0),
+      qty: asNumber(extra?.qty ?? extra?.quantity ?? extra?.count ?? 1, 1) || 1,
     }));
   };
   const normalizeCart = (list) => {
@@ -1722,6 +1723,14 @@ function onlineOrderFromDoc(id, data = {}) {
       );
       const extrasSource =
         item?.extras || item?.options || item?.addOns || item?.addons || [];
+      const itemType = item?.itemType || item?.catalogType || item?.lineType || item?.kind || "";
+      const extraId =
+        item?.extraId ??
+        item?.extra_id ??
+        item?.catalogId ??
+        item?.catalog_id ??
+        null;
+      const uses = item?.uses && typeof item.uses === "object" ? item.uses : null;
       return {
         id:
           item?.id ||
@@ -1733,6 +1742,9 @@ function onlineOrderFromDoc(id, data = {}) {
         qty,
         price,
         extras: normalizeExtras(extrasSource),
+        ...(itemType ? { itemType } : {}),
+        ...(extraId != null ? { extraId } : {}),
+        ...(uses ? { uses } : {}),
       };
     });
   };
@@ -1792,7 +1804,8 @@ function onlineOrderFromDoc(id, data = {}) {
         sum +
         (Array.isArray(item.extras)
           ? item.extras.reduce(
-              (inner, ex) => inner + Number(ex.price || 0) * Number(item.qty || 1),
+              (inner, ex) =>
+                inner + Number(ex.price || 0) * getCartExtraQty(ex) * Number(item.qty || 1),
               0
             )
           : 0),
@@ -1917,6 +1930,41 @@ const normalizeNameKey = (value) =>
     .replace(/[^a-z0-9]+/g, "")
     .trim();
 
+function isStandaloneExtraCartLine(line = {}) {
+  const type = String(
+    line?.itemType ?? line?.catalogType ?? line?.lineType ?? line?.kind ?? ""
+  ).toLowerCase();
+  return type === "extra" || type === "extras";
+}
+
+function getStandaloneExtraCatalogId(line = {}) {
+  const explicit =
+    line?.extraId ??
+    line?.extra_id ??
+    line?.catalogId ??
+    line?.catalog_id ??
+    line?.sourceId;
+  if (explicit != null && explicit !== "") return explicit;
+  const id = line?.id;
+  if (typeof id === "string" && id.startsWith("extra-")) {
+    return id.slice("extra-".length);
+  }
+  return id;
+}
+
+function findExtraDefinitionForCartLine(line = {}, extras = []) {
+  const extraId = getStandaloneExtraCatalogId(line);
+  const idMatch = (extras || []).find((extra) => String(extra?.id) === String(extraId));
+  if (idMatch) return idMatch;
+  const nameKey = normalizeNameKey(line?.name || line?.title || line?.label);
+  return (extras || []).find((extra) => normalizeNameKey(extra?.name) === nameKey) || null;
+}
+
+function getCartExtraQty(extra = {}) {
+  const qty = Number(extra?.qty ?? extra?.quantity ?? extra?.count ?? 1);
+  return Number.isFinite(qty) && qty > 0 ? qty : 1;
+}
+
 function normalizeOnlineOrderType(type, availableTypes = []) {
   const normalized = normalizeNameKey(type);
   const options = availableTypes.map((t) => [normalizeNameKey(t), t]);
@@ -1971,10 +2019,14 @@ function buildCartWithUsesFromOnline(order, menu = [], extras = []) {
   return (order.cart || []).map((line, idx) => {
     const qty = toQty(line?.qty ?? line?.quantity ?? 1);
     const price = toPrice(line?.price ?? line?.unitPrice ?? 0);
+    const isExtraLine = isStandaloneExtraCartLine(line);
     const idKey = line?.id != null ? String(line.id) : line?.menuItemId != null ? String(line.menuItemId) : "";
     const nameKey = normalizeNameKey(line?.name || line?.title || line?.label);
-    const matchedMenu = (idKey && menuById.get(idKey)) || (nameKey && menuByName.get(nameKey)) || null;
-    const unitUses = { ...(matchedMenu?.uses || {}) };
+    const matchedMenu = !isExtraLine
+      ? (idKey && menuById.get(idKey)) || (nameKey && menuByName.get(nameKey)) || null
+      : null;
+    const matchedExtraLine = isExtraLine ? findExtraDefinitionForCartLine(line, extras) : null;
+    const unitUses = { ...((isExtraLine ? matchedExtraLine : matchedMenu)?.uses || {}) };
 
     const normalizedExtras = Array.isArray(line?.extras)
       ? line.extras.map((extra, exIdx) => {
@@ -1983,13 +2035,15 @@ function buildCartWithUsesFromOnline(order, menu = [], extras = []) {
           const matchedExtra =
             (exIdKey && extraById.get(exIdKey)) || (exNameKey && extraByName.get(exNameKey)) || null;
           const extraUses = matchedExtra?.uses || {};
+          const extraQty = getCartExtraQty(extra);
           for (const key of Object.keys(extraUses)) {
-            unitUses[key] = (unitUses[key] || 0) + Number(extraUses[key] || 0);
+            unitUses[key] = (unitUses[key] || 0) + Number(extraUses[key] || 0) * extraQty;
           }
           return {
             id: extra?.id || extra?.extraId || extra?.optionId || extra?.uid || `extra-${idx}-${exIdx}`,
             name: extra?.name || extra?.title || extra?.label || "Extra",
             price: toPrice(extra?.price ?? extra?.amount ?? extra?.cost ?? 0),
+            qty: extraQty,
           };
         })
       : [];
@@ -2001,6 +2055,7 @@ function buildCartWithUsesFromOnline(order, menu = [], extras = []) {
       price,
       extras: normalizedExtras,
       uses: multiplyUses(unitUses, qty),
+      ...(isExtraLine ? { itemType: "extra", extraId: getStandaloneExtraCatalogId(line) } : {}),
     };
   });
 }
@@ -2925,7 +2980,7 @@ function buildReceiptHTML(order, widthMm = 80) {
   const cartSubtotal = (order.cart || []).reduce((sum, line) => {
     const base = Number(line.price || 0);
     const extrasSum = (line.extras || []).reduce(
-      (s, e) => s + Number(e.price || 0),
+      (s, e) => s + Number(e.price || 0) * getCartExtraQty(e),
       0
     );
     const q = Number(line.qty || 1);
@@ -2970,14 +3025,18 @@ function buildReceiptHTML(order, widthMm = 80) {
       `;
       const extras = (ci.extras || [])
         .map(
-          (ex) => `
+          (ex) => {
+            const extraQty = getCartExtraQty(ex);
+            const totalExtraQty = q * extraQty;
+            return `
           <div class="tr">
             <div class="td c-item extra">+ ${escHtml(ex.name)}</div>
-            <div class="td c-qty">${q}</div>
+            <div class="td c-qty">${totalExtraQty}</div>
             <div class="td c-price">${currency(ex.price)}</div>
-            <div class="td c-total">${currency(ex.price * q)}</div>
+            <div class="td c-total">${currency(ex.price * totalExtraQty)}</div>
           </div>
-        `
+        `;
+          }
         )
         .join("");
       return base + extras;
@@ -3995,9 +4054,8 @@ if (!hasMeaningfulActualCounts) {
   const [extraList, setExtraList] = useState(BASE_EXTRAS);
   const [orderTypes, setOrderTypes] = useState(DEFAULT_ORDER_TYPES);
   const [defaultDeliveryFee, setDefaultDeliveryFee] = useState(DEFAULT_DELIVERY_FEE);
-  const [selectedBurger, setSelectedBurger] = useState(null);
-  const [selectedExtras, setSelectedExtras] = useState([]);
-  const [selectedQty, setSelectedQty] = useState(1);
+  const [selectedItems, setSelectedItems] = useState({});
+  const [selectedExtras, setSelectedExtras] = useState({});
 const [cart, setCart] = useState([]);
 const [newCategoryUnit, setNewCategoryUnit] = useState("piece");
 const [worker, setWorker] = useState("");
@@ -4026,7 +4084,7 @@ const cartItemsSubtotal = useMemo(
     roundMoney(
       cart.reduce((sum, item) => {
         const extrasTotal = (item.extras || []).reduce(
-          (inner, extra) => inner + Number(extra.price || 0),
+          (inner, extra) => inner + Number(extra.price || 0) * getCartExtraQty(extra),
           0
         );
         return (
@@ -5125,12 +5183,41 @@ useEffect(() => {
     });
   }, [orders]);
   /* --------------------------- APP LOGIC --------------------------- */
+  const updateSelectedQty = (setter, id, delta) => {
+    const key = String(id);
+    setter((prev) => {
+      const current = prev[key];
+      if (!current) return prev;
+      const nextQty = Math.max(0, Math.floor(Number(current.qty || 1) + delta));
+      const next = { ...prev };
+      if (nextQty <= 0) delete next[key];
+      else next[key] = { ...current, qty: nextQty };
+      return next;
+    });
+  };
+
+  const toggleSelectedItem = (item) => {
+    const key = String(item.id);
+    setSelectedItems((prev) => {
+      if (prev[key]) {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      }
+      return { ...prev, [key]: { item, qty: 1 } };
+    });
+  };
+
   const toggleExtra = (extra) => {
-    setSelectedExtras((prev) =>
-      prev.find((e) => e.id === extra.id)
-        ? prev.filter((e) => e.id !== extra.id)
-        : [...prev, extra]
-    );
+    const key = String(extra.id);
+    setSelectedExtras((prev) => {
+      if (prev[key]) {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      }
+      return { ...prev, [key]: { item: extra, qty: 1 } };
+    });
   };
 
 const invById = useMemo(() => {
@@ -5541,9 +5628,18 @@ const marginTrend = useMemo(() => {
     } else {
       for (const line of lines) {
         const qty = Math.max(1, Number(line?.qty || 1));
+        if (
+          isStandaloneExtraCartLine(line) &&
+          String(getStandaloneExtraCatalogId(line)) === String(id)
+        ) {
+          const price = Number(line?.price || 0);
+          revenue += price * qty;
+          cogs += unitCogs * qty;
+          continue;
+        }
         for (const extra of line?.extras || []) {
-          if (Number(extra?.id) !== id) continue;
-          const extraQty = Math.max(1, Number(extra?.qty || 1));
+          if (String(extra?.id) !== String(id)) continue;
+          const extraQty = getCartExtraQty(extra);
           const price = Number(extra?.price || 0);
           const units = qty * extraQty;
           revenue += price * units;
@@ -6248,28 +6344,44 @@ const multiplyUses = (uses = {}, factor = 1) => {
   return out;
 };
   const addToCart = () => {
-    if (!selectedBurger) return alert("Select a burger/item first.");
-    const qty = Math.max(1, Number(selectedQty || 1));
-    const uses = {};
-    const prodUses = selectedBurger.uses || {};
-    for (const k of Object.keys(prodUses))
-      uses[k] = (uses[k] || 0) + (prodUses[k] || 0) * qty;
-    for (const ex of selectedExtras) {
-      const exUses = ex.uses || {};
-      for (const k of Object.keys(exUses))
-        uses[k] = (uses[k] || 0) + (exUses[k] || 0) * qty;
-    }
-    const line = {
-      ...selectedBurger,
-      extras: [...selectedExtras],
-      price: selectedBurger.price,
-      qty,
-      uses,
-    };
-    setCart((c) => [...c, line]);
-    setSelectedBurger(null);
-    setSelectedExtras([]);
-    setSelectedQty(1);
+    const toSelectedQty = (value) => Math.max(1, Math.floor(Number(value || 1)));
+    const selectedItemLines = Object.values(selectedItems)
+      .filter((entry) => entry?.item && Number(entry.qty || 0) > 0)
+      .map(({ item, qty }) => {
+        const lineQty = toSelectedQty(qty);
+        const currentItem =
+          menu.find((candidate) => String(candidate.id) === String(item.id)) || item;
+        return {
+          ...currentItem,
+          itemType: "menu",
+          extras: [],
+          price: Number(currentItem.price || 0),
+          qty: lineQty,
+          uses: multiplyUses(currentItem.uses || {}, lineQty),
+        };
+      });
+    const selectedExtraLines = Object.values(selectedExtras)
+      .filter((entry) => entry?.item && Number(entry.qty || 0) > 0)
+      .map(({ item, qty }) => {
+        const lineQty = toSelectedQty(qty);
+        const currentExtra =
+          extraList.find((candidate) => String(candidate.id) === String(item.id)) || item;
+        return {
+          ...currentExtra,
+          id: `extra-${currentExtra.id}`,
+          extraId: currentExtra.id,
+          itemType: "extra",
+          extras: [],
+          price: Number(currentExtra.price || 0),
+          qty: lineQty,
+          uses: multiplyUses(currentExtra.uses || {}, lineQty),
+        };
+      });
+    const newLines = [...selectedItemLines, ...selectedExtraLines];
+    if (newLines.length === 0) return alert("Select at least one burger/item or extra first.");
+    setCart((c) => [...c, ...newLines]);
+    setSelectedItems({});
+    setSelectedExtras({});
   };
   const removeFromCart = (i) =>
     setCart((c) => c.filter((_, idx) => idx !== i));
@@ -6302,6 +6414,71 @@ const multiplyUses = (uses = {}, factor = 1) => {
       };
     })
   );
+const handleSelectionTileKeyDown = (event, onSelect) => {
+  if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    onSelect();
+  }
+};
+const renderSelectionQtyControl = (qty, onMinus, onPlus, label) => (
+  <div
+    onClick={(event) => event.stopPropagation()}
+    style={{
+      position: "absolute",
+      right: 10,
+      bottom: 8,
+      display: "inline-flex",
+      alignItems: "center",
+      gap: 6,
+      padding: "4px 6px",
+      borderRadius: 6,
+      border: `1px solid ${btnBorder}`,
+      background: dark ? "rgba(0,0,0,0.42)" : "rgba(255,255,255,0.92)",
+      boxShadow: dark ? "none" : "0 1px 4px rgba(0,0,0,0.12)",
+    }}
+  >
+    <strong style={{ fontSize: 12 }}>Qty:</strong>
+    <button
+      type="button"
+      aria-label={`Decrease ${label} quantity`}
+      onClick={(event) => {
+        event.stopPropagation();
+        onMinus();
+      }}
+      style={{
+        width: 26,
+        height: 26,
+        borderRadius: 6,
+        border: `1px solid ${btnBorder}`,
+        background: dark ? "#242424" : "#f7f7f7",
+        color: dark ? "#eee" : "#111",
+        cursor: "pointer",
+      }}
+    >
+      -
+    </button>
+    <span style={{ minWidth: 22, textAlign: "center", fontWeight: 700 }}>{qty}</span>
+    <button
+      type="button"
+      aria-label={`Increase ${label} quantity`}
+      onClick={(event) => {
+        event.stopPropagation();
+        onPlus();
+      }}
+      style={{
+        width: 26,
+        height: 26,
+        borderRadius: 6,
+        border: `1px solid ${btnBorder}`,
+        background: dark ? "#242424" : "#f7f7f7",
+        color: dark ? "#eee" : "#111",
+        cursor: "pointer",
+      }}
+    >
+      +
+    </button>
+  </div>
+);
 const recordCustomerFromOrder = (order) => {
   if (!order) return;
   const phone = normalizePhone(order.deliveryPhone);
@@ -6383,14 +6560,17 @@ const checkout = async () => {
       ? normalizePhone(deliveryPhone)
       : normalizePhone(customerPhone);
     const cartWithUses = cart.map((line) => {
-      const baseItem = menu.find((m) => m.id === line.id);
-      const unitUses = { ...(baseItem?.uses || {}) };
+      const isExtraLine = isStandaloneExtraCartLine(line);
+      const baseItem = isExtraLine ? null : menu.find((m) => m.id === line.id);
+      const standaloneExtra = isExtraLine ? findExtraDefinitionForCartLine(line, extraList) : null;
+      const unitUses = { ...((isExtraLine ? standaloneExtra : baseItem)?.uses || {}) };
 
       for (const ex of line.extras || []) {
         const exDef = extraList.find((e) => e.id === ex.id) || ex;
         const exUses = exDef.uses || {};
+        const extraQty = getCartExtraQty(ex);
         for (const k of Object.keys(exUses)) {
-          unitUses[k] = (unitUses[k] || 0) + Number(exUses[k] || 0);
+          unitUses[k] = (unitUses[k] || 0) + Number(exUses[k] || 0) * extraQty;
         }
       }
 
@@ -6592,7 +6772,7 @@ const integrateOnlineOrder = async (onlineOrder) => {
   const deliveryFee = Number(onlineOrder.deliveryFee || 0);
   const computedItemsTotal = cartWithUses.reduce((sum, line) => {
     const extrasSum = (line.extras || []).reduce(
-      (inner, ex) => inner + Number(ex.price || 0),
+      (inner, ex) => inner + Number(ex.price || 0) * getCartExtraQty(ex),
       0
     );
     return (
@@ -6891,7 +7071,9 @@ const onlineFallbackId =
               const exPriceValue = Number(ex?.price);
               const hasPrice = Number.isFinite(exPriceValue) && exPriceValue !== 0;
               const exPrice = hasPrice ? formatMoney(exPriceValue) : "";
-              return `  + ${ex?.name || "Extra"}${exPrice ? ` (${exPrice})` : ""}`;
+              const exQty = getCartExtraQty(ex);
+              const qtyLabel = exQty > 1 ? ` x${exQty}` : "";
+              return `  + ${ex?.name || "Extra"}${qtyLabel}${exPrice ? ` (${exPrice})` : ""}`;
             })
             .join("\n")
         : "";
@@ -7658,9 +7840,17 @@ const totals = useMemo(() => {
       for (const line of o.cart || []) {
         const q = Number(line.qty || 1);
         const base = Number(line.price || 0);
-        add(itemMap, line.id, line.name, q, base * q);
-        for (const ex of line.extras || [])
-          add(extraMap, ex.id, ex.name, q, Number(ex.price || 0) * q);
+        if (isStandaloneExtraCartLine(line)) {
+          const extraId = getStandaloneExtraCatalogId(line);
+          add(extraMap, extraId, line.name, q, base * q);
+        } else {
+          add(itemMap, line.id, line.name, q, base * q);
+        }
+        for (const ex of line.extras || []) {
+          const extraQty = getCartExtraQty(ex);
+          const units = q * extraQty;
+          add(extraMap, ex.id, ex.name, units, Number(ex.price || 0) * units);
+        }
       }
     }
     const items = Array.from(itemMap.values()).sort(
@@ -9581,25 +9771,44 @@ const cogs = Number(
                 }}
               >
                 {menu.map((item) => {
-                  const isSel = selectedBurger?.id === item.id;
+                  const selectedEntry = selectedItems[String(item.id)];
+                  const isSel = !!selectedEntry;
+                  const qty = selectedEntry?.qty || 1;
                   const bg = item.color || (dark ? "#1e1e1e" : "#ffffff");
                   return (
-                    <button
+                    <div
                       key={item.id}
-                      onClick={() => setSelectedBurger(item)}
+                      role="button"
+                      tabIndex={0}
+                      aria-pressed={isSel}
+                      onClick={() => toggleSelectedItem(item)}
+                      onKeyDown={(event) =>
+                        handleSelectionTileKeyDown(event, () => toggleSelectedItem(item))
+                      }
                       style={{
+                        position: "relative",
+                        minHeight: 88,
                         textAlign: "left",
-                        padding: 12,
-                        border: isSel ? "2px solid #1976d2" : `1px solid ${btnBorder}`,
-                        borderRadius: 10,
+                        padding: isSel ? "12px 12px 48px" : 12,
+                        border: isSel ? "2px solid #42a5f5" : `1px solid ${btnBorder}`,
+                        borderRadius: 8,
                         background: bg,
                         color: dark ? "#eee" : "#000",
                         cursor: "pointer",
+                        boxShadow: isSel ? "0 0 0 3px rgba(66, 165, 245, 0.22)" : "none",
+                        transition: "border-color 120ms ease, box-shadow 120ms ease",
                       }}
                     >
                       <div style={{ fontWeight: 700, marginBottom: 4 }}>{item.name}</div>
                       <div>E£{item.price}</div>
-                    </button>
+                      {isSel &&
+                        renderSelectionQtyControl(
+                          qty,
+                          () => updateSelectedQty(setSelectedItems, item.id, -1),
+                          () => updateSelectedQty(setSelectedItems, item.id, 1),
+                          item.name
+                        )}
+                    </div>
                   );
                 })}
               </div>
@@ -9616,55 +9825,53 @@ const cogs = Number(
                 }}
               >
                 {extraList.map((ex) => {
-                  const checked = !!selectedExtras.find((e) => e.id === ex.id);
+                  const selectedEntry = selectedExtras[String(ex.id)];
+                  const checked = !!selectedEntry;
+                  const qty = selectedEntry?.qty || 1;
                   const bg = ex.color || (dark ? "#1e1e1e" : "#ffffff");
                   return (
-                    <button
+                    <div
                       key={ex.id}
+                      role="button"
+                      tabIndex={0}
+                      aria-pressed={checked}
                       onClick={() => toggleExtra(ex)}
+                      onKeyDown={(event) =>
+                        handleSelectionTileKeyDown(event, () => toggleExtra(ex))
+                      }
                       style={{
+                        position: "relative",
+                        minHeight: 88,
                         textAlign: "left",
-                        padding: 12,
-                        border: checked ? "2px solid #1976d2" : `1px solid ${btnBorder}`,
-                        borderRadius: 10,
+                        padding: checked ? "12px 12px 48px" : 12,
+                        border: checked ? "2px solid #42a5f5" : `1px solid ${btnBorder}`,
+                        borderRadius: 8,
                         background: bg,
                         color: dark ? "#eee" : "#000",
                         cursor: "pointer",
+                        boxShadow: checked ? "0 0 0 3px rgba(66, 165, 245, 0.22)" : "none",
+                        transition: "border-color 120ms ease, box-shadow 120ms ease",
                       }}
                     >
                       <div style={{ fontWeight: 700, marginBottom: 4 }}>{ex.name}</div>
                       <div>E£{ex.price}</div>
-                    </button>
+                      {checked &&
+                        renderSelectionQtyControl(
+                          qty,
+                          () => updateSelectedQty(setSelectedExtras, ex.id, -1),
+                          () => updateSelectedQty(setSelectedExtras, ex.id, 1),
+                          ex.name
+                        )}
+                    </div>
                   );
                 })}
               </div>
 
-              {/* Qty + Add */}
+              {/* Add */}
               <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 8 }}>
-                <strong>Qty:</strong>
-                <button
-                  onClick={() => setSelectedQty((q) => Math.max(1, Number(q || 1) - 1))}
-                  style={{ padding: "4px 10px", borderRadius: 6, border: `1px solid ${btnBorder}` }}
-                >
-                  –
-                </button>
-                <input
-                  type="number"
-                  value={selectedQty}
-                  onChange={(e) => setSelectedQty(Math.max(1, Number(e.target.value || 1)))}
-                  style={{ width: 70, textAlign: "center" }}
-                />
-                <button
-                  onClick={() => setSelectedQty((q) => Math.max(1, Number(q || 1) + 1))}
-                  style={{ padding: "4px 10px", borderRadius: 6, border: `1px solid ${btnBorder}` }}
-                >
-                  +
-                </button>
-
                 <button
                   onClick={addToCart}
                   style={{
-                    marginLeft: "auto",
                     padding: "10px 14px",
                     borderRadius: 6,
                     border: "none",
@@ -9673,7 +9880,7 @@ const cogs = Number(
                     cursor: "pointer",
                   }}
                 >
-                  Add to cart
+                  Add to Cart
                 </button>
               </div>
             </div>
@@ -9686,7 +9893,7 @@ const cogs = Number(
           <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
             {cart.map((it, idx) => {
               const extrasSum = (it.extras || []).reduce(
-                (t, e) => t + Number(e.price || 0),
+                (t, e) => t + Number(e.price || 0) * getCartExtraQty(e),
                 0
               );
               const lineTotal =
@@ -11558,20 +11765,32 @@ const ordersInPeriod = (allOrders || []).filter(o => {
   for (const o of ordersInPeriod) {
     for (const line of (o.cart || [])) {
       const lineQty = Number(line.qty || 1);
+      const isExtraLine = isStandaloneExtraCartLine(line);
 
       // main item usage
-      const defItem = findDefByLine(line, menu || []) || (line?.id != null ? menuById.get(line.id) : null);
+      const defItem = isExtraLine
+        ? null
+        : findDefByLine(line, menu || []) || (line?.id != null ? menuById.get(line.id) : null);
       if (defItem?.uses) {
         for (const [invId, perUnit] of Object.entries(defItem.uses)) {
           add(used, invId, Number(perUnit || 0) * lineQty);
+        }
+      }
+      if (isExtraLine) {
+        const defExtraLine = findExtraDefinitionForCartLine(line, extraList || []);
+        if (defExtraLine?.uses) {
+          for (const [invId, perUnit] of Object.entries(defExtraLine.uses)) {
+            add(used, invId, Number(perUnit || 0) * lineQty);
+          }
         }
       }
       // extras usage
       for (const ex of (line.extras || [])) {
         const defEx = findDefByLine(ex, extraList || []) || (ex?.id != null ? exById.get(ex.id) : null);
         if (defEx?.uses) {
+          const extraQty = getCartExtraQty(ex);
           for (const [invId, perUnit] of Object.entries(defEx.uses)) {
-            add(used, invId, Number(perUnit || 0) * lineQty);
+            add(used, invId, Number(perUnit || 0) * lineQty * extraQty);
           }
         }
       }
