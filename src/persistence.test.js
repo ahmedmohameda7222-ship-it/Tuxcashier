@@ -1,34 +1,11 @@
-jest.mock("jspdf", () => {
-  return jest.fn().mockImplementation(() => ({
-    addImage: jest.fn(),
-    addFileToVFS: jest.fn(),
-    addFont: jest.fn(),
-    setFont: jest.fn(),
-    setFontSize: jest.fn(),
-    text: jest.fn(),
-    save: jest.fn(),
-  }));
-});
-jest.mock("jspdf-autotable", () => jest.fn());
-
 import { packStateForCloud, unpackStateFromCloud } from "./App";
 
 describe("state persistence helpers", () => {
   it("preserves realtimeOrders flag and converts dates when packing/unpacking", () => {
     const sampleDate = new Date("2024-02-03T04:05:06.000Z");
     const state = {
-      menu: [{ id: "m1", name: "Burger", price: 40, isCombo: true }],
+      menu: [{ id: "m1", name: "Burger" }],
       extraList: [{ id: "e1", name: "Cheese" }],
-      beverageList: [
-        {
-          id: "b1",
-          name: "Cola",
-          price: 12,
-          uses: { i1: 1 },
-          color: "#123456",
-          active: true,
-        },
-      ],
       orders: [
         {
           orderNo: 1,
@@ -48,32 +25,7 @@ describe("state persistence helpers", () => {
           note: "Thanks",
           date: sampleDate,
           restockedAt: sampleDate,
-          cart: [
-            {
-              id: "m1",
-              name: "Burger",
-              qty: 1,
-              price: 40,
-              isCombo: true,
-              comboBeverage: {
-                id: "b1",
-                beverageId: "b1",
-                name: "Cola",
-                price: 0,
-                included: true,
-                itemType: "combo-beverage",
-                qtyPerCombo: 1,
-              },
-            },
-            {
-              id: "beverage-b1",
-              beverageId: "b1",
-              itemType: "beverage",
-              name: "Cola",
-              qty: 2,
-              price: 12,
-            },
-          ],
+          cart: [],
         },
       ],
       inventory: [{ id: "i1", name: "Patty" }],
@@ -148,34 +100,13 @@ describe("state persistence helpers", () => {
     const packed = packStateForCloud(state);
 
     expect(packed.realtimeOrders).toBe(false);
-    expect(packed.menu[0].isCombo).toBe(true);
-    expect(packed.beverages[0]).toMatchObject({
-      id: "b1",
-      name: "Cola",
-      price: 12,
-      uses: { i1: 1 },
-      active: true,
-    });
-    expect(packed.orders[0].cart[0].comboBeverage.name).toBe("Cola");
-    expect(packed.orders[0].cart[1].itemType).toBe("beverage");
-    expect(packed.workerSessions[0].signInAt).toEqual(sampleDate.toISOString());
+  expect(packed.workerSessions[0].signInAt).toEqual(sampleDate.toISOString());
     expect(packed.onlineOrders[0].createdAt).toEqual(sampleDate.toISOString());
     expect(packed.lastSeenOnlineOrderTs).toBe(sampleDate.getTime());
 
     const unpacked = unpackStateFromCloud(packed);
 
     expect(unpacked.realtimeOrders).toBe(false);
-    expect(unpacked.menu[0].isCombo).toBe(true);
-    expect(unpacked.beverageList[0]).toMatchObject({
-      id: "b1",
-      name: "Cola",
-      price: 12,
-      uses: { i1: 1 },
-      active: true,
-      deleted: false,
-    });
-    expect(unpacked.orders[0].cart[0].comboBeverage.name).toBe("Cola");
-    expect(unpacked.orders[0].cart[1].beverageId).toBe("b1");
     expect(unpacked.workerSessions[0].signInAt).toBeInstanceOf(Date);
     expect(unpacked.orders[0].date).toBeInstanceOf(Date);
     expect(unpacked.orders[0].discountPercentage).toBe(0);

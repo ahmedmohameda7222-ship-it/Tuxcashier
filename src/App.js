@@ -1092,7 +1092,6 @@ export function packStateForCloud(state) {
    const {
     menu,
     extraList,
-    beverageList,
     orders,
     inventory,
     bulkInventoryItems,
@@ -1157,9 +1156,8 @@ export function packStateForCloud(state) {
     realtimeOrders: typeof realtimeOrders === "boolean" ? realtimeOrders : undefined,
     version: 1,
     updatedAt: new Date().toISOString(),
-    menu: normalizeMenuList(menu),
-    extras: normalizeExtraList(extraList),
-    beverages: normalizeBeverageList(beverageList),
+    menu,
+    extras: extraList,
     orders: (orders || []).map((o) => ({
       ...o,
       date: toIso(o.date),
@@ -1404,9 +1402,8 @@ if (Array.isArray(data.orders)) {
   if (typeof data.reportFilter === "string") out.reportFilter = data.reportFilter;
   if (typeof data.reportDay === "string") out.reportDay = data.reportDay;
   if (typeof data.reportMonth === "string") out.reportMonth = data.reportMonth;
-  if (data.menu) out.menu = normalizeMenuList(data.menu);
-  if (data.extras) out.extraList = normalizeExtraList(data.extras);
-  if (data.beverages) out.beverageList = normalizeBeverageList(data.beverages);
+  if (data.menu) out.menu = data.menu;
+  if (data.extras) out.extraList = data.extras;
   if (data.inventory) out.inventory = data.inventory;
   if (Array.isArray(data.bulkInventoryItems)) out.bulkInventoryItems = data.bulkInventoryItems;
   if (Array.isArray(data.bulkInventoryHistory)) out.bulkInventoryHistory = data.bulkInventoryHistory;
@@ -1733,14 +1730,7 @@ function onlineOrderFromDoc(id, data = {}) {
         item?.catalogId ??
         item?.catalog_id ??
         null;
-      const beverageId =
-        item?.beverageId ??
-        item?.beverage_id ??
-        item?.drinkId ??
-        item?.drink_id ??
-        null;
       const uses = item?.uses && typeof item.uses === "object" ? item.uses : null;
-      const comboBeverage = getComboBeverage(item);
       return {
         id:
           item?.id ||
@@ -1754,9 +1744,6 @@ function onlineOrderFromDoc(id, data = {}) {
         extras: normalizeExtras(extrasSource),
         ...(itemType ? { itemType } : {}),
         ...(extraId != null ? { extraId } : {}),
-        ...(beverageId != null ? { beverageId } : {}),
-        ...(item?.isCombo != null ? { isCombo: !!item.isCombo } : {}),
-        ...(comboBeverage ? { comboBeverage } : {}),
         ...(uses ? { uses } : {}),
       };
     });
@@ -1950,13 +1937,6 @@ function isStandaloneExtraCartLine(line = {}) {
   return type === "extra" || type === "extras";
 }
 
-function isStandaloneBeverageCartLine(line = {}) {
-  const type = String(
-    line?.itemType ?? line?.catalogType ?? line?.lineType ?? line?.kind ?? ""
-  ).toLowerCase();
-  return type === "beverage" || type === "beverages" || type === "drink" || type === "drinks";
-}
-
 function getStandaloneExtraCatalogId(line = {}) {
   const explicit =
     line?.extraId ??
@@ -1972,23 +1952,6 @@ function getStandaloneExtraCatalogId(line = {}) {
   return id;
 }
 
-function getStandaloneBeverageCatalogId(line = {}) {
-  const explicit =
-    line?.beverageId ??
-    line?.beverage_id ??
-    line?.drinkId ??
-    line?.drink_id ??
-    line?.catalogId ??
-    line?.catalog_id ??
-    line?.sourceId;
-  if (explicit != null && explicit !== "") return explicit;
-  const id = line?.id;
-  if (typeof id === "string" && id.startsWith("beverage-")) {
-    return id.slice("beverage-".length);
-  }
-  return id;
-}
-
 function findExtraDefinitionForCartLine(line = {}, extras = []) {
   const extraId = getStandaloneExtraCatalogId(line);
   const idMatch = (extras || []).find((extra) => String(extra?.id) === String(extraId));
@@ -1997,93 +1960,9 @@ function findExtraDefinitionForCartLine(line = {}, extras = []) {
   return (extras || []).find((extra) => normalizeNameKey(extra?.name) === nameKey) || null;
 }
 
-function findBeverageDefinitionForCartLine(line = {}, beverages = []) {
-  const beverageId = getStandaloneBeverageCatalogId(line);
-  const idMatch = (beverages || []).find((beverage) => String(beverage?.id) === String(beverageId));
-  if (idMatch) return idMatch;
-  const nameKey = normalizeNameKey(line?.name || line?.title || line?.label);
-  return (beverages || []).find((beverage) => normalizeNameKey(beverage?.name) === nameKey) || null;
-}
-
 function getCartExtraQty(extra = {}) {
   const qty = Number(extra?.qty ?? extra?.quantity ?? extra?.count ?? 1);
   return Number.isFinite(qty) && qty > 0 ? qty : 1;
-}
-
-function getComboBeverageQty(beverage = {}) {
-  const qty = Number(beverage?.qtyPerCombo ?? beverage?.qty ?? beverage?.quantity ?? 1);
-  return Number.isFinite(qty) && qty > 0 ? qty : 1;
-}
-
-function getComboBeverage(line = {}) {
-  const source =
-    line?.comboBeverage ||
-    line?.includedBeverage ||
-    line?.includedComboBeverage ||
-    line?.combo_beverage ||
-    null;
-  if (!source || typeof source !== "object") return null;
-  const beverageId =
-    source.beverageId ??
-    source.beverage_id ??
-    source.drinkId ??
-    source.drink_id ??
-    source.id ??
-    "";
-  return {
-    ...source,
-    id: source.id ?? beverageId,
-    beverageId,
-    name: source.name || source.title || source.label || "Beverage",
-    price: 0,
-    included: true,
-    itemType: "combo-beverage",
-    priceLabel: "Included",
-    qtyPerCombo: getComboBeverageQty(source),
-    uses: source.uses && typeof source.uses === "object" ? source.uses : {},
-  };
-}
-
-function normalizeCatalogList(list = [], options = {}) {
-  const { includeCombo = false } = options;
-  if (!Array.isArray(list)) return [];
-  return list.map((item, idx) => {
-    const safe = item && typeof item === "object" ? item : {};
-    const rawPrice = Number(safe.price ?? 0);
-    const normalized = {
-      ...safe,
-      id: safe.id ?? `${includeCombo ? "item" : "catalog"}_${idx + 1}`,
-      name: String(safe.name || safe.title || safe.label || "").trim(),
-      price: Number.isFinite(rawPrice) && rawPrice >= 0 ? rawPrice : 0,
-      uses: safe.uses && typeof safe.uses === "object" ? safe.uses : {},
-      color: safe.color || "#ffffff",
-      targetMarginPctOverride:
-        safe.targetMarginPctOverride === undefined ? null : safe.targetMarginPctOverride,
-      prepMinutes: Number(safe.prepMinutes || 0),
-      equipmentMinutes:
-        safe.equipmentMinutes && typeof safe.equipmentMinutes === "object"
-          ? safe.equipmentMinutes
-          : {},
-    };
-    if (includeCombo) normalized.isCombo = !!safe.isCombo;
-    return normalized;
-  });
-}
-
-function normalizeMenuList(list = []) {
-  return normalizeCatalogList(list, { includeCombo: true });
-}
-
-function normalizeExtraList(list = []) {
-  return normalizeCatalogList(list);
-}
-
-function normalizeBeverageList(list = []) {
-  return normalizeCatalogList(list).map((item) => ({
-    ...item,
-    active: item.active === undefined ? true : !!item.active,
-    deleted: !!item.deleted,
-  }));
 }
 
 function normalizeOnlineOrderType(type, availableTypes = []) {
@@ -2107,7 +1986,7 @@ function normalizeOnlineOrderType(type, availableTypes = []) {
   return availableTypes[0] || String(type || "Take-Away");
 }
 
-function buildCartWithUsesFromOnline(order, menu = [], extras = [], beverages = []) {
+function buildCartWithUsesFromOnline(order, menu = [], extras = []) {
   if (!order || !Array.isArray(order.cart)) return [];
   const menuById = new Map();
   const menuByName = new Map();
@@ -2127,15 +2006,6 @@ function buildCartWithUsesFromOnline(order, menu = [], extras = [], beverages = 
     const nameKey = normalizeNameKey(extra.name);
     if (nameKey) extraByName.set(nameKey, extra);
   }
-  const beverageById = new Map();
-  const beverageByName = new Map();
-  for (const beverage of beverages || []) {
-    if (!beverage) continue;
-    const idKey = String(beverage.id);
-    if (idKey) beverageById.set(idKey, beverage);
-    const nameKey = normalizeNameKey(beverage.name);
-    if (nameKey) beverageByName.set(nameKey, beverage);
-  }
 
   const toQty = (value) => {
     const num = Number(value);
@@ -2150,23 +2020,13 @@ function buildCartWithUsesFromOnline(order, menu = [], extras = [], beverages = 
     const qty = toQty(line?.qty ?? line?.quantity ?? 1);
     const price = toPrice(line?.price ?? line?.unitPrice ?? 0);
     const isExtraLine = isStandaloneExtraCartLine(line);
-    const isBeverageLine = isStandaloneBeverageCartLine(line);
     const idKey = line?.id != null ? String(line.id) : line?.menuItemId != null ? String(line.menuItemId) : "";
     const nameKey = normalizeNameKey(line?.name || line?.title || line?.label);
-    const matchedMenu = !isExtraLine && !isBeverageLine
+    const matchedMenu = !isExtraLine
       ? (idKey && menuById.get(idKey)) || (nameKey && menuByName.get(nameKey)) || null
       : null;
     const matchedExtraLine = isExtraLine ? findExtraDefinitionForCartLine(line, extras) : null;
-    const matchedBeverageLine = isBeverageLine ? findBeverageDefinitionForCartLine(line, beverages) : null;
-    const baseDefinition = isBeverageLine
-      ? matchedBeverageLine
-      : isExtraLine
-      ? matchedExtraLine
-      : matchedMenu;
-    const unitUses = { ...(baseDefinition?.uses || {}) };
-    if (!Object.keys(unitUses).length && line?.uses && typeof line.uses === "object") {
-      Object.assign(unitUses, multiplyUses(line.uses, 1 / qty));
-    }
+    const unitUses = { ...((isExtraLine ? matchedExtraLine : matchedMenu)?.uses || {}) };
 
     const normalizedExtras = Array.isArray(line?.extras)
       ? line.extras.map((extra, exIdx) => {
@@ -2187,44 +2047,6 @@ function buildCartWithUsesFromOnline(order, menu = [], extras = [], beverages = 
           };
         })
       : [];
-    const comboBeverageRaw = getComboBeverage(line);
-    const comboBeverage = comboBeverageRaw
-      ? (() => {
-          const comboIdKey =
-            comboBeverageRaw.beverageId != null
-              ? String(comboBeverageRaw.beverageId)
-              : comboBeverageRaw.id != null
-              ? String(comboBeverageRaw.id)
-              : "";
-          const comboNameKey = normalizeNameKey(comboBeverageRaw.name);
-          const matched =
-            (comboIdKey && beverageById.get(comboIdKey)) ||
-            (comboNameKey && beverageByName.get(comboNameKey)) ||
-            null;
-          const qtyPerCombo = getComboBeverageQty(comboBeverageRaw);
-          const beverageUses =
-            matched?.uses ||
-            (comboBeverageRaw.uses && typeof comboBeverageRaw.uses === "object"
-              ? comboBeverageRaw.uses
-              : {});
-          for (const key of Object.keys(beverageUses)) {
-            unitUses[key] =
-              (unitUses[key] || 0) + Number(beverageUses[key] || 0) * qtyPerCombo;
-          }
-          return {
-            ...comboBeverageRaw,
-            id: matched?.id ?? comboBeverageRaw.id ?? comboBeverageRaw.beverageId,
-            beverageId: matched?.id ?? comboBeverageRaw.beverageId ?? comboBeverageRaw.id,
-            name: matched?.name || comboBeverageRaw.name || "Beverage",
-            price: 0,
-            included: true,
-            itemType: "combo-beverage",
-            priceLabel: "Included",
-            qtyPerCombo,
-            uses: beverageUses,
-          };
-        })()
-      : null;
 
     return {
       id: line?.id || line?.menuItemId || line?.itemId || line?.uid || `item-${idx}`,
@@ -2234,11 +2056,6 @@ function buildCartWithUsesFromOnline(order, menu = [], extras = [], beverages = 
       extras: normalizedExtras,
       uses: multiplyUses(unitUses, qty),
       ...(isExtraLine ? { itemType: "extra", extraId: getStandaloneExtraCatalogId(line) } : {}),
-      ...(isBeverageLine
-        ? { itemType: "beverage", beverageId: getStandaloneBeverageCatalogId(line) }
-        : {}),
-      ...(line?.isCombo != null ? { isCombo: !!line.isCombo } : {}),
-      ...(comboBeverage ? { comboBeverage } : {}),
     };
   });
 }
@@ -2569,7 +2386,6 @@ const BASE_EXTRAS = [
     equipmentMinutes: {},
   },
 ];
-const BASE_BEVERAGES = [];
 const DEFAULT_INVENTORY = [
   { id: "meat",   name: "Meat",   unit: "g",     qty: 0, costPerUnit: 0, minQty: 0 },
   { id: "cheese", name: "Cheese", unit: "slices",qty: 0, costPerUnit: 0, minQty: 0 },
@@ -3199,7 +3015,6 @@ function buildReceiptHTML(order, widthMm = 80) {
  const rowsHtml = (order.cart || [])
     .map((ci) => {
       const q = Number(ci.qty || 1);
-      const comboBeverage = getComboBeverage(ci);
       const base = `
         <div class="tr">
           <div class="td c-item">${escHtml(ci.name)}</div>
@@ -3224,17 +3039,7 @@ function buildReceiptHTML(order, widthMm = 80) {
           }
         )
         .join("");
-      const comboDrink = comboBeverage
-        ? `
-          <div class="tr">
-            <div class="td c-item extra">+ ${escHtml(comboBeverage.name)}</div>
-            <div class="td c-qty">${q * getComboBeverageQty(comboBeverage)}</div>
-            <div class="td c-price">Included</div>
-            <div class="td c-total">Included</div>
-          </div>
-        `
-        : "";
-      return base + comboDrink + extras;
+      return base + extras;
     })
     .join("");
 
@@ -3695,25 +3500,18 @@ const [bankMonth, setBankMonth] = useState(() => {
 const [newItemName, setNewItemName] = useState("");
 const [newItemPrice, setNewItemPrice] = useState(0);
 const [newItemColor, setNewItemColor] = useState("#ffffff");
-const parseNonNegativePrice = (value) => {
-  const price = Number(value);
-  return Number.isFinite(price) && price >= 0 ? price : null;
-};
   const addMenuFromForm = () => {
   const name = String(newItemName || "").trim();
   if (!name) return alert("Name required.");
-  const price = parseNonNegativePrice(newItemPrice);
-  if (price == null) return alert("Price must be a valid number greater than or equal to 0.");
   const id = getNextMenuId(menu);
 setMenu((arr) => [
     ...arr,
     {
       id,
       name,
-      price,
+      price: Math.max(0, Number(newItemPrice || 0)),
       uses: {},
       color: newItemColor || "#ffffff",
-      isCombo: false,
       prepMinutes: 0,
       equipmentMinutes: {},
     },
@@ -4254,13 +4052,10 @@ if (!hasMeaningfulActualCounts) {
 };
   const [menu, setMenu] = useState(BASE_MENU);
   const [extraList, setExtraList] = useState(BASE_EXTRAS);
-  const [beverageList, setBeverageList] = useState(BASE_BEVERAGES);
   const [orderTypes, setOrderTypes] = useState(DEFAULT_ORDER_TYPES);
   const [defaultDeliveryFee, setDefaultDeliveryFee] = useState(DEFAULT_DELIVERY_FEE);
   const [selectedItems, setSelectedItems] = useState({});
   const [selectedExtras, setSelectedExtras] = useState({});
-  const [selectedBeverages, setSelectedBeverages] = useState({});
-  const [comboBeverageSelections, setComboBeverageSelections] = useState({});
 const [cart, setCart] = useState([]);
 const [newCategoryUnit, setNewCategoryUnit] = useState("piece");
 const [worker, setWorker] = useState("");
@@ -4431,32 +4226,6 @@ const removeBankTx = (id) => {
   const sortBy = "date-desc";
   const [newExtraName, setNewExtraName] = useState("");
   const [newExtraPrice, setNewExtraPrice] = useState(0);
-  const [newBeverageName, setNewBeverageName] = useState("");
-  const [newBeveragePrice, setNewBeveragePrice] = useState(0);
-  const [newBeverageColor, setNewBeverageColor] = useState("#ffffff");
-  const addBeverageFromForm = () => {
-    const name = String(newBeverageName || "").trim();
-    if (!name) return alert("Beverage name required.");
-    const price = parseNonNegativePrice(newBeveragePrice);
-    if (price == null) return alert("Beverage price must be a valid number greater than or equal to 0.");
-    const id = Date.now();
-    setBeverageList((arr) => [
-      ...arr,
-      {
-        id,
-        name,
-        price,
-        uses: {},
-        color: newBeverageColor || "#ffffff",
-        active: true,
-        prepMinutes: 0,
-        equipmentMinutes: {},
-      },
-    ]);
-    setNewBeverageName("");
-    setNewBeveragePrice(0);
-    setNewBeverageColor("#ffffff");
-  };
   const [localHydrated, setLocalHydrated] = useState(false);
 const [lastLocalEditAt, setLastLocalEditAt] = useState(0);
   /* --------------------------- SUPABASE STATE --------------------------- */
@@ -4591,9 +4360,8 @@ useEffect(() => {
 useEffect(() => {
   if (localHydrated) return;
   const l = loadLocal();
-  if (l.menu) setMenu(normalizeMenuList(l.menu));
-  if (l.extraList) setExtraList(normalizeExtraList(l.extraList));
-  if (l.beverageList) setBeverageList(normalizeBeverageList(l.beverageList));
+  if (l.menu) setMenu(l.menu);
+  if (l.extraList) setExtraList(l.extraList);
   if (l.workers) setWorkers(l.workers);
  if (l.paymentMethods) setPaymentMethods(l.paymentMethods);
   if (l.orderTypes) setOrderTypes(l.orderTypes);
@@ -4702,7 +4470,6 @@ useEffect(() => {
 useEffect(() => { saveLocalPartial({ customers }); }, [customers]);                  // ⬅️ NEW
 useEffect(() => { saveLocalPartial({ deliveryZones }); }, [deliveryZones]);          // ⬅️ NEW
 useEffect(() => { saveLocalPartial({ extraList }); }, [extraList]);
-useEffect(() => { saveLocalPartial({ beverageList }); }, [beverageList]);
 useEffect(() => { saveLocalPartial({ workers }); }, [workers]);
 useEffect(() => { saveLocalPartial({ paymentMethods }); }, [paymentMethods]);
 useEffect(() => { saveLocalPartial({ orderTypes }); }, [orderTypes]);
@@ -4764,7 +4531,7 @@ useEffect(() => {
   setLastLocalEditAt(Date.now());
   // eslint-disable-next-line react-hooks/exhaustive-deps
 }, [
-  menu, extraList, beverageList, workers, paymentMethods, orderTypes, defaultDeliveryFee,
+  menu, extraList, workers, paymentMethods, orderTypes, defaultDeliveryFee,
  inventory, adminPins, dark,
   bulkInventoryItems, bulkInventoryHistory,
   expenses, bankTx, dayMeta, inventoryLocked, inventorySnapshot, inventoryLockedAt,
@@ -4788,9 +4555,8 @@ useEffect(() => {
   if (!cogsKey) {
     if (menu.length) setCogsKey(`m-${menu[0].id}`);
     else if (extraList.length) setCogsKey(`e-${extraList[0].id}`);
-    else if (beverageList.length) setCogsKey(`b-${beverageList[0].id}`);
   }
-}, [cogsKey, menu, extraList, beverageList]);
+}, [cogsKey, menu, extraList]);
 const [syncCostsFromPurchases, setSyncCostsFromPurchases] = useState(() => {
   const l = loadLocal();
   return typeof l?.syncCostsFromPurchases === "boolean" ? l.syncCostsFromPurchases : true;
@@ -4849,7 +4615,6 @@ const onlineOrderCollections = useMemo(() => ONLINE_ORDER_COLLECTIONS, []);
           if (unpacked.menu) setMenu(unpacked.menu);
           if (unpacked.reconHistory) setReconHistory(unpacked.reconHistory);
           if (unpacked.extraList) setExtraList(unpacked.extraList);
-          if (unpacked.beverageList) setBeverageList(unpacked.beverageList);
           if (unpacked.inventory) setInventory(unpacked.inventory);
           applyBulkInventoryFromCloud(unpacked.bulkInventoryItems, unpacked.bulkInventoryHistory);
           if (unpacked.utilityBills) setUtilityBills(normalizeUtilityBills(unpacked.utilityBills));
@@ -4920,7 +4685,6 @@ if (ts && lastLocalEditAt && ts < lastLocalEditAt) return;
       if (unpacked.menu) setMenu(unpacked.menu);
       if (unpacked.reconHistory) setReconHistory(unpacked.reconHistory);
       if (unpacked.extraList) setExtraList(unpacked.extraList);
-      if (unpacked.beverageList) setBeverageList(unpacked.beverageList);
       if (unpacked.inventory) setInventory(unpacked.inventory);
       applyBulkInventoryFromCloud(unpacked.bulkInventoryItems, unpacked.bulkInventoryHistory);
       if (typeof unpacked.nextOrderNo === "number") setNextOrderNo(unpacked.nextOrderNo);
@@ -4964,7 +4728,6 @@ if (ts && lastLocalEditAt && ts < lastLocalEditAt) return;
 if (unpacked.workerProfiles) setWorkerProfiles(unpacked.workerProfiles);
 if (unpacked.workerSessions) setWorkerSessions(unpacked.workerSessions);
       if (unpacked.extraList) setExtraList(unpacked.extraList);
-      if (unpacked.beverageList) setBeverageList(unpacked.beverageList);
       if (unpacked.inventory) setInventory(unpacked.inventory);
       applyBulkInventoryFromCloud(unpacked.bulkInventoryItems, unpacked.bulkInventoryHistory);
       if (unpacked.nextOrderNo != null) setNextOrderNo(unpacked.nextOrderNo);
@@ -5017,7 +4780,6 @@ if (unpacked.workerSessions) setWorkerSessions(unpacked.workerSessions);
     const bodyBase = packStateForCloud({
       menu,
       extraList,
-      beverageList,
       orders: realtimeOrders ? [] : orders,
       inventory,
       bulkInventoryItems,
@@ -5084,7 +4846,6 @@ useEffect(() => {
  const bodyBase = packStateForCloud({
         menu,
         extraList,
-        beverageList,
         orders: realtimeOrders ? [] : orders,
         inventory,
         bulkInventoryItems,
@@ -5155,7 +4916,6 @@ useEffect(() => {
   workerProfiles,
   workerSessions,
   extraList,
-  beverageList,
   orders,
   inventory,
   bulkInventoryItems,
@@ -5460,55 +5220,6 @@ useEffect(() => {
     });
   };
 
-  const toggleBeverage = (beverage) => {
-    const key = String(beverage.id);
-    setSelectedBeverages((prev) => {
-      if (prev[key]) {
-        const next = { ...prev };
-        delete next[key];
-        return next;
-      }
-      return { ...prev, [key]: { item: beverage, qty: 1 } };
-    });
-  };
-
-  const activeBeverages = useMemo(
-    () => (beverageList || []).filter((b) => b && b.active !== false && !b.deleted),
-    [beverageList]
-  );
-
-  useEffect(() => {
-    setComboBeverageSelections((prev) => {
-      const validComboIds = new Set(
-        Object.values(selectedItems)
-          .filter((entry) => entry?.item?.isCombo)
-          .map((entry) => String(entry.item.id))
-      );
-      const validBeverageIds = new Set(activeBeverages.map((b) => String(b.id)));
-      let changed = false;
-      const next = {};
-      for (const [itemId, beverageId] of Object.entries(prev || {})) {
-        if (!validComboIds.has(String(itemId))) {
-          changed = true;
-          continue;
-        }
-        if (beverageId && !validBeverageIds.has(String(beverageId))) {
-          changed = true;
-          next[itemId] = "";
-          continue;
-        }
-        next[itemId] = beverageId;
-      }
-      for (const itemId of validComboIds) {
-        if (!(itemId in next)) {
-          next[itemId] = "";
-          changed = true;
-        }
-      }
-      return changed ? next : prev;
-    });
-  }, [selectedItems, activeBeverages]);
-
 const invById = useMemo(() => {
   const map = {};
   for (const item of inventory) map[item.id] = item;
@@ -5551,7 +5262,6 @@ const cogsMarginData = useMemo(() => {
   const rows = [
     ...menu.map((d) => ({ ...d, _k: `m-${d.id}`, _type: "menu" })),
     ...extraList.map((d) => ({ ...d, _k: `e-${d.id}`, _type: "extra" })),
-    ...beverageList.map((d) => ({ ...d, _k: `b-${d.id}`, _type: "beverage" })),
   ].map((def) => {
     const price = Number(def.price || 0);
     const breakdown = computeCostBreakdown(def, invById, cogsCostContext);
@@ -5579,12 +5289,11 @@ const cogsMarginData = useMemo(() => {
   const below = rows.filter((row) => row._marginPct + 0.0001 < row._targetMarginPct);
   const missingCostKeys = rows.filter((row) => row._hasMissingCosts).map((row) => row._k);
   return { all: rows, below, threshold, missingCostKeys };
-}, [menu, extraList, beverageList, invById, targetMarginPct, cogsCostContext]);
+}, [menu, extraList, invById, targetMarginPct, cogsCostContext]);
 const filteredCogsRows = useMemo(() => {
   let rows = showLowMarginOnly ? cogsMarginData.below : cogsMarginData.all;
   if (cogsTypeFilter === "menu") rows = rows.filter((row) => row._type === "menu");
   if (cogsTypeFilter === "extra") rows = rows.filter((row) => row._type === "extra");
-  if (cogsTypeFilter === "beverage") rows = rows.filter((row) => row._type === "beverage");
   const q = String(cogsSearch || "").trim().toLowerCase();
   if (q) {
     rows = rows.filter((row) => String(row.name || "").toLowerCase().includes(q));
@@ -5645,13 +5354,12 @@ const marginSummary = totalMarginRows
       ? `Showing ${sortedCogsRows.length} item${sortedCogsRows.length === 1 ? "" : "s"} below the target margin.`
       : `${lowMarginCount} of ${totalMarginRows} item${totalMarginRows === 1 ? "" : "s"} are below the target margin.`) +
       (revenueAtRisk > 0 ? ` Low-margin revenue at risk: E£${revenueAtRisk.toFixed(2)}.` : ""))
-  : "No menu, extra, or beverage items available yet.";
+  : "No menu or extra items available yet.";
 const handleApplyTargetMarginToLowItems = () => {
   const rows = cogsMarginData.below || [];
   if (!rows.length) return;
   const menuUpdates = [];
   const extraUpdates = [];
-  const beverageUpdates = [];
   for (const row of rows) {
     const safeTarget = Math.min(
       row.targetMarginPctOverride ?? targetMarginPct,
@@ -5664,25 +5372,21 @@ const handleApplyTargetMarginToLowItems = () => {
     if (Math.abs(suggested - Number(row._price || 0)) < 0.001) continue;
     if (row._type === "extra") {
       extraUpdates.push({ id: row.id, price: suggested });
-    } else if (row._type === "beverage") {
-      beverageUpdates.push({ id: row.id, price: suggested });
     } else {
       menuUpdates.push({ id: row.id, price: suggested });
     }
   }
   const menuCount = menuUpdates.length;
   const extraCount = extraUpdates.length;
-  const beverageCount = beverageUpdates.length;
-  if (!menuCount && !extraCount && !beverageCount) {
+  if (!menuCount && !extraCount) {
     alert("All below-target items already match their suggested prices.");
     return;
   }
-  const total = menuCount + extraCount + beverageCount;
+  const total = menuCount + extraCount;
   const confirmMsg =
     `Apply target-margin pricing to ${total} item${total === 1 ? "" : "s"}?\n` +
     (menuCount ? `• Menu: ${menuCount}\n` : "") +
-    (extraCount ? `• Extras: ${extraCount}\n` : "") +
-    (beverageCount ? `• Beverages: ${beverageCount}` : "");
+    (extraCount ? `• Extras: ${extraCount}` : "");
   if (!window.confirm(confirmMsg.trim())) return;
   if (menuCount) {
     setMenu((arr) =>
@@ -5696,14 +5400,6 @@ const handleApplyTargetMarginToLowItems = () => {
     setExtraList((arr) =>
       arr.map((it) => {
         const upd = extraUpdates.find((u) => u.id === it.id);
-        return upd ? { ...it, price: upd.price } : it;
-      })
-    );
-  }
-  if (beverageCount) {
-    setBeverageList((arr) =>
-      arr.map((it) => {
-        const upd = beverageUpdates.find((u) => u.id === it.id);
         return upd ? { ...it, price: upd.price } : it;
       })
     );
@@ -5755,21 +5451,17 @@ const updateRowPrice = (row, newPrice, { confirm = false } = {}) => {
   const current = Number(row._price ?? row.price ?? 0);
   if (Math.abs(sanitized - current) < 0.001) return;
   const [kind, idStr] = String(row._k || "").split("-");
-  const id = idStr;
+  const id = Number(idStr);
   if (!id) return;
   const label = row.name || "item";
   if (confirm && !window.confirm(`Set "${label}" price to E£${sanitized.toFixed(2)}?`)) return;
   if (kind === "e") {
     setExtraList((arr) =>
-      arr.map((it) => (String(it.id) === String(id) ? { ...it, price: sanitized } : it))
-    );
-  } else if (kind === "b") {
-    setBeverageList((arr) =>
-      arr.map((it) => (String(it.id) === String(id) ? { ...it, price: sanitized } : it))
+      arr.map((it) => (it.id === id ? { ...it, price: sanitized } : it))
     );
   } else {
     setMenu((arr) =>
-      arr.map((it) => (String(it.id) === String(id) ? { ...it, price: sanitized } : it))
+      arr.map((it) => (it.id === id ? { ...it, price: sanitized } : it))
     );
   }
 };
@@ -5813,8 +5505,6 @@ const updateEquipmentField = (id, field, value) => {
 const applyToCatalogItem = (kind, itemId, updater) => {
   if (kind === "menu") {
     setMenu((items) => items.map((it) => (it.id === itemId ? updater(it) : it)));
-  } else if (kind === "beverage") {
-    setBeverageList((items) => items.map((it) => (it.id === itemId ? updater(it) : it)));
   } else {
     setExtraList((items) => items.map((it) => (it.id === itemId ? updater(it) : it)));
   }
@@ -5830,14 +5520,6 @@ const removeEquipment = (id) => {
     })
   );
   setExtraList((items) =>
-    items.map((it) => {
-      if (!it.equipmentMinutes || !(id in it.equipmentMinutes)) return it;
-      const next = { ...it.equipmentMinutes };
-      delete next[id];
-      return { ...it, equipmentMinutes: next };
-    })
-  );
-  setBeverageList((items) =>
     items.map((it) => {
       if (!it.equipmentMinutes || !(id in it.equipmentMinutes)) return it;
       const next = { ...it.equipmentMinutes };
@@ -5942,24 +5624,6 @@ const marginTrend = useMemo(() => {
         const price = Number(line?.price || 0);
         revenue += price * qty;
         cogs += unitCogs * qty;
-      }
-    } else if (type === "beverage") {
-      for (const line of lines) {
-        const qty = Math.max(1, Number(line?.qty || 1));
-        if (
-          isStandaloneBeverageCartLine(line) &&
-          String(getStandaloneBeverageCatalogId(line)) === String(id)
-        ) {
-          const price = Number(line?.price || 0);
-          revenue += price * qty;
-          cogs += unitCogs * qty;
-          continue;
-        }
-        const comboBeverage = getComboBeverage(line);
-        if (comboBeverage && String(comboBeverage.beverageId || comboBeverage.id) === String(id)) {
-          const units = qty * getComboBeverageQty(comboBeverage);
-          cogs += unitCogs * units;
-        }
       }
     } else {
       for (const line of lines) {
@@ -6617,7 +6281,6 @@ const endDay = async () => {
         const bodyBase = packStateForCloud({
           menu,
           extraList,
-          beverageList,
           orders: realtimeOrders ? [] : clearedOrders,
           inventory,
           bulkInventoryItems,
@@ -6682,39 +6345,12 @@ const multiplyUses = (uses = {}, factor = 1) => {
 };
   const addToCart = () => {
     const toSelectedQty = (value) => Math.max(1, Math.floor(Number(value || 1)));
-    const comboMissingBeverage = Object.values(selectedItems).find((entry) => {
-      if (!entry?.item?.isCombo) return false;
-      if (!activeBeverages.length) return false;
-      return !comboBeverageSelections[String(entry.item.id)];
-    });
-    if (comboMissingBeverage) {
-      return alert(`Choose an included beverage for ${comboMissingBeverage.item.name}.`);
-    }
     const selectedItemLines = Object.values(selectedItems)
       .filter((entry) => entry?.item && Number(entry.qty || 0) > 0)
       .map(({ item, qty }) => {
         const lineQty = toSelectedQty(qty);
         const currentItem =
           menu.find((candidate) => String(candidate.id) === String(item.id)) || item;
-        const comboBeverageId = currentItem.isCombo
-          ? comboBeverageSelections[String(currentItem.id)]
-          : "";
-        const comboBeverageDef = comboBeverageId
-          ? activeBeverages.find((candidate) => String(candidate.id) === String(comboBeverageId))
-          : null;
-        const comboBeverage = comboBeverageDef
-          ? {
-              id: comboBeverageDef.id,
-              beverageId: comboBeverageDef.id,
-              name: comboBeverageDef.name,
-              price: 0,
-              included: true,
-              itemType: "combo-beverage",
-              priceLabel: "Included",
-              qtyPerCombo: 1,
-              uses: comboBeverageDef.uses || {},
-            }
-          : null;
         return {
           ...currentItem,
           itemType: "menu",
@@ -6722,8 +6358,6 @@ const multiplyUses = (uses = {}, factor = 1) => {
           price: Number(currentItem.price || 0),
           qty: lineQty,
           uses: multiplyUses(currentItem.uses || {}, lineQty),
-          isCombo: !!currentItem.isCombo,
-          ...(comboBeverage ? { comboBeverage } : {}),
         };
       });
     const selectedExtraLines = Object.values(selectedExtras)
@@ -6743,30 +6377,11 @@ const multiplyUses = (uses = {}, factor = 1) => {
           uses: multiplyUses(currentExtra.uses || {}, lineQty),
         };
       });
-    const selectedBeverageLines = Object.values(selectedBeverages)
-      .filter((entry) => entry?.item && Number(entry.qty || 0) > 0)
-      .map(({ item, qty }) => {
-        const lineQty = toSelectedQty(qty);
-        const currentBeverage =
-          beverageList.find((candidate) => String(candidate.id) === String(item.id)) || item;
-        return {
-          ...currentBeverage,
-          id: `beverage-${currentBeverage.id}`,
-          beverageId: currentBeverage.id,
-          itemType: "beverage",
-          extras: [],
-          price: Number(currentBeverage.price || 0),
-          qty: lineQty,
-          uses: multiplyUses(currentBeverage.uses || {}, lineQty),
-        };
-      });
-    const newLines = [...selectedItemLines, ...selectedExtraLines, ...selectedBeverageLines];
-    if (newLines.length === 0) return alert("Select at least one burger/item, extra, or beverage first.");
+    const newLines = [...selectedItemLines, ...selectedExtraLines];
+    if (newLines.length === 0) return alert("Select at least one burger/item or extra first.");
     setCart((c) => [...c, ...newLines]);
     setSelectedItems({});
     setSelectedExtras({});
-    setSelectedBeverages({});
-    setComboBeverageSelections({});
   };
   const removeFromCart = (i) =>
     setCart((c) => c.filter((_, idx) => idx !== i));
@@ -6946,11 +6561,9 @@ const checkout = async () => {
       : normalizePhone(customerPhone);
     const cartWithUses = cart.map((line) => {
       const isExtraLine = isStandaloneExtraCartLine(line);
-      const isBeverageLine = isStandaloneBeverageCartLine(line);
-      const baseItem = isExtraLine || isBeverageLine ? null : menu.find((m) => String(m.id) === String(line.id));
+      const baseItem = isExtraLine ? null : menu.find((m) => m.id === line.id);
       const standaloneExtra = isExtraLine ? findExtraDefinitionForCartLine(line, extraList) : null;
-      const standaloneBeverage = isBeverageLine ? findBeverageDefinitionForCartLine(line, beverageList) : null;
-      const unitUses = { ...((isBeverageLine ? standaloneBeverage : isExtraLine ? standaloneExtra : baseItem)?.uses || {}) };
+      const unitUses = { ...((isExtraLine ? standaloneExtra : baseItem)?.uses || {}) };
 
       for (const ex of line.extras || []) {
         const exDef = extraList.find((e) => e.id === ex.id) || ex;
@@ -6960,24 +6573,9 @@ const checkout = async () => {
           unitUses[k] = (unitUses[k] || 0) + Number(exUses[k] || 0) * extraQty;
         }
       }
-      const comboBeverage = getComboBeverage(line);
-      if (comboBeverage) {
-        const comboDef =
-          beverageList.find((b) => String(b.id) === String(comboBeverage.beverageId || comboBeverage.id)) ||
-          comboBeverage;
-        const beverageUses = comboDef.uses || {};
-        const comboQty = getComboBeverageQty(comboBeverage);
-        for (const k of Object.keys(beverageUses)) {
-          unitUses[k] = (unitUses[k] || 0) + Number(beverageUses[k] || 0) * comboQty;
-        }
-      }
 
       const qty = Math.max(1, Number(line.qty || 1));
-      return {
-        ...line,
-        ...(comboBeverage ? { comboBeverage } : {}),
-        uses: multiplyUses(unitUses, qty),
-      };
+      return { ...line, uses: multiplyUses(unitUses, qty) };
     });
     const required = {};
     for (const line of cartWithUses) {
@@ -7139,7 +6737,7 @@ const integrateOnlineOrder = async (onlineOrder) => {
   const existing = findPosOrderForOnline(onlineOrder);
   if (existing) return existing;
 
-  const cartWithUses = buildCartWithUsesFromOnline(onlineOrder, menu, extraList, beverageList);
+  const cartWithUses = buildCartWithUsesFromOnline(onlineOrder, menu, extraList);
   const required = computeInventoryRequirement(cartWithUses);
   for (const invId of Object.keys(required)) {
     const invItem = invById[invId];
@@ -7466,10 +7064,6 @@ const onlineFallbackId =
       const qty = Math.max(1, Number(line.qty || 1));
       const unitPrice = formatMoney(line.price || 0);
       const base = `${qty} × ${line.name || "Item"} (${unitPrice})`;
-      const comboBeverage = getComboBeverage(line);
-      const comboLine = comboBeverage
-        ? `  + ${comboBeverage.name || "Beverage"} x${qty * getComboBeverageQty(comboBeverage)} (Included)`
-        : "";
       const extras = Array.isArray(line.extras)
         ? line.extras
             .filter(Boolean)
@@ -7483,7 +7077,7 @@ const onlineFallbackId =
             })
             .join("\n")
         : "";
-      return [base, comboLine, extras].filter(Boolean).join("\n");
+      return extras ? `${base}\n${extras}` : base;
     });
     const orderDetails = orderDetailsList.filter(Boolean).join("\n") || "No items";
 
@@ -8235,55 +7829,22 @@ const totals = useMemo(() => {
   const salesStats = useMemo(() => {
     const itemMap = new Map();
     const extraMap = new Map();
-    const beverageMap = new Map();
-    const includedBeverageMap = new Map();
-    const beverageInventoryMap = new Map();
     const add = (map, id, name, count, revenue) => {
       const prev = map.get(id) || { id, name, count: 0, revenue: 0 };
       prev.count += count;
       prev.revenue += revenue;
       map.set(id, prev);
     };
-    const addInventoryUsage = (uses = {}, units = 1) => {
-      for (const [invId, qty] of Object.entries(uses || {})) {
-        const amount = Number(qty || 0) * Number(units || 1);
-        if (!amount) continue;
-        const inv = invById[invId] || {};
-        const prev =
-          beverageInventoryMap.get(invId) || {
-            id: invId,
-            name: inv.name || invId,
-            unit: inv.unit || "",
-            qty: 0,
-          };
-        prev.qty += amount;
-        beverageInventoryMap.set(invId, prev);
-      }
-    };
     for (const o of reportOrders) {
       if (o.voided) continue;
       for (const line of o.cart || []) {
         const q = Number(line.qty || 1);
         const base = Number(line.price || 0);
-        if (isStandaloneBeverageCartLine(line)) {
-          const beverageId = getStandaloneBeverageCatalogId(line);
-          add(beverageMap, beverageId, line.name, q, base * q);
-          addInventoryUsage(line.uses || {}, 1);
-        } else if (isStandaloneExtraCartLine(line)) {
+        if (isStandaloneExtraCartLine(line)) {
           const extraId = getStandaloneExtraCatalogId(line);
           add(extraMap, extraId, line.name, q, base * q);
         } else {
           add(itemMap, line.id, line.name, q, base * q);
-        }
-        const comboBeverage = getComboBeverage(line);
-        if (comboBeverage) {
-          const comboQty = getComboBeverageQty(comboBeverage);
-          const units = q * comboQty;
-          const beverageId = comboBeverage.beverageId || comboBeverage.id;
-          add(includedBeverageMap, beverageId, comboBeverage.name, units, 0);
-          const beverageDef =
-            beverageList.find((b) => String(b.id) === String(beverageId)) || comboBeverage;
-          addInventoryUsage(beverageDef.uses || comboBeverage.uses || {}, units);
         }
         for (const ex of line.extras || []) {
           const extraQty = getCartExtraQty(ex);
@@ -8298,17 +7859,8 @@ const totals = useMemo(() => {
     const extras = Array.from(extraMap.values()).sort(
       (a, b) => b.count - a.count || b.revenue - a.revenue
     );
-    const beverages = Array.from(beverageMap.values()).sort(
-      (a, b) => b.count - a.count || b.revenue - a.revenue
-    );
-    const includedBeverages = Array.from(includedBeverageMap.values()).sort(
-      (a, b) => b.count - a.count || String(a.name).localeCompare(String(b.name))
-    );
-    const beverageInventory = Array.from(beverageInventoryMap.values()).sort(
-      (a, b) => b.qty - a.qty || String(a.name).localeCompare(String(b.name))
-    );
-    return { items, extras, beverages, includedBeverages, beverageInventory };
-  }, [reportOrders, invById, beverageList]);
+    return { items, extras };
+  }, [reportOrders]);
 
  const marginChartRange = useMemo(() => {
     const now = new Date();
@@ -8727,41 +8279,6 @@ const endedStr   = m.endedAt   ? fmtDateTime(m.endedAt)   : "—";
       });
 
       y = doc.lastAutoTable ? doc.lastAutoTable.finalY + 8 : y + 40;
-      doc.text("Beverages — Paid Sales", 14, y);
-      autoTable(doc, {
-        head: [["Beverage", "Paid Qty", "Revenue (E£)"]],
-        body: salesStats.beverages.map((r) => [r.name, String(r.count), r.revenue.toFixed(2)]),
-        startY: y + 4,
-        theme: "grid",
-      });
-
-      y = doc.lastAutoTable ? doc.lastAutoTable.finalY + 8 : y + 40;
-      doc.text("Beverages — Included in Combos", 14, y);
-      autoTable(doc, {
-        head: [["Beverage", "Included Qty", "Revenue (E£)"]],
-        body: salesStats.includedBeverages.map((r) => [
-          r.name,
-          String(r.count),
-          r.revenue.toFixed(2),
-        ]),
-        startY: y + 4,
-        theme: "grid",
-      });
-
-      y = doc.lastAutoTable ? doc.lastAutoTable.finalY + 8 : y + 40;
-      doc.text("Beverage Inventory Usage", 14, y);
-      autoTable(doc, {
-        head: [["Inventory Item", "Used", "Unit"]],
-        body: salesStats.beverageInventory.map((r) => [
-          r.name,
-          Number(r.qty || 0).toFixed(2),
-          r.unit || "",
-        ]),
-        startY: y + 4,
-        theme: "grid",
-      });
-
-      y = doc.lastAutoTable ? doc.lastAutoTable.finalY + 8 : y + 40;
       doc.text("Inventory — Start vs Now", 14, y);
 
       if (!inventoryReportRows.length) {
@@ -8816,7 +8333,6 @@ const endedStr   = m.endedAt   ? fmtDateTime(m.endedAt)   : "—";
   // ---------- helpers for Edit (reorder + consumption toggles) ----------
   const [openMenuConsId, setOpenMenuConsId] = useState(null);
   const [openExtraConsId, setOpenExtraConsId] = useState(null);
-  const [openBeverageConsId, setOpenBeverageConsId] = useState(null);
   const moveByIndex = (arr, idx, dir) => {
     const ni = idx + dir;
     if (ni < 0 || ni >= arr.length) return arr;
@@ -8845,18 +8361,6 @@ const endedStr   = m.endedAt   ? fmtDateTime(m.endedAt)   : "—";
     });
   const moveExtraDown = (id) =>
     setExtraList((arr) => {
-      const idx = arr.findIndex((x) => x.id === id);
-      if (idx < 0) return arr;
-      return moveByIndex(arr, idx, +1);
-    });
-  const moveBeverageUp = (id) =>
-    setBeverageList((arr) => {
-      const idx = arr.findIndex((x) => x.id === id);
-      if (idx < 0) return arr;
-      return moveByIndex(arr, idx, -1);
-    });
-  const moveBeverageDown = (id) =>
-    setBeverageList((arr) => {
       const idx = arr.findIndex((x) => x.id === id);
       if (idx < 0) return arr;
       return moveByIndex(arr, idx, +1);
@@ -9388,16 +8892,6 @@ const generatePurchasesPDF = () => {
                 );
               })}
             </optgroup>
-            <optgroup label="Beverages">
-              {beverageList.map(def => {
-                const cogs = computeCOGSForItemDef(def, invById, cogsCostContext);
-                return (
-                  <option key={`b-${def.id}`} value={`b-${def.id}`}>
-                    {`${def.name} — COGS E£${cogs.toFixed(2)} • Price E£${Number(def.price||0).toFixed(2)}`}
-                  </option>
-                );
-              })}
-            </optgroup>
           </select>
 
           {/* Current stats for selection */}
@@ -9904,10 +9398,6 @@ const cogs = Number(
               <h5 style={{ margin: "0 0 6px" }}>Extras</h5>
               {renderPrepTable("extra", extraList, "No extras yet.")}
             </div>
-            <div>
-              <h5 style={{ margin: "0 0 6px" }}>Beverages</h5>
-              {renderPrepTable("beverage", beverageList, "No beverages yet.")}
-            </div>
           </div>
         </div>
       </div>
@@ -10006,7 +9496,6 @@ const cogs = Number(
               <option value="all">All items</option>
               <option value="menu">Menu only</option>
               <option value="extra">Extras only</option>
-              <option value="beverage">Beverages only</option>
             </select>
             <input
               type="search"
@@ -10312,11 +9801,6 @@ const cogs = Number(
                     >
                       <div style={{ fontWeight: 700, marginBottom: 4 }}>{item.name}</div>
                       <div>E£{item.price}</div>
-                      {item.isCombo && (
-                        <div style={{ marginTop: 6, fontSize: 12, fontWeight: 700, color: dark ? "#a5d6a7" : "#2e7d32" }}>
-                          Combo
-                        </div>
-                      )}
                       {isSel &&
                         renderSelectionQtyControl(
                           qty,
@@ -10383,128 +9867,6 @@ const cogs = Number(
                 })}
               </div>
 
-              <h3 style={{ marginTop: 18 }}>Beverages</h3>
-              <div
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
-                  gap: 10,
-                }}
-              >
-                {activeBeverages.map((bev) => {
-                  const selectedEntry = selectedBeverages[String(bev.id)];
-                  const checked = !!selectedEntry;
-                  const qty = selectedEntry?.qty || 1;
-                  const bg = bev.color || (dark ? "#1e1e1e" : "#ffffff");
-                  return (
-                    <div
-                      key={bev.id}
-                      role="button"
-                      tabIndex={0}
-                      aria-pressed={checked}
-                      onClick={() => toggleBeverage(bev)}
-                      onKeyDown={(event) =>
-                        handleSelectionTileKeyDown(event, () => toggleBeverage(bev))
-                      }
-                      style={{
-                        position: "relative",
-                        minHeight: 88,
-                        textAlign: "left",
-                        padding: checked ? "12px 12px 48px" : 12,
-                        border: checked ? "2px solid #42a5f5" : `1px solid ${btnBorder}`,
-                        borderRadius: 8,
-                        background: bg,
-                        color: dark ? "#eee" : "#000",
-                        cursor: "pointer",
-                        boxShadow: checked ? "0 0 0 3px rgba(66, 165, 245, 0.22)" : "none",
-                        transition: "border-color 120ms ease, box-shadow 120ms ease",
-                      }}
-                    >
-                      <div style={{ fontWeight: 700, marginBottom: 4 }}>{bev.name}</div>
-                      <div>E£{bev.price}</div>
-                      {checked &&
-                        renderSelectionQtyControl(
-                          qty,
-                          () => updateSelectedQty(setSelectedBeverages, bev.id, -1),
-                          () => updateSelectedQty(setSelectedBeverages, bev.id, 1),
-                          bev.name
-                        )}
-                    </div>
-                  );
-                })}
-                {activeBeverages.length === 0 && (
-                  <div
-                    style={{
-                      padding: 10,
-                      borderRadius: 8,
-                      border: `1px dashed ${btnBorder}`,
-                      opacity: 0.75,
-                    }}
-                  >
-                    Add beverages in Admin.
-                  </div>
-                )}
-              </div>
-
-              {Object.values(selectedItems).some((entry) => entry?.item?.isCombo) && (
-                <div
-                  style={{
-                    marginTop: 12,
-                    display: "grid",
-                    gap: 8,
-                    padding: 10,
-                    borderRadius: 8,
-                    border: `1px solid ${cardBorder}`,
-                    background: dark ? "#171717" : "#fafafa",
-                  }}
-                >
-                  <div style={{ fontWeight: 700 }}>Included combo beverages</div>
-                  {Object.values(selectedItems)
-                    .filter((entry) => entry?.item?.isCombo)
-                    .map((entry) => {
-                      const item = entry.item;
-                      const key = String(item.id);
-                      return (
-                        <label
-                          key={key}
-                          style={{
-                            display: "grid",
-                            gridTemplateColumns: "minmax(120px, 1fr) minmax(160px, 1.2fr)",
-                            gap: 8,
-                            alignItems: "center",
-                          }}
-                        >
-                          <span>{item.name}</span>
-                          <select
-                            value={comboBeverageSelections[key] || ""}
-                            onChange={(e) =>
-                              setComboBeverageSelections((prev) => ({
-                                ...prev,
-                                [key]: e.target.value,
-                              }))
-                            }
-                            disabled={!activeBeverages.length}
-                            style={{
-                              padding: 6,
-                              borderRadius: 6,
-                              border: `1px solid ${btnBorder}`,
-                              background: dark ? "#1e1e1e" : "#fff",
-                              color: dark ? "#eee" : "#000",
-                            }}
-                          >
-                            <option value="">Select beverage</option>
-                            {activeBeverages.map((bev) => (
-                              <option key={bev.id} value={bev.id}>
-                                {bev.name}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                      );
-                    })}
-                </div>
-              )}
-
               {/* Add */}
               <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 8 }}>
                 <button
@@ -10534,7 +9896,6 @@ const cogs = Number(
                 (t, e) => t + Number(e.price || 0) * getCartExtraQty(e),
                 0
               );
-              const comboBeverage = getComboBeverage(it);
               const lineTotal =
                 (Number(it.price || 0) + extrasSum) * Number(it.qty || 1);
               return (
@@ -10554,12 +9915,9 @@ const cogs = Number(
                 >
                   <div style={{ flex: 1 }}>
                     <strong>{it.name}</strong> — E£{it.price}
-                    {(it.extras?.length > 0 || comboBeverage) && (
+                    {it.extras?.length > 0 && (
                       <ul style={{ margin: "4px 0 0 16px", color: dark ? "#bbb" : "#555" }}>
-                        {comboBeverage && (
-                          <li key="combo-beverage">+ {comboBeverage.name} (Included)</li>
-                        )}
-                        {(it.extras || []).map((e) => (
+                        {it.extras.map((e) => (
                           <li key={e.id}>+ {e.name} (E£{e.price})</li>
                         ))}
                       </ul>
@@ -11585,33 +10943,25 @@ const cogs = Number(
                       </div>
 
                       <ul style={{ marginTop: 8, marginBottom: 8 }}>
-                        {o.cart.map((ci, idx) => {
-                          const comboBeverage = getComboBeverage(ci);
-                          return (
-                            <li key={idx} style={{ marginLeft: 12 }}>
-                              • {ci.name} × {ci.qty || 1} — E£{ci.price} each
-                              {(ci.extras?.length > 0 || comboBeverage) && (
-                                <ul
-                                  style={{
-                                    margin: "2px 0 6px 18px",
-                                    color: dark ? "#bbb" : "#555",
-                                  }}
-                                >
-                                  {comboBeverage && (
-                                    <li key="combo-beverage">
-                                      + {comboBeverage.name} (Included) × {(ci.qty || 1) * getComboBeverageQty(comboBeverage)}
-                                    </li>
-                                  )}
-                                  {(ci.extras || []).map((ex) => (
-                                    <li key={ex.id}>
-                                      + {ex.name} (E£{ex.price}) × {ci.qty || 1}
-                                    </li>
-                                  ))}
-                                </ul>
-                              )}
-                            </li>
-                          );
-                        })}
+                        {o.cart.map((ci, idx) => (
+                          <li key={idx} style={{ marginLeft: 12 }}>
+                            • {ci.name} × {ci.qty || 1} — E£{ci.price} each
+                            {ci.extras?.length > 0 && (
+                              <ul
+                                style={{
+                                  margin: "2px 0 6px 18px",
+                                  color: dark ? "#bbb" : "#555",
+                                }}
+                              >
+                                {ci.extras.map((ex) => (
+                                  <li key={ex.id}>
+                                    + {ex.name} (E£{ex.price}) × {ci.qty || 1}
+                                  </li>
+                                ))}
+                              </ul>
+                            )}
+                          </li>
+                        ))}
                       </ul>
 
                       <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
@@ -14799,83 +14149,6 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
               )}
             </tbody>
           </table>
-          <h3>Beverages Sold</h3>
-          <table style={{ width: "100%", borderCollapse: "collapse", marginTop: 16, marginBottom: 16 }}>
-            <thead>
-              <tr>
-                <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Beverage</th>
-                <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Paid Qty</th>
-                <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Avg Price (E£)</th>
-                <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Revenue (E£)</th>
-              </tr>
-            </thead>
-            <tbody>
-              {salesStats.beverages.map((r) => {
-                const avg = r.count ? r.revenue / r.count : 0;
-                return (
-                  <tr key={r.id}>
-                    <td style={{ padding: 6 }}>{r.name}</td>
-                    <td style={{ padding: 6, textAlign: "right" }}>{r.count}</td>
-                    <td style={{ padding: 6, textAlign: "right" }}>{avg.toFixed(2)}</td>
-                    <td style={{ padding: 6, textAlign: "right" }}>{r.revenue.toFixed(2)}</td>
-                  </tr>
-                );
-              })}
-              {salesStats.beverages.length === 0 && (
-                <tr>
-                  <td colSpan={4} style={{ padding: 8, opacity: 0.8 }}>No paid beverages sold in this period.</td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-          <h3>Included Combo Beverages</h3>
-          <table style={{ width: "100%", borderCollapse: "collapse", marginBottom: 16 }}>
-            <thead>
-              <tr>
-                <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Beverage</th>
-                <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Included Qty</th>
-                <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Revenue (E£)</th>
-              </tr>
-            </thead>
-            <tbody>
-              {salesStats.includedBeverages.map((r) => (
-                <tr key={r.id}>
-                  <td style={{ padding: 6 }}>{r.name}</td>
-                  <td style={{ padding: 6, textAlign: "right" }}>{r.count}</td>
-                  <td style={{ padding: 6, textAlign: "right" }}>{r.revenue.toFixed(2)}</td>
-                </tr>
-              ))}
-              {salesStats.includedBeverages.length === 0 && (
-                <tr>
-                  <td colSpan={3} style={{ padding: 8, opacity: 0.8 }}>No included combo beverages in this period.</td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-          <h3>Beverage Inventory Usage</h3>
-          <table style={{ width: "100%", borderCollapse: "collapse", marginBottom: 16 }}>
-            <thead>
-              <tr>
-                <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Inventory Item</th>
-                <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Used</th>
-                <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Unit</th>
-              </tr>
-            </thead>
-            <tbody>
-              {salesStats.beverageInventory.map((r) => (
-                <tr key={r.id}>
-                  <td style={{ padding: 6 }}>{r.name}</td>
-                  <td style={{ padding: 6, textAlign: "right" }}>{Number(r.qty || 0).toFixed(2)}</td>
-                  <td style={{ padding: 6 }}>{r.unit}</td>
-                </tr>
-              ))}
-              {salesStats.beverageInventory.length === 0 && (
-                <tr>
-                  <td colSpan={3} style={{ padding: 8, opacity: 0.8 }}>No beverage inventory usage in this period.</td>
-                </tr>
-              )}
-            </tbody>
-          </table>
                 {/* Inventory — Start vs Now */}
 <h3>Inventory — Start vs Now</h3>
 {(!inventorySnapshot || inventorySnapshot.length === 0) ? (
@@ -14919,7 +14192,6 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
                 <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Name</th>
                 <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Price (E£)</th>
                 <th style={{ textAlign: "center", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Color</th>
-                <th style={{ textAlign: "center", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Combo</th>
                 <th style={{ borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Arrange</th>
                 <th style={{ borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Actions</th>
               </tr>
@@ -14959,18 +14231,6 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
                       />
                     </td>
                     <td style={{ padding: 6, textAlign: "center" }}>
-                      <input
-                        type="checkbox"
-                        checked={!!it.isCombo}
-                        onChange={(e) =>
-                          setMenu((arr) =>
-                            arr.map((x) => (x.id === it.id ? { ...x, isCombo: e.target.checked } : x))
-                          )
-                        }
-                        aria-label={`Mark ${it.name} as combo`}
-                      />
-                    </td>
-                    <td style={{ padding: 6, textAlign: "center" }}>
                       <button onClick={() => moveMenuUp(it.id)} style={{ marginRight: 6 }}>↑</button>
                       <button onClick={() => moveMenuDown(it.id)}>↓</button>
                     </td>
@@ -15006,7 +14266,7 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
                   </tr>
                   {openMenuConsId === it.id && (
                     <tr>
-                      <td colSpan={6} style={{ padding: 6, background: dark ? "#151515" : "#fafafa" }}>
+                      <td colSpan={5} style={{ padding: 6, background: dark ? "#151515" : "#fafafa" }}>
                        <div
                             style={{
                               display: "grid",
@@ -15064,13 +14324,13 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
               ))}
               {menu.length === 0 && (
                 <tr>
-                  <td colSpan={6} style={{ padding: 8, opacity: 0.8 }}>No items. Add some below.</td>
+                  <td colSpan={5} style={{ padding: 8, opacity: 0.8 }}>No items. Add some below.</td>
                 </tr>
               )}
             </tbody>
                 <tfoot>
   <tr>
-    <td colSpan={6} style={{ padding: 8 }}>
+    <td colSpan={5} style={{ padding: 8 }}>
       <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
         <input
           type="text"
@@ -15315,230 +14575,6 @@ setExtraList((arr) => [
 >
   Add Extra
 </button>
-<div style={{ flexBasis: "100%", width: "100%", marginTop: 16, marginBottom: 18 }}>
-  <h3>Beverages</h3>
-  <table style={{ width: "100%", borderCollapse: "collapse", marginBottom: 12 }}>
-    <thead>
-      <tr>
-        <th style={{ textAlign: "left", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Name</th>
-        <th style={{ textAlign: "right", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Price (E£)</th>
-        <th style={{ textAlign: "center", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Color</th>
-        <th style={{ textAlign: "center", borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Active</th>
-        <th style={{ borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Arrange</th>
-        <th style={{ borderBottom: `1px solid ${cardBorder}`, padding: 6 }}>Actions</th>
-      </tr>
-    </thead>
-    <tbody>
-      {beverageList.map((bev) => (
-        <React.Fragment key={bev.id}>
-          <tr>
-            <td style={{ padding: 6 }}>
-              <input
-                type="text"
-                value={bev.name}
-                onChange={(e) =>
-                  setBeverageList((arr) =>
-                    arr.map((x) => (x.id === bev.id ? { ...x, name: e.target.value } : x))
-                  )
-                }
-                onBlur={(e) => {
-                  if (!String(e.target.value || "").trim()) {
-                    alert("Beverage name cannot be empty.");
-                    setBeverageList((arr) =>
-                      arr.map((x) => (x.id === bev.id ? { ...x, name: "Beverage" } : x))
-                    );
-                  }
-                }}
-                style={{ width: "100%", padding: 6, borderRadius: 6, border: `1px solid ${btnBorder}` }}
-              />
-            </td>
-            <td style={{ padding: 6, textAlign: "right" }}>
-              <input
-                type="number"
-                min={0}
-                value={bev.price}
-                onChange={(e) => {
-                  const price = parseNonNegativePrice(e.target.value);
-                  setBeverageList((arr) =>
-                    arr.map((x) => (x.id === bev.id ? { ...x, price: price == null ? 0 : price } : x))
-                  );
-                }}
-                style={{ width: 120, padding: 6, borderRadius: 6, border: `1px solid ${btnBorder}`, textAlign: "right" }}
-              />
-            </td>
-            <td style={{ padding: 6, textAlign: "center" }}>
-              <input
-                type="color"
-                value={bev.color || "#ffffff"}
-                onChange={(e) =>
-                  setBeverageList((arr) =>
-                    arr.map((x) => (x.id === bev.id ? { ...x, color: e.target.value } : x))
-                  )
-                }
-                style={{ width: 40, height: 28, border: "none", background: "none" }}
-              />
-            </td>
-            <td style={{ padding: 6, textAlign: "center" }}>
-              <input
-                type="checkbox"
-                checked={bev.active !== false && !bev.deleted}
-                onChange={(e) =>
-                  setBeverageList((arr) =>
-                    arr.map((x) =>
-                      x.id === bev.id ? { ...x, active: e.target.checked, deleted: false } : x
-                    )
-                  )
-                }
-                aria-label={`Set ${bev.name} active`}
-              />
-            </td>
-            <td style={{ padding: 6, textAlign: "center" }}>
-              <button onClick={() => moveBeverageUp(bev.id)} style={{ marginRight: 6 }}>↑</button>
-              <button onClick={() => moveBeverageDown(bev.id)}>↓</button>
-            </td>
-            <td style={{ padding: 6 }}>
-              <button
-                onClick={() => setOpenBeverageConsId((v) => (v === bev.id ? null : bev.id))}
-                style={{
-                  background: "#455a64",
-                  color: "#fff",
-                  border: "none",
-                  borderRadius: 6,
-                  padding: "6px 10px",
-                  cursor: "pointer",
-                  marginRight: 6,
-                }}
-              >
-                Edit Consumption
-              </button>
-              <button
-                onClick={() =>
-                  setBeverageList((arr) =>
-                    arr.map((x) =>
-                      x.id === bev.id ? { ...x, active: false, deleted: false } : x
-                    )
-                  )
-                }
-                style={{
-                  background: "#c62828",
-                  color: "#fff",
-                  border: "none",
-                  borderRadius: 6,
-                  padding: "6px 10px",
-                  cursor: "pointer",
-                }}
-              >
-                Deactivate
-              </button>
-            </td>
-          </tr>
-          {openBeverageConsId === bev.id && (
-            <tr>
-              <td colSpan={6} style={{ padding: 6, background: dark ? "#151515" : "#fafafa" }}>
-                <div
-                  style={{
-                    display: "grid",
-                    gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))",
-                    columnGap: 16,
-                    rowGap: 14,
-                  }}
-                >
-                  {inventory.map((inv) => {
-                    const cur = Number((bev.uses || {})[inv.id] || 0);
-                    return (
-                      <label
-                        key={inv.id}
-                        style={{
-                          display: "flex",
-                          gap: 6,
-                          alignItems: "center",
-                          padding: 6,
-                          borderRadius: 6,
-                          border: `1px solid ${btnBorder}`,
-                          background: dark ? "#1e1e1e" : "#fff",
-                        }}
-                      >
-                        <span style={{ minWidth: 120 }}>{inv.name} ({inv.unit})</span>
-                        <input
-                          type="number"
-                          value={cur}
-                          min={0}
-                          step="any"
-                          onChange={(e) => {
-                            const v = Math.max(0, Number(e.target.value || 0));
-                            setBeverageList((arr) =>
-                              arr.map((x) =>
-                                x.id === bev.id
-                                  ? {
-                                      ...x,
-                                      uses: v > 0
-                                        ? { ...(x.uses || {}), [inv.id]: v }
-                                        : Object.fromEntries(
-                                            Object.entries(x.uses || {}).filter(([k]) => k !== inv.id)
-                                          ),
-                                    }
-                                  : x
-                              )
-                            );
-                          }}
-                          style={{ width: 120 }}
-                        />
-                      </label>
-                    );
-                  })}
-                </div>
-              </td>
-            </tr>
-          )}
-        </React.Fragment>
-      ))}
-      {beverageList.length === 0 && (
-        <tr>
-          <td colSpan={6} style={{ padding: 8, opacity: 0.8 }}>No beverages. Add some below.</td>
-        </tr>
-      )}
-    </tbody>
-  </table>
-  <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-    <input
-      type="text"
-      placeholder="New beverage name"
-      value={newBeverageName}
-      onChange={(e) => setNewBeverageName(e.target.value)}
-      style={{ padding: 6, borderRadius: 6, border: `1px solid ${btnBorder}`, minWidth: 220 }}
-    />
-    <input
-      type="number"
-      placeholder="Price (E£)"
-      value={newBeveragePrice}
-      onChange={(e) => setNewBeveragePrice(e.target.value)}
-      style={{ padding: 6, borderRadius: 6, border: `1px solid ${btnBorder}`, width: 160 }}
-    />
-    <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-      <span style={{ opacity: 0.8 }}>Color</span>
-      <input
-        type="color"
-        value={newBeverageColor}
-        onChange={(e) => setNewBeverageColor(e.target.value)}
-        style={{ width: 40, height: 28, border: "none", background: "none", cursor: "pointer" }}
-      />
-    </label>
-    <button
-      onClick={addBeverageFromForm}
-      style={{
-        background: "#2e7d32",
-        color: "#fff",
-        border: "none",
-        borderRadius: 6,
-        padding: "8px 12px",
-        cursor: "pointer",
-        fontWeight: 700,
-      }}
-    >
-      Add Beverage
-    </button>
-  </div>
-</div>
 <div
   style={{
     display: "grid",
