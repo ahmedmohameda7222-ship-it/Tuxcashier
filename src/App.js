@@ -487,6 +487,180 @@ const POS_STATE_ID = "pos";
 const ONLINE_ORDER_COLLECTIONS = [];
 
 const LS_KEY = "tux_pos_local_state_v1";
+export function nowIso() {
+  return new Date().toISOString();
+}
+
+const SECTION_UPDATED_AT_KEY = "sectionUpdatedAt";
+const ADMIN_SETTINGS_SECTION = "adminSettings";
+const REPORT_FILTERS_SECTION = "reportFilters";
+const HISTORY_SECTION = "history";
+const RECONCILIATION_SECTION = "reconciliation";
+const DAY_META_SECTION = "dayMeta";
+const WORKER_SESSIONS_SECTION = "workerSessions";
+const LOCAL_ONLY_SECTION = "localUi";
+
+const ADMIN_SETTINGS_KEYS = [
+  "menu",
+  "extraList",
+  "beverageList",
+  "workers",
+  "workerProfiles",
+  "paymentMethods",
+  "orderTypes",
+  "defaultDeliveryFee",
+  "deliveryZones",
+  "adminPins",
+  "autoPrintOnCheckout",
+  "preferredPaperWidthMm",
+  "cloudEnabled",
+  "realtimeOrders",
+  "dark",
+  "targetMarginPct",
+  "showLowMarginOnly",
+  "utilityBills",
+  "laborProfile",
+  "equipmentList",
+  "syncCostsFromPurchases",
+];
+
+const REPORT_FILTER_KEYS = ["reportFilter", "reportDay", "reportMonth"];
+const PROTECTED_HISTORY_KEYS = [
+  "historicalOrders",
+  "historicalExpenses",
+  "historicalPurchases",
+  "reconHistory",
+  "workerSessions",
+];
+
+const SECTION_KEYS = {
+  [ADMIN_SETTINGS_SECTION]: ADMIN_SETTINGS_KEYS,
+  [REPORT_FILTERS_SECTION]: REPORT_FILTER_KEYS,
+  [HISTORY_SECTION]: ["historicalOrders", "historicalExpenses", "historicalPurchases"],
+  [RECONCILIATION_SECTION]: ["reconHistory", "reconCounts", "reconSavedBy"],
+  [DAY_META_SECTION]: ["dayMeta"],
+  [WORKER_SESSIONS_SECTION]: ["workerSessions"],
+  [LOCAL_ONLY_SECTION]: ["adminSubTab", "usageFilter", "usageWeekDate", "usageMonth", "purchaseFilter"],
+};
+
+function sectionForKey(key) {
+  for (const [section, keys] of Object.entries(SECTION_KEYS)) {
+    if (keys.includes(key)) return section;
+  }
+  return key;
+}
+
+function toMs(value) {
+  if (!value) return 0;
+  const ms = value instanceof Date ? value.getTime() : new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function getStableRecordKey(record, fallbackPrefix = "row", index = 0) {
+  if (!record || typeof record !== "object") return `${fallbackPrefix}_${index}`;
+  const candidates = [
+    record.id,
+    record.sessionId,
+    record.dayId,
+    record.orderNo != null ? `order_${record.orderNo}` : "",
+    record.channelOrderNo ? `channel_${record.channelOrderNo}` : "",
+    record.name && (record.signInAt || record.date || record.at)
+      ? `${record.name}_${record.signInAt || record.date || record.at}`
+      : "",
+  ];
+  return String(candidates.find((v) => v !== undefined && v !== null && String(v) !== "") || `${fallbackPrefix}_${index}`);
+}
+
+function recordUpdatedMs(record) {
+  if (!record || typeof record !== "object") return 0;
+  const candidates = [
+    record.updatedAt,
+    record.savedAt,
+    record.reconciledAt,
+    record.endedAt,
+    record.endAt,
+    record.signOutAt,
+    record.createdAt,
+    record.date,
+    record.at,
+    record.signInAt,
+  ];
+  return candidates.reduce((max, value) => Math.max(max, toMs(value)), 0);
+}
+
+function stampRecord(record, stamp = nowIso(), fallbackPrefix = "row", index = 0) {
+  if (!record || typeof record !== "object") return record;
+  const createdAt =
+    record.createdAt ||
+    record.savedAt ||
+    record.reconciledAt ||
+    record.endedAt ||
+    record.endAt ||
+    record.signInAt ||
+    record.date ||
+    record.at ||
+    stamp;
+  return {
+    ...record,
+    id: record.id || getStableRecordKey(record, fallbackPrefix, index),
+    createdAt,
+    updatedAt: record.updatedAt || stamp,
+  };
+}
+
+function stampRecords(records, stamp = nowIso(), fallbackPrefix = "row") {
+  return Array.isArray(records)
+    ? records.map((record, index) => stampRecord(record, stamp, fallbackPrefix, index))
+    : [];
+}
+
+export function mergeByIdPreferNewest(localRows = [], remoteRows = [], options = {}) {
+  const { protectEmptyRemote = true, fallbackPrefix = "row" } = options;
+  const local = Array.isArray(localRows) ? localRows : [];
+  const remote = Array.isArray(remoteRows) ? remoteRows : [];
+  if (protectEmptyRemote && local.length && remote.length === 0) return local;
+
+  const merged = new Map();
+  local.forEach((row, index) => {
+    merged.set(getStableRecordKey(row, fallbackPrefix, index), row);
+  });
+  remote.forEach((row, index) => {
+    const key = getStableRecordKey(row, fallbackPrefix, index);
+    const prev = merged.get(key);
+    if (!prev || recordUpdatedMs(row) >= recordUpdatedMs(prev)) {
+      merged.set(key, row);
+    }
+  });
+  return Array.from(merged.values());
+}
+
+function hasAnyValueForKeys(source = {}, keys = []) {
+  return keys.some((key) => {
+    const value = source?.[key];
+    if (Array.isArray(value)) return value.length > 0;
+    if (value && typeof value === "object") return Object.keys(value).length > 0;
+    return value !== undefined && value !== null && value !== "";
+  });
+}
+
+function shouldApplyRemoteSection(localState = {}, remoteState = {}, section, options = {}) {
+  const { keys = SECTION_KEYS[section] || [], allowLegacyWhenLocalEmpty = true } = options;
+  const localMeta = localState?.[SECTION_UPDATED_AT_KEY] || {};
+  const remoteMeta = remoteState?.[SECTION_UPDATED_AT_KEY] || {};
+  const localMs = toMs(localMeta[section]);
+  const remoteMs = toMs(remoteMeta[section]);
+  if (remoteMs) return !localMs || remoteMs >= localMs;
+  return allowLegacyWhenLocalEmpty && !hasAnyValueForKeys(localState, keys);
+}
+
+function addSectionUpdatedAt(base = {}, sections = [], stamp = nowIso()) {
+  const next = { ...(base || {}) };
+  for (const section of sections) {
+    if (section) next[section] = stamp;
+  }
+  return next;
+}
+
 function loadLocal() {
 
   try { 
@@ -494,11 +668,44 @@ function loadLocal() {
   }
   catch { return {}; }
 }
-function saveLocalPartial(patch) {
+function saveLocalPartial(patch, options = {}) {
   try {
+    const stamp = options.updatedAt || nowIso();
     const cur = loadLocal();
-    localStorage.setItem(LS_KEY, JSON.stringify({ ...cur, ...patch }));
-  } catch {}
+    const next = { ...cur };
+    const sections = new Set(options.sections || []);
+    for (const [key, value] of Object.entries(patch || {})) {
+      const isProtectedHistory = PROTECTED_HISTORY_KEYS.includes(key);
+      const wouldClearProtectedArray =
+        isProtectedHistory &&
+        Array.isArray(cur[key]) &&
+        cur[key].length > 0 &&
+        Array.isArray(value) &&
+        value.length === 0 &&
+        !options.allowHistoryReset;
+
+      if (wouldClearProtectedArray) {
+        next[key] = cur[key];
+        continue;
+      }
+
+      next[key] = value;
+      sections.add(sectionForKey(key));
+    }
+    next[SECTION_UPDATED_AT_KEY] = addSectionUpdatedAt(
+      cur[SECTION_UPDATED_AT_KEY],
+      Array.from(sections),
+      stamp
+    );
+    if (options.resetMarker) {
+      next.resetMarkers = [...(Array.isArray(cur.resetMarkers) ? cur.resetMarkers : []), options.resetMarker];
+    }
+    localStorage.setItem(LS_KEY, JSON.stringify(next));
+    return true;
+  } catch (err) {
+    console.warn("Local save failed:", err);
+    return false;
+  }
 }
 function formatDateDDMMYY(date) {
   if (!date) return "";
@@ -1126,10 +1333,17 @@ export function packStateForCloud(state) {
     reportFilter,
     reportDay,
     reportMonth,
+    sectionUpdatedAt,
+    syncCostsFromPurchases,
   } = state;
+  const stamp = nowIso();
+  const localSectionUpdatedAt = loadLocal()?.[SECTION_UPDATED_AT_KEY] || {};
   const purchases = Array.isArray(state.purchases)
     ? state.purchases.map((p) => ({
         ...p,
+        id: p.id || getStableRecordKey(p, "purchase"),
+        createdAt: toIso(p.createdAt || p.date || stamp),
+        updatedAt: toIso(p.updatedAt || stamp),
         date: toIso(p.date),
       }))
     : [];
@@ -1151,17 +1365,31 @@ export function packStateForCloud(state) {
  workerProfiles,
     workerSessions: (workerSessions || []).map((session) => ({
       ...session,
+      id: session.id || getStableRecordKey(session, "worker_session"),
+      createdAt: toIso(session.createdAt || session.signInAt || stamp),
+      updatedAt: toIso(session.updatedAt || session.signOutAt || session.endedAt || stamp),
       signInAt: toIso(session.signInAt),
       signOutAt: toIso(session.signOutAt),
+      endAt: toIso(session.endAt),
+      endedAt: toIso(session.endedAt),
     })),
     realtimeOrders: typeof realtimeOrders === "boolean" ? realtimeOrders : undefined,
     version: 1,
-    updatedAt: new Date().toISOString(),
+    updatedAt: stamp,
+    [SECTION_UPDATED_AT_KEY]: {
+      ...localSectionUpdatedAt,
+      ...(sectionUpdatedAt || {}),
+    },
+    adminSettingsUpdatedAt:
+      (sectionUpdatedAt || localSectionUpdatedAt || {})[ADMIN_SETTINGS_SECTION],
     menu: normalizeMenuList(menu),
     extras: normalizeExtraList(extraList),
     beverages: normalizeBeverageList(beverageList),
     orders: (orders || []).map((o) => ({
       ...o,
+      id: o.id || getStableRecordKey(o, "order"),
+      createdAt: toIso(o.createdAt || o.date || stamp),
+      updatedAt: toIso(o.updatedAt || o.restockedAt || stamp),
       date: toIso(o.date),
       restockedAt: toIso(o.restockedAt),
     })),
@@ -1180,6 +1408,9 @@ export function packStateForCloud(state) {
     defaultDeliveryFee,
     expenses: (expenses || []).map((e) => ({
       ...e,
+      id: e.id || getStableRecordKey(e, "expense"),
+      createdAt: toIso(e.createdAt || e.date || stamp),
+      updatedAt: toIso(e.updatedAt || stamp),
       date: toIso(e.date),
     })),
     purchases,
@@ -1194,6 +1425,7 @@ export function packStateForCloud(state) {
           lastReportAt: toIso(dayMeta.lastReportAt),
           resetAt: toIso(dayMeta.resetAt),
           reconciledAt: toIso(dayMeta.reconciledAt),
+          updatedAt: toIso(dayMeta.updatedAt || stamp),
           shiftChanges: Array.isArray(dayMeta.shiftChanges)
             ? dayMeta.shiftChanges.map((c) => ({
                 ...c,
@@ -1204,15 +1436,25 @@ export function packStateForCloud(state) {
       : {},
    bankTx: (bankTx || []).map((t) => ({
       ...t,
+      id: t.id || getStableRecordKey(t, "bank_tx"),
+      createdAt: toIso(t.createdAt || t.date || stamp),
+      updatedAt: toIso(t.updatedAt || stamp),
       date: toIso(t.date),
     })),
    reconHistory: (reconHistory || []).map((r) => ({
       ...r,
+      id: r.id || getStableRecordKey(r, "reconciliation"),
+      createdAt: toIso(r.createdAt || r.savedAt || r.reconciledAt || r.at || stamp),
+      updatedAt: toIso(r.updatedAt || r.savedAt || r.reconciledAt || stamp),
       at: toIso(r.at),
+      savedAt: toIso(r.savedAt),
+      reconciledAt: toIso(r.reconciledAt),
     })),
     utilityBills,
     laborProfile,
     equipmentList,
+    syncCostsFromPurchases:
+      typeof syncCostsFromPurchases === "boolean" ? syncCostsFromPurchases : undefined,
     onlineOrders: Array.isArray(onlineOrdersRaw)
       ? onlineOrdersRaw.map((order) => ({
           ...order,
@@ -1247,21 +1489,27 @@ export function packStateForCloud(state) {
       ? Number(lastSeenOnlineOrderTs)
       : undefined,
     historicalOrders: Array.isArray(historicalOrders)
-      ? historicalOrders.map((o) => ({
+      ? stampRecords(historicalOrders, stamp, "historical_order").map((o) => ({
           ...o,
+          createdAt: toIso(o?.createdAt || o?.date || stamp),
+          updatedAt: toIso(o?.updatedAt || stamp),
           date: toIso(o?.date),
           restockedAt: toIso(o?.restockedAt),
         }))
       : [],
     historicalExpenses: Array.isArray(historicalExpenses)
-      ? historicalExpenses.map((e) => ({
+      ? stampRecords(historicalExpenses, stamp, "historical_expense").map((e) => ({
           ...e,
+          createdAt: toIso(e?.createdAt || e?.date || stamp),
+          updatedAt: toIso(e?.updatedAt || stamp),
           date: toIso(e?.date),
         }))
       : [],
     historicalPurchases: Array.isArray(historicalPurchases)
-      ? historicalPurchases.map((p) => ({
+      ? stampRecords(historicalPurchases, stamp, "historical_purchase").map((p) => ({
           ...p,
+          createdAt: toIso(p?.createdAt || p?.date || stamp),
+          updatedAt: toIso(p?.updatedAt || stamp),
           date: toIso(p?.date),
         }))
       : [],
@@ -1324,24 +1572,33 @@ function computeCOGSForItemDef(def, invMap, ctx) {
 }
 export function unpackStateFromCloud(data, fallbackDayMeta = {}) {
   const out = {};
+  if (data?.[SECTION_UPDATED_AT_KEY] && typeof data[SECTION_UPDATED_AT_KEY] === "object") {
+    out[SECTION_UPDATED_AT_KEY] = data[SECTION_UPDATED_AT_KEY];
+  }
 if (Array.isArray(data.orders)) {
     out.orders = data.orders.map((o) => ({
       ...o,
       date: o.date ? new Date(o.date) : new Date(),
       restockedAt: o.restockedAt ? new Date(o.restockedAt) : undefined,
       whatsappSentAt: o.whatsappSentAt ? new Date(o.whatsappSentAt) : null,
+      createdAt: o.createdAt ? new Date(o.createdAt) : o.createdAt,
+      updatedAt: o.updatedAt ? new Date(o.updatedAt) : o.updatedAt,
     }));
   }
  if (Array.isArray(data.expenses)) {
     out.expenses = data.expenses.map((e) => ({
       ...e,
       date: e.date ? new Date(e.date) : new Date(),
+      createdAt: e.createdAt ? new Date(e.createdAt) : e.createdAt,
+      updatedAt: e.updatedAt ? new Date(e.updatedAt) : e.updatedAt,
     }));
   }
   if (Array.isArray(data.purchases)) {
     out.purchases = data.purchases.map((p) => ({
       ...p,
       date: p.date ? new Date(p.date) : new Date(),
+      createdAt: p.createdAt ? new Date(p.createdAt) : p.createdAt,
+      updatedAt: p.updatedAt ? new Date(p.updatedAt) : p.updatedAt,
     }));
   }
   if (Array.isArray(data.purchaseCategories)) out.purchaseCategories = data.purchaseCategories;
@@ -1365,6 +1622,10 @@ if (Array.isArray(data.orders)) {
       lastReportAt: data.dayMeta.lastReportAt ? new Date(data.dayMeta.lastReportAt) : null,
       resetBy: data.dayMeta.resetBy || "",
       resetAt: data.dayMeta.resetAt ? new Date(data.dayMeta.resetAt) : null,
+      dayId: data.dayMeta.dayId || "",
+      reconciliationId: data.dayMeta.reconciliationId || "",
+      active: data.dayMeta.active === false ? false : Boolean(data.dayMeta.startedAt && !data.dayMeta.endedAt),
+      updatedAt: data.dayMeta.updatedAt || data.dayMeta.endedAt || data.dayMeta.startedAt || null,
       shiftChanges: Array.isArray(data.dayMeta.shiftChanges)
         ? data.dayMeta.shiftChanges.map((c) => ({
             ...c,
@@ -1377,7 +1638,12 @@ if (Array.isArray(data.orders)) {
   }
   if (Array.isArray(data.reconHistory)) {
   out.reconHistory = data.reconHistory.map(r => ({
-    ...r, at: r.at ? new Date(r.at) : new Date()
+    ...r,
+    at: r.at ? new Date(r.at) : new Date(),
+    savedAt: r.savedAt ? new Date(r.savedAt) : r.savedAt,
+    reconciledAt: r.reconciledAt ? new Date(r.reconciledAt) : r.reconciledAt,
+    createdAt: r.createdAt ? new Date(r.createdAt) : r.createdAt,
+    updatedAt: r.updatedAt ? new Date(r.updatedAt) : r.updatedAt,
   }));
 }
   if (Array.isArray(data.historicalOrders)) {
@@ -1386,6 +1652,8 @@ if (Array.isArray(data.orders)) {
         ...o,
         date: o?.date ? new Date(o.date) : o?.date,
         restockedAt: o?.restockedAt ? new Date(o.restockedAt) : o?.restockedAt,
+        createdAt: o?.createdAt ? new Date(o.createdAt) : o?.createdAt,
+        updatedAt: o?.updatedAt ? new Date(o.updatedAt) : o?.updatedAt,
       })
     );
   }
@@ -1393,12 +1661,16 @@ if (Array.isArray(data.orders)) {
     out.historicalExpenses = data.historicalExpenses.map((e) => ({
       ...e,
       date: e?.date ? new Date(e.date) : new Date(),
+      createdAt: e?.createdAt ? new Date(e.createdAt) : e?.createdAt,
+      updatedAt: e?.updatedAt ? new Date(e.updatedAt) : e?.updatedAt,
     }));
   }
   if (Array.isArray(data.historicalPurchases)) {
     out.historicalPurchases = data.historicalPurchases.map((p) => ({
       ...p,
       date: p?.date ? new Date(p.date) : new Date(),
+      createdAt: p?.createdAt ? new Date(p.createdAt) : p?.createdAt,
+      updatedAt: p?.updatedAt ? new Date(p.updatedAt) : p?.updatedAt,
     }));
   }
   if (typeof data.reportFilter === "string") out.reportFilter = data.reportFilter;
@@ -1426,12 +1698,18 @@ if (Array.isArray(data.workerSessions)) {
       ...s,
       signInAt: s.signInAt ? new Date(s.signInAt) : null,
       signOutAt: s.signOutAt ? new Date(s.signOutAt) : null,
+      endAt: s.endAt ? new Date(s.endAt) : s.endAt,
+      endedAt: s.endedAt ? new Date(s.endedAt) : s.endedAt,
+      createdAt: s.createdAt ? new Date(s.createdAt) : s.createdAt,
+      updatedAt: s.updatedAt ? new Date(s.updatedAt) : s.updatedAt,
     }));
   }
   if (typeof data.realtimeOrders === "boolean") out.realtimeOrders = data.realtimeOrders;
  if (data.utilityBills) out.utilityBills = data.utilityBills;
   if (data.laborProfile) out.laborProfile = data.laborProfile;
   if (Array.isArray(data.equipmentList)) out.equipmentList = data.equipmentList;
+  if (typeof data.syncCostsFromPurchases === "boolean")
+    out.syncCostsFromPurchases = data.syncCostsFromPurchases;
  if (Array.isArray(data.onlineOrders)) {
     out.onlineOrdersRaw = data.onlineOrders.map((order) => {
       const safeOrder = order && typeof order === "object" ? order : {};
@@ -4020,24 +4298,11 @@ const resetUsageViewAdmin = () => {
   const okAdmin = !!promptAdminAndPin();
   if (!okAdmin) return;
 
-  // Reset historical data
-  setHistoricalOrders([]);
-  setHistoricalExpenses([]);
-  setHistoricalPurchases([]);
-  
-  // Save empty arrays to localStorage
-  saveLocalPartial({
-    historicalOrders: [],
-    historicalExpenses: [],
-    historicalPurchases: []
-  });
-  
-  // Reset the Usage tab view back to default
   setUsageFilter("week");
   setUsageWeekDate(new Date().toISOString().slice(0, 10));
   setUsageMonth(new Date().toISOString().slice(0, 7));
 
-  alert("Inventory Usage data has been reset.");
+  alert("Inventory Usage view has been reset. Report history was preserved.");
 };
 
 const [newWName, setNewWName] = useState("");
@@ -4200,8 +4465,24 @@ const allTimeVarianceTotal = useMemo(
 const resetAllReconciliations = () => {
   const okAdmin = !!promptAdminAndPin();
   if (!okAdmin) return;
-  if (!window.confirm("Reset ALL saved reconciliations and variance totals? This cannot be undone.")) return;
+  const phrase = window.prompt(
+    "Type RESET RECONCILIATIONS to clear saved reconciliations and variance totals.",
+    ""
+  );
+  if (String(phrase || "").trim() !== "RESET RECONCILIATIONS") return;
   setReconHistory([]);
+  saveLocalPartial(
+    { reconHistory: [] },
+    {
+      allowHistoryReset: true,
+      sections: [RECONCILIATION_SECTION],
+      resetMarker: {
+        id: `reset_recon_${Date.now()}`,
+        type: "reconciliation",
+        resetAt: nowIso(),
+      },
+    }
+  );
   alert("All reconciliations cleared.");
 };
 const totalVariance = useMemo(
@@ -4218,8 +4499,30 @@ const hasMeaningfulActualCounts = useMemo(
     }),
   [paymentMethods, reconCounts]
 );
+const currentDayId = useMemo(() => {
+  if (dayMeta?.dayId) return dayMeta.dayId;
+  const startMs = toMs(dayMeta?.startedAt);
+  return startMs ? `day_${startMs}` : "";
+}, [dayMeta]);
+const latestReconciliationForCurrentDay = useMemo(() => {
+  if (!currentDayId) return null;
+  return (
+    (reconHistory || [])
+      .filter((record) => {
+        if (!record) return false;
+        const recordDayId = record.dayId || record.sessionId || "";
+        if (recordDayId) return recordDayId === currentDayId;
+        return (
+          dayMeta?.startedAt &&
+          toMs(record.savedAt || record.reconciledAt || record.at) >=
+            toMs(dayMeta.startedAt)
+        );
+      })
+      .sort((a, b) => recordUpdatedMs(b) - recordUpdatedMs(a))[0] || null
+  );
+}, [currentDayId, reconHistory, dayMeta?.startedAt]);
 const saveReconciliation = () => {
-  if (!dayMeta.startedAt) return alert("Start a shift first.");
+  if (!dayMeta.startedAt || dayMeta.endedAt) return alert("Start an active shift first.");
   const who = String(reconSavedBy || dayMeta.currentWorker || "").trim();
   if (!who) return alert("Select or type who saved it (Saved by).");
   const missingActualMethods = (paymentMethods || []).filter(
@@ -4241,15 +4544,36 @@ if (!hasMeaningfulActualCounts) {
       variance: Number((actual - expected).toFixed(2)),
     };
   }
+  const savedAt = new Date();
+  const dayId = currentDayId || `day_${toMs(dayMeta.startedAt) || Date.now()}`;
+  const openSessionIds = (workerSessions || [])
+    .filter((session) => session && !session.signOutAt)
+    .map((session) => session.id)
+    .filter(Boolean);
   const rec = {
-    id: `rec_${Date.now()}`,
+    id: `rec_${dayId}`,
+    dayId,
+    sessionId: dayId,
+    worker: who,
     savedBy: who,
-    at: new Date(),
+    at: savedAt,
+    savedAt,
+    reconciledAt: savedAt,
+    createdAt: latestReconciliationForCurrentDay?.createdAt || savedAt,
+    updatedAt: savedAt,
+    dayStartedAt: dayMeta.startedAt,
+    workerSessionIds: openSessionIds,
+    totals: {
+      expectedByMethod,
+      rawInflowByMethod,
+      totalVariance: Number(totalVariance.toFixed(2)),
+    },
     breakdown,
     totalVariance: Number(totalVariance.toFixed(2)),
+    status: Math.abs(Number(totalVariance || 0)) < 0.01 ? "balanced" : "variance",
   };
-  setReconHistory(arr => [rec, ...arr]);
-  setDayMeta(d => ({ ...d, reconciledAt: new Date() }));
+  setReconHistory(arr => [rec, ...(arr || []).filter((row) => row?.id !== rec.id)]);
+  setDayMeta(d => ({ ...d, dayId, reconciledAt: savedAt, reconciliationId: rec.id, updatedAt: nowIso() }));
   alert("Reconciliation saved ✅");
 };
   const [menu, setMenu] = useState(BASE_MENU);
@@ -4478,14 +4802,14 @@ const writeSeqRef = useRef(0);
   const [autoPrintOnCheckout, setAutoPrintOnCheckout] = useState(true);
   const [preferredPaperWidthMm, setPreferredPaperWidthMm] = useState(80);
   useEffect(() => {
-  if (!dayMeta.startedAt) {
+  if (!dayMeta.startedAt || dayMeta.endedAt) {
     setReconCounts({}); setReconSavedBy("");
     return;
   }
   const init = {};
   for (const m of paymentMethods || []) init[m] = 0;
   setReconCounts((prev) => ({ ...init, ...prev }));
-}, [dayMeta.startedAt, paymentMethods]);
+}, [dayMeta.startedAt, dayMeta.endedAt, paymentMethods]);
   useEffect(() => {
     try {
       setFbReady(true);
@@ -4612,10 +4936,21 @@ useEffect(() => {
       ...s,
       signInAt: s.signInAt ? new Date(s.signInAt) : null,
       signOutAt: s.signOutAt ? new Date(s.signOutAt) : null,
+      endAt: s.endAt ? new Date(s.endAt) : s.endAt,
+      endedAt: s.endedAt ? new Date(s.endedAt) : s.endedAt,
+      createdAt: s.createdAt ? new Date(s.createdAt) : s.createdAt,
+      updatedAt: s.updatedAt ? new Date(s.updatedAt) : s.updatedAt,
     })));
   }
   if (Array.isArray(l.reconHistory)) {
-  setReconHistory(l.reconHistory.map(r => ({ ...r, at: r.at ? new Date(r.at) : new Date() })));
+  setReconHistory(l.reconHistory.map(r => ({
+    ...r,
+    at: r.at ? new Date(r.at) : new Date(),
+    savedAt: r.savedAt ? new Date(r.savedAt) : r.savedAt,
+    reconciledAt: r.reconciledAt ? new Date(r.reconciledAt) : r.reconciledAt,
+    createdAt: r.createdAt ? new Date(r.createdAt) : r.createdAt,
+    updatedAt: r.updatedAt ? new Date(r.updatedAt) : r.updatedAt,
+  })));
 }
 if (l.reconCounts && typeof l.reconCounts === "object") setReconCounts(l.reconCounts);
 if (typeof l.reconSavedBy === "string") setReconSavedBy(l.reconSavedBy);
@@ -4639,6 +4974,11 @@ if (Array.isArray(l.deliveryZones)) setDeliveryZones(l.deliveryZones);
      endedAt: l.dayMeta.endedAt ? new Date(l.dayMeta.endedAt) : null,
      lastReportAt: l.dayMeta.lastReportAt ? new Date(l.dayMeta.lastReportAt) : null,
      resetAt: l.dayMeta.resetAt ? new Date(l.dayMeta.resetAt) : null,
+     reconciledAt: l.dayMeta.reconciledAt ? new Date(l.dayMeta.reconciledAt) : null,
+     dayId: l.dayMeta.dayId || "",
+     reconciliationId: l.dayMeta.reconciliationId || "",
+     active: l.dayMeta.active === false ? false : Boolean(l.dayMeta.startedAt && !l.dayMeta.endedAt),
+     updatedAt: l.dayMeta.updatedAt || l.dayMeta.endedAt || l.dayMeta.startedAt || null,
      shiftChanges: Array.isArray(l.dayMeta.shiftChanges)
        ? l.dayMeta.shiftChanges.map(c => ({ ...c, at: c.at ? new Date(c.at) : null }))
        : [],
@@ -4665,58 +5005,49 @@ if (typeof l.nextOrderNo === "number") setNextOrderNo(l.nextOrderNo);
   }
   setLocalHydrated(true);
 }, [localHydrated]);
-useEffect(() => { saveLocalPartial({ menu }); }, [menu]);
   useEffect(() => {
+if (!localHydrated) return;
 saveLocalPartial({
   purchases: purchases.map(p => ({ ...p, date: toIso(p.date) }))
 });
-}, [purchases]);
-  useEffect(() => { saveLocalPartial({ workerProfiles }); }, [workerProfiles]);
+}, [purchases, localHydrated]);
 
 useEffect(() => {
+  if (!localHydrated) return;
   saveLocalPartial({
     workerSessions: (workerSessions || []).map(s => ({
       ...s,
       signInAt: toIso(s.signInAt),
       signOutAt: toIso(s.signOutAt),
+      endAt: toIso(s.endAt),
+      endedAt: toIso(s.endedAt),
+      updatedAt: toIso(s.updatedAt),
     }))
   });
-}, [workerSessions]);
+}, [workerSessions, localHydrated]);
   
-  useEffect(() => { saveLocalPartial({ adminSubTab }); }, [adminSubTab]);
+  useEffect(() => { if (!localHydrated) return; saveLocalPartial({ adminSubTab }); }, [adminSubTab, localHydrated]);
 useEffect(() => {
   const l = loadLocal();
   if (typeof l.adminSubTab === "string") setAdminSubTab(l.adminSubTab);
 }, []); 
-useEffect(() => { saveLocalPartial({ reconHistory }); }, [reconHistory]);
-useEffect(() => { saveLocalPartial({ reconCounts }); }, [reconCounts]);
-useEffect(() => { saveLocalPartial({ reconSavedBy }); }, [reconSavedBy]);
-useEffect(() => { saveLocalPartial({ purchaseCategories }); }, [purchaseCategories]); // ⬅️ NEW
-useEffect(() => { saveLocalPartial({ purchaseFilter }); }, [purchaseFilter]);  
+useEffect(() => { if (!localHydrated) return; saveLocalPartial({ reconHistory }); }, [reconHistory, localHydrated]);
+useEffect(() => { if (!localHydrated) return; saveLocalPartial({ reconCounts }); }, [reconCounts, localHydrated]);
+useEffect(() => { if (!localHydrated) return; saveLocalPartial({ reconSavedBy }); }, [reconSavedBy, localHydrated]);
+useEffect(() => { if (!localHydrated) return; saveLocalPartial({ purchaseCategories }); }, [purchaseCategories, localHydrated]); // ⬅️ NEW
+useEffect(() => { if (!localHydrated) return; saveLocalPartial({ purchaseFilter }); }, [purchaseFilter, localHydrated]);  
 useEffect(() => {
+  if (!localHydrated) return;
   saveLocalPartial({ reportFilter, reportDay, reportMonth });
-}, [reportFilter, reportDay, reportMonth]);
+}, [reportFilter, reportDay, reportMonth, localHydrated]);
 useEffect(() => {
+  if (!localHydrated) return;
   saveLocalPartial({ usageFilter, usageWeekDate, usageMonth });
-}, [usageFilter, usageWeekDate, usageMonth]);
-useEffect(() => { saveLocalPartial({ customers }); }, [customers]);                  // ⬅️ NEW
-useEffect(() => { saveLocalPartial({ deliveryZones }); }, [deliveryZones]);          // ⬅️ NEW
-useEffect(() => { saveLocalPartial({ extraList }); }, [extraList]);
-useEffect(() => { saveLocalPartial({ beverageList }); }, [beverageList]);
-useEffect(() => { saveLocalPartial({ workers }); }, [workers]);
-useEffect(() => { saveLocalPartial({ paymentMethods }); }, [paymentMethods]);
-useEffect(() => { saveLocalPartial({ orderTypes }); }, [orderTypes]);
-useEffect(() => { saveLocalPartial({ defaultDeliveryFee }); }, [defaultDeliveryFee]);
-useEffect(() => { saveLocalPartial({ utilityBills }); }, [utilityBills]);
-useEffect(() => { saveLocalPartial({ laborProfile }); }, [laborProfile]);
-useEffect(() => { saveLocalPartial({ equipmentList }); }, [equipmentList]);
-useEffect(() => { saveLocalPartial({ inventory }); }, [inventory]);
-useEffect(() => { saveLocalPartial({ bulkInventoryItems }); }, [bulkInventoryItems]);
-useEffect(() => { saveLocalPartial({ bulkInventoryHistory }); }, [bulkInventoryHistory]);
-useEffect(() => { saveLocalPartial({ adminPins }); }, [adminPins]);
-useEffect(() => { saveLocalPartial({ dark }); }, [dark]);
-useEffect(() => { saveLocalPartial({ targetMarginPct }); }, [targetMarginPct]);
-useEffect(() => { saveLocalPartial({ showLowMarginOnly }); }, [showLowMarginOnly]);
+}, [usageFilter, usageWeekDate, usageMonth, localHydrated]);
+useEffect(() => { if (!localHydrated) return; saveLocalPartial({ customers }); }, [customers, localHydrated]);                  // ⬅️ NEW
+useEffect(() => { if (!localHydrated) return; saveLocalPartial({ inventory }); }, [inventory, localHydrated]);
+useEffect(() => { if (!localHydrated) return; saveLocalPartial({ bulkInventoryItems }); }, [bulkInventoryItems, localHydrated]);
+useEffect(() => { if (!localHydrated) return; saveLocalPartial({ bulkInventoryHistory }); }, [bulkInventoryHistory, localHydrated]);
 useEffect(() => {
   if (orderType !== "Delivery") return;
   const p = String(deliveryPhone || "").trim();
@@ -4742,23 +5073,20 @@ useEffect(() => {
     setBulkRefillItemId(bulkInventoryItems[0].id);
   }
 }, [bulkRefillItemId, bulkInventoryItems]);
-useEffect(() => { saveLocalPartial({ expenses }); }, [expenses]);
-useEffect(() => { saveLocalPartial({ bankTx }); }, [bankTx]);
-useEffect(() => { saveLocalPartial({ dayMeta }); }, [dayMeta]);
-useEffect(() => { saveLocalPartial({ historicalOrders }); }, [historicalOrders]);
-useEffect(() => { saveLocalPartial({ historicalExpenses }); }, [historicalExpenses]);
-useEffect(() => { saveLocalPartial({ historicalPurchases }); }, [historicalPurchases]);
-useEffect(() => { saveLocalPartial({ inventoryLocked }); }, [inventoryLocked]);
-useEffect(() => { saveLocalPartial({ inventorySnapshot }); }, [inventorySnapshot]);
-useEffect(() => { saveLocalPartial({ inventoryLockedAt }); }, [inventoryLockedAt]);
-useEffect(() => { saveLocalPartial({ autoPrintOnCheckout }); }, [autoPrintOnCheckout]);
-useEffect(() => { saveLocalPartial({ preferredPaperWidthMm }); }, [preferredPaperWidthMm]);
-useEffect(() => { saveLocalPartial({ cloudEnabled }); }, [cloudEnabled]);
-useEffect(() => { saveLocalPartial({ realtimeOrders }); }, [realtimeOrders]);
-useEffect(() => { saveLocalPartial({ nextOrderNo }); }, [nextOrderNo]);
+useEffect(() => { if (!localHydrated) return; saveLocalPartial({ expenses }); }, [expenses, localHydrated]);
+useEffect(() => { if (!localHydrated) return; saveLocalPartial({ bankTx }); }, [bankTx, localHydrated]);
+useEffect(() => { if (!localHydrated) return; saveLocalPartial({ dayMeta }); }, [dayMeta, localHydrated]);
+useEffect(() => { if (!localHydrated) return; saveLocalPartial({ historicalOrders }); }, [historicalOrders, localHydrated]);
+useEffect(() => { if (!localHydrated) return; saveLocalPartial({ historicalExpenses }); }, [historicalExpenses, localHydrated]);
+useEffect(() => { if (!localHydrated) return; saveLocalPartial({ historicalPurchases }); }, [historicalPurchases, localHydrated]);
+useEffect(() => { if (!localHydrated) return; saveLocalPartial({ inventoryLocked }); }, [inventoryLocked, localHydrated]);
+useEffect(() => { if (!localHydrated) return; saveLocalPartial({ inventorySnapshot }); }, [inventorySnapshot, localHydrated]);
+useEffect(() => { if (!localHydrated) return; saveLocalPartial({ inventoryLockedAt }); }, [inventoryLockedAt, localHydrated]);
+useEffect(() => { if (!localHydrated) return; saveLocalPartial({ nextOrderNo }); }, [nextOrderNo, localHydrated]);
 useEffect(() => {
+  if (!localHydrated) return;
   if (!realtimeOrders) saveLocalPartial({ orders });
-}, [orders, realtimeOrders]);
+}, [orders, realtimeOrders, localHydrated]);
 
 useEffect(() => {
   setLastLocalEditAt(Date.now());
@@ -4795,7 +5123,6 @@ const [syncCostsFromPurchases, setSyncCostsFromPurchases] = useState(() => {
   const l = loadLocal();
   return typeof l?.syncCostsFromPurchases === "boolean" ? l.syncCostsFromPurchases : true;
 });
-useEffect(() => { saveLocalPartial({ syncCostsFromPurchases }); }, [syncCostsFromPurchases]);
 useEffect(() => {
   if (!purchases?.length || !syncCostsFromPurchases) return;
   setInventory(current => {
@@ -4813,11 +5140,357 @@ useEffect(() => {
     return changed ? next : current;
   });
 }, [purchases, purchaseCategories, syncCostsFromPurchases]);
+const buildAdminSettingsSnapshot = useCallback(
+  (overrides = {}) =>
+    sanitizeForSupabase({
+      menu: normalizeMenuList(overrides.menu ?? menu),
+      extraList: normalizeExtraList(overrides.extraList ?? extraList),
+      beverageList: normalizeBeverageList(overrides.beverageList ?? beverageList),
+      workers: overrides.workers ?? workers,
+      workerProfiles: overrides.workerProfiles ?? workerProfiles,
+      paymentMethods: overrides.paymentMethods ?? paymentMethods,
+      orderTypes: overrides.orderTypes ?? orderTypes,
+      defaultDeliveryFee: overrides.defaultDeliveryFee ?? defaultDeliveryFee,
+      deliveryZones: overrides.deliveryZones ?? deliveryZones,
+      adminPins: overrides.adminPins ?? adminPins,
+      autoPrintOnCheckout: overrides.autoPrintOnCheckout ?? autoPrintOnCheckout,
+      preferredPaperWidthMm: overrides.preferredPaperWidthMm ?? preferredPaperWidthMm,
+      cloudEnabled: overrides.cloudEnabled ?? cloudEnabled,
+      realtimeOrders: overrides.realtimeOrders ?? realtimeOrders,
+      dark: overrides.dark ?? dark,
+      targetMarginPct: overrides.targetMarginPct ?? targetMarginPct,
+      showLowMarginOnly: overrides.showLowMarginOnly ?? showLowMarginOnly,
+      utilityBills: normalizeUtilityBills(overrides.utilityBills ?? utilityBills),
+      laborProfile: normalizeLaborProfile(overrides.laborProfile ?? laborProfile),
+      equipmentList: normalizeEquipmentList(overrides.equipmentList ?? equipmentList),
+      syncCostsFromPurchases:
+        overrides.syncCostsFromPurchases ?? syncCostsFromPurchases,
+    }),
+  [
+    menu,
+    extraList,
+    beverageList,
+    workers,
+    workerProfiles,
+    paymentMethods,
+    orderTypes,
+    defaultDeliveryFee,
+    deliveryZones,
+    adminPins,
+    autoPrintOnCheckout,
+    preferredPaperWidthMm,
+    cloudEnabled,
+    realtimeOrders,
+    dark,
+    targetMarginPct,
+    showLowMarginOnly,
+    utilityBills,
+    laborProfile,
+    equipmentList,
+    syncCostsFromPurchases,
+  ]
+);
+const currentAdminSettingsSnapshot = useMemo(
+  () => buildAdminSettingsSnapshot(),
+  [buildAdminSettingsSnapshot]
+);
+const [adminSavedSnapshot, setAdminSavedSnapshot] = useState(null);
+const [adminSaveStatus, setAdminSaveStatus] = useState({ kind: "idle", message: "" });
+useEffect(() => {
+  if (!localHydrated || adminSavedSnapshot) return;
+  setAdminSavedSnapshot(currentAdminSettingsSnapshot);
+}, [localHydrated, adminSavedSnapshot, currentAdminSettingsSnapshot]);
+const adminHasUnsavedChanges = useMemo(() => {
+  if (!adminSavedSnapshot) return false;
+  return JSON.stringify(currentAdminSettingsSnapshot) !== JSON.stringify(adminSavedSnapshot);
+}, [currentAdminSettingsSnapshot, adminSavedSnapshot]);
+const getAdminSettingsForPersistence = useCallback(
+  (useCurrentDraft = false) => {
+    if (useCurrentDraft || !adminHasUnsavedChanges || !adminSavedSnapshot) {
+      return currentAdminSettingsSnapshot;
+    }
+    return adminSavedSnapshot;
+  },
+  [adminHasUnsavedChanges, adminSavedSnapshot, currentAdminSettingsSnapshot]
+);
+const withPersistedAdminSettings = useCallback(
+  (state, options = {}) => ({
+    ...(state || {}),
+    ...getAdminSettingsForPersistence(Boolean(options.useCurrentAdminDraft)),
+    sectionUpdatedAt:
+      options.sectionUpdatedAt || loadLocal()?.[SECTION_UPDATED_AT_KEY] || {},
+  }),
+  [getAdminSettingsForPersistence]
+);
+const buildFullStateForCloud = useCallback(
+  (overrides = {}, options = {}) =>
+    withPersistedAdminSettings(
+      {
+        orders: realtimeOrders ? [] : orders,
+        inventory,
+        bulkInventoryItems,
+        bulkInventoryHistory,
+        nextOrderNo,
+        expenses,
+        purchases,
+        purchaseCategories,
+        customers,
+        dayMeta,
+        bankTx,
+        reconHistory,
+        workerSessions,
+        onlineOrdersRaw,
+        onlineOrderStatus,
+        lastSeenOnlineOrderTs,
+        historicalOrders,
+        historicalExpenses,
+        historicalPurchases,
+        reportFilter,
+        reportDay,
+        reportMonth,
+        ...overrides,
+      },
+      options
+    ),
+  [
+    withPersistedAdminSettings,
+    realtimeOrders,
+    orders,
+    inventory,
+    bulkInventoryItems,
+    bulkInventoryHistory,
+    nextOrderNo,
+    expenses,
+    purchases,
+    purchaseCategories,
+    customers,
+    dayMeta,
+    bankTx,
+    reconHistory,
+    workerSessions,
+    onlineOrdersRaw,
+    onlineOrderStatus,
+    lastSeenOnlineOrderTs,
+    historicalOrders,
+    historicalExpenses,
+    historicalPurchases,
+    reportFilter,
+    reportDay,
+    reportMonth,
+  ]
+);
 const supabaseReady = fbReady;
 const stateDocRef = supabaseReady;
 const ordersColRef = supabaseReady;
 const counterDocRef = supabaseReady;
 const onlineOrderCollections = useMemo(() => ONLINE_ORDER_COLLECTIONS, []);
+const writeFullStateToCloud = useCallback(
+  async (overrides = {}, options = {}) => {
+    if (!stateDocRef || !fbUser) throw new Error("Supabase not ready.");
+    const bodyBase = packStateForCloud(buildFullStateForCloud(overrides, options));
+    writeSeqRef.current += 1;
+    const body = {
+      ...bodyBase,
+      writerId: clientIdRef.current,
+      writeSeq: writeSeqRef.current,
+      clientTime: Date.now(),
+    };
+    await savePosState(body);
+    const now = Date.now();
+    setLastLocalEditAt(now);
+    setLastAppliedCloudAt(now);
+    setCloudStatus((s) => ({ ...s, lastSaveAt: new Date(now), error: null }));
+    return body;
+  },
+  [stateDocRef, fbUser, buildFullStateForCloud]
+);
+const saveAdminSettings = useCallback(async () => {
+  const stamp = nowIso();
+  const localState = loadLocal();
+  const sectionUpdatedAt = addSectionUpdatedAt(
+    localState?.[SECTION_UPDATED_AT_KEY],
+    [ADMIN_SETTINGS_SECTION],
+    stamp
+  );
+  const adminPatch = {
+    ...currentAdminSettingsSnapshot,
+    [SECTION_UPDATED_AT_KEY]: sectionUpdatedAt,
+    adminSettingsUpdatedAt: stamp,
+  };
+
+  setAdminSaveStatus({ kind: "saving", message: "Saving..." });
+  const savedLocal = saveLocalPartial(adminPatch, {
+    sections: [ADMIN_SETTINGS_SECTION],
+    updatedAt: stamp,
+  });
+  if (!savedLocal) {
+    setAdminSaveStatus({ kind: "error", message: "Save failed locally." });
+    return;
+  }
+
+  try {
+    if (cloudEnabled && stateDocRef && fbUser) {
+      await writeFullStateToCloud(
+        {
+          [SECTION_UPDATED_AT_KEY]: sectionUpdatedAt,
+        },
+        { useCurrentAdminDraft: true, sectionUpdatedAt }
+      );
+    }
+    setAdminSavedSnapshot(currentAdminSettingsSnapshot);
+    setAdminSaveStatus({ kind: "saved", message: "Saved" });
+    setTimeout(() => {
+      setAdminSaveStatus((s) => (s.kind === "saved" ? { kind: "idle", message: "" } : s));
+    }, 2500);
+  } catch (err) {
+    console.warn("Admin settings save failed:", err);
+    setAdminSaveStatus({
+      kind: "error",
+      message: `Save failed: ${String(err?.message || err)}`,
+    });
+  }
+}, [
+  currentAdminSettingsSnapshot,
+  cloudEnabled,
+  stateDocRef,
+  fbUser,
+  writeFullStateToCloud,
+]);
+const applyRemoteState = useCallback(
+  (rawData, options = {}) => {
+    if (!rawData) return null;
+    const force = Boolean(options.force);
+    const unpacked = unpackStateFromCloud(rawData, dayMeta);
+    const localState = loadLocal();
+
+    if (!realtimeOrders && unpacked.orders) setOrders(unpacked.orders);
+    if (unpacked.inventory) setInventory(unpacked.inventory);
+    applyBulkInventoryFromCloud(unpacked.bulkInventoryItems, unpacked.bulkInventoryHistory);
+    if (unpacked.nextOrderNo != null) setNextOrderNo(unpacked.nextOrderNo);
+    if (unpacked.customers) setCustomers(dedupeCustomers(unpacked.customers));
+    if (unpacked.inventoryLocked != null) setInventoryLocked(unpacked.inventoryLocked);
+    if (unpacked.inventorySnapshot) setInventorySnapshot(unpacked.inventorySnapshot);
+    if (unpacked.inventoryLockedAt != null) setInventoryLockedAt(unpacked.inventoryLockedAt);
+    if (unpacked.expenses) setExpenses(unpacked.expenses);
+    if (unpacked.bankTx) setBankTx(unpacked.bankTx);
+    if (unpacked.onlineOrdersRaw) setOnlineOrdersRaw(unpacked.onlineOrdersRaw);
+    if (unpacked.onlineOrderStatus) setOnlineOrderStatus(unpacked.onlineOrderStatus);
+    if (unpacked.lastSeenOnlineOrderTs != null)
+      setLastSeenOnlineOrderTs(unpacked.lastSeenOnlineOrderTs);
+    if (unpacked.purchases) setPurchases(unpacked.purchases);
+    if (unpacked.purchaseCategories)
+      setPurchaseCategories(normalizePurchaseCategories(unpacked.purchaseCategories));
+
+    if (
+      unpacked.dayMeta &&
+      (force || shouldApplyRemoteSection(localState, rawData, DAY_META_SECTION))
+    ) {
+      setDayMeta((prev) => {
+        if (!force && prev?.endedAt && !unpacked.dayMeta?.endedAt) return prev;
+        return unpacked.dayMeta;
+      });
+    }
+
+    if (unpacked.workerSessions) {
+      setWorkerSessions((prev) =>
+        mergeByIdPreferNewest(prev, unpacked.workerSessions, {
+          fallbackPrefix: "worker_session",
+        })
+      );
+    }
+    if (unpacked.reconHistory) {
+      setReconHistory((prev) =>
+        mergeByIdPreferNewest(prev, unpacked.reconHistory, {
+          fallbackPrefix: "reconciliation",
+        })
+      );
+    }
+    if (unpacked.historicalOrders) {
+      setHistoricalOrders((prev) =>
+        mergeByIdPreferNewest(prev, unpacked.historicalOrders, {
+          fallbackPrefix: "historical_order",
+        })
+      );
+    }
+    if (unpacked.historicalExpenses) {
+      setHistoricalExpenses((prev) =>
+        mergeByIdPreferNewest(prev, unpacked.historicalExpenses, {
+          fallbackPrefix: "historical_expense",
+        })
+      );
+    }
+    if (unpacked.historicalPurchases) {
+      setHistoricalPurchases((prev) =>
+        mergeByIdPreferNewest(prev, unpacked.historicalPurchases, {
+          fallbackPrefix: "historical_purchase",
+        })
+      );
+    }
+
+    const canApplyReportFilters =
+      force || shouldApplyRemoteSection(localState, rawData, REPORT_FILTERS_SECTION);
+    if (canApplyReportFilters) {
+      if (typeof unpacked.reportFilter === "string") setReportFilter(unpacked.reportFilter);
+      if (typeof unpacked.reportDay === "string") setReportDay(unpacked.reportDay);
+      if (typeof unpacked.reportMonth === "string") setReportMonth(unpacked.reportMonth);
+    }
+
+    const canApplyAdminSettings =
+      force ||
+      (!adminHasUnsavedChanges &&
+        shouldApplyRemoteSection(localState, rawData, ADMIN_SETTINGS_SECTION));
+    if (canApplyAdminSettings) {
+      if (unpacked.menu) setMenu(unpacked.menu);
+      if (unpacked.extraList) setExtraList(unpacked.extraList);
+      if (unpacked.beverageList) setBeverageList(unpacked.beverageList);
+      if (unpacked.utilityBills) setUtilityBills(normalizeUtilityBills(unpacked.utilityBills));
+      if (unpacked.laborProfile) setLaborProfile(normalizeLaborProfile(unpacked.laborProfile));
+      if (unpacked.equipmentList) setEquipmentList(normalizeEquipmentList(unpacked.equipmentList));
+      if (unpacked.dark != null) setDark(unpacked.dark);
+      if (unpacked.workers) setWorkers(unpacked.workers);
+      if (unpacked.paymentMethods) setPaymentMethods(unpacked.paymentMethods);
+      if (unpacked.adminPins) setAdminPins({ ...DEFAULT_ADMIN_PINS, ...unpacked.adminPins });
+      if (unpacked.orderTypes) setOrderTypes(unpacked.orderTypes);
+      if (unpacked.defaultDeliveryFee != null) setDefaultDeliveryFee(unpacked.defaultDeliveryFee);
+      if (unpacked.workerProfiles) setWorkerProfiles(unpacked.workerProfiles);
+      if (unpacked.deliveryZones) setDeliveryZones(unpacked.deliveryZones);
+      if (typeof unpacked.realtimeOrders === "boolean") setRealtimeOrders(unpacked.realtimeOrders);
+      if (typeof unpacked.syncCostsFromPurchases === "boolean")
+        setSyncCostsFromPurchases(unpacked.syncCostsFromPurchases);
+
+      const remoteStamp =
+        rawData?.[SECTION_UPDATED_AT_KEY]?.[ADMIN_SETTINGS_SECTION] ||
+        rawData?.adminSettingsUpdatedAt ||
+        rawData?.updatedAt ||
+        nowIso();
+      const sectionUpdatedAt = addSectionUpdatedAt(
+        loadLocal()?.[SECTION_UPDATED_AT_KEY],
+        [ADMIN_SETTINGS_SECTION],
+        remoteStamp
+      );
+      const remoteAdminSnapshot = buildAdminSettingsSnapshot(unpacked);
+      saveLocalPartial(
+        {
+          ...remoteAdminSnapshot,
+          [SECTION_UPDATED_AT_KEY]: sectionUpdatedAt,
+          adminSettingsUpdatedAt: remoteStamp,
+        },
+        { sections: [ADMIN_SETTINGS_SECTION], updatedAt: remoteStamp }
+      );
+      setAdminSavedSnapshot(remoteAdminSnapshot);
+      setAdminSaveStatus({ kind: "idle", message: "" });
+    }
+
+    return unpacked;
+  },
+  [
+    dayMeta,
+    realtimeOrders,
+    applyBulkInventoryFromCloud,
+    adminHasUnsavedChanges,
+    buildAdminSettingsSnapshot,
+  ]
+);
 
   useEffect(() => {
     if (!counterDocRef || !fbUser) return;
@@ -4844,55 +5517,7 @@ const onlineOrderCollections = useMemo(() => ONLINE_ORDER_COLLECTIONS, []);
       try {
         const data = await loadPosState();
         if (data) {
-          const unpacked = unpackStateFromCloud(data, dayMeta);
-          if (!realtimeOrders && unpacked.orders) setOrders(unpacked.orders);
-          if (unpacked.menu) setMenu(unpacked.menu);
-          if (unpacked.reconHistory) setReconHistory(unpacked.reconHistory);
-          if (unpacked.extraList) setExtraList(unpacked.extraList);
-          if (unpacked.beverageList) setBeverageList(unpacked.beverageList);
-          if (unpacked.inventory) setInventory(unpacked.inventory);
-          applyBulkInventoryFromCloud(unpacked.bulkInventoryItems, unpacked.bulkInventoryHistory);
-          if (unpacked.utilityBills) setUtilityBills(normalizeUtilityBills(unpacked.utilityBills));
-          if (unpacked.laborProfile) setLaborProfile(normalizeLaborProfile(unpacked.laborProfile));
-          if (unpacked.equipmentList) setEquipmentList(normalizeEquipmentList(unpacked.equipmentList));
-          if (unpacked.nextOrderNo != null) setNextOrderNo(unpacked.nextOrderNo);
-          if (unpacked.dark != null) setDark(unpacked.dark);
-          if (unpacked.workers) setWorkers(unpacked.workers);
-          if (unpacked.paymentMethods) setPaymentMethods(unpacked.paymentMethods);
-          if (unpacked.customers) setCustomers(dedupeCustomers(unpacked.customers));
-          if (unpacked.inventoryLocked != null)
-            setInventoryLocked(unpacked.inventoryLocked);
-          if (unpacked.inventorySnapshot)
-            setInventorySnapshot(unpacked.inventorySnapshot);
-          if (unpacked.inventoryLockedAt != null)
-            setInventoryLockedAt(unpacked.inventoryLockedAt);
-          if (unpacked.adminPins)
-            setAdminPins({ ...DEFAULT_ADMIN_PINS, ...unpacked.adminPins });
-          if (unpacked.orderTypes) setOrderTypes(unpacked.orderTypes);
-          if (unpacked.defaultDeliveryFee != null)
-            setDefaultDeliveryFee(unpacked.defaultDeliveryFee);
-          if (unpacked.expenses) setExpenses(unpacked.expenses);
-          if (unpacked.dayMeta) setDayMeta(unpacked.dayMeta);
-          if (unpacked.bankTx) setBankTx(unpacked.bankTx);
-          if (unpacked.onlineOrdersRaw)
-            setOnlineOrdersRaw(unpacked.onlineOrdersRaw);
-          if (unpacked.onlineOrderStatus)
-            setOnlineOrderStatus(unpacked.onlineOrderStatus);
-          if (unpacked.lastSeenOnlineOrderTs != null)
-            setLastSeenOnlineOrderTs(unpacked.lastSeenOnlineOrderTs);
-          if (unpacked.workerProfiles) setWorkerProfiles(unpacked.workerProfiles);
-        if (unpacked.workerSessions) setWorkerSessions(unpacked.workerSessions);
-          if (unpacked.historicalOrders) setHistoricalOrders(unpacked.historicalOrders);
-          if (unpacked.historicalExpenses) setHistoricalExpenses(unpacked.historicalExpenses);
-          if (unpacked.historicalPurchases) setHistoricalPurchases(unpacked.historicalPurchases);
-          if (typeof unpacked.reportFilter === "string") setReportFilter(unpacked.reportFilter);
-          if (typeof unpacked.reportDay === "string") setReportDay(unpacked.reportDay);
-          if (typeof unpacked.reportMonth === "string") setReportMonth(unpacked.reportMonth);
-           if (unpacked.purchases) setPurchases(unpacked.purchases);
-       if (unpacked.purchaseCategories) {
-   setPurchaseCategories(normalizePurchaseCategories(unpacked.purchaseCategories));
-}
-        if (unpacked.deliveryZones) setDeliveryZones(unpacked.deliveryZones);
+          applyRemoteState(data);
           setCloudStatus((s) => ({ ...s, lastLoadAt: new Date(), error: null }));
         }
       } catch (e) {
@@ -4902,7 +5527,7 @@ const onlineOrderCollections = useMemo(() => ONLINE_ORDER_COLLECTIONS, []);
         setHydrated(true);
       }
     })();
-  }, [stateDocRef, fbUser, hydrated, dayMeta, realtimeOrders, applyBulkInventoryFromCloud]);
+  }, [stateDocRef, fbUser, hydrated, applyRemoteState]);
   useEffect(() => {
   if (!cloudEnabled || !stateDocRef || !fbUser) return;
   const unsub = subscribeToPosState((data) => {
@@ -4916,30 +5541,7 @@ const onlineOrderCollections = useMemo(() => ONLINE_ORDER_COLLECTIONS, []);
       const ts = data.updatedAt ? new Date(data.updatedAt).getTime() : 0;
       if (ts && ts <= (lastAppliedCloudAt || 0)) return;
 if (ts && lastLocalEditAt && ts < lastLocalEditAt) return;
-      const unpacked = unpackStateFromCloud(data, dayMeta);
-      if (unpacked.menu) setMenu(unpacked.menu);
-      if (unpacked.reconHistory) setReconHistory(unpacked.reconHistory);
-      if (unpacked.extraList) setExtraList(unpacked.extraList);
-      if (unpacked.beverageList) setBeverageList(unpacked.beverageList);
-      if (unpacked.inventory) setInventory(unpacked.inventory);
-      applyBulkInventoryFromCloud(unpacked.bulkInventoryItems, unpacked.bulkInventoryHistory);
-      if (typeof unpacked.nextOrderNo === "number") setNextOrderNo(unpacked.nextOrderNo);
-      if (typeof unpacked.dark === "boolean") setDark(unpacked.dark);
-      if (unpacked.workers) setWorkers(unpacked.workers);
-      if (unpacked.paymentMethods) setPaymentMethods(unpacked.paymentMethods);
-      if (typeof unpacked.inventoryLocked === "boolean") setInventoryLocked(unpacked.inventoryLocked);
-      if (unpacked.inventorySnapshot) setInventorySnapshot(unpacked.inventorySnapshot);
-      if (unpacked.inventoryLockedAt != null) setInventoryLockedAt(unpacked.inventoryLockedAt);
-      if (unpacked.adminPins) setAdminPins({ ...DEFAULT_ADMIN_PINS, ...unpacked.adminPins });
-      if (unpacked.orderTypes) setOrderTypes(unpacked.orderTypes);
-      if (unpacked.defaultDeliveryFee != null) setDefaultDeliveryFee(unpacked.defaultDeliveryFee);
-      if (unpacked.expenses) setExpenses(unpacked.expenses);
-      if (unpacked.historicalOrders) setHistoricalOrders(unpacked.historicalOrders);
-      if (unpacked.historicalExpenses) setHistoricalExpenses(unpacked.historicalExpenses);
-      if (unpacked.historicalPurchases) setHistoricalPurchases(unpacked.historicalPurchases);
-      if (typeof unpacked.reportFilter === "string") setReportFilter(unpacked.reportFilter);
-      if (typeof unpacked.reportDay === "string") setReportDay(unpacked.reportDay);
-      if (typeof unpacked.reportMonth === "string") setReportMonth(unpacked.reportMonth);
+      applyRemoteState(data);
 
       const appliedAt = ts || Date.now();
       setLastAppliedCloudAt(appliedAt);
@@ -4951,59 +5553,14 @@ if (ts && lastLocalEditAt && ts < lastLocalEditAt) return;
   });
 
   return () => unsub();
-}, [cloudEnabled, stateDocRef, fbUser, dayMeta, lastAppliedCloudAt, lastLocalEditAt, applyBulkInventoryFromCloud]);
+}, [cloudEnabled, stateDocRef, fbUser, lastAppliedCloudAt, lastLocalEditAt, applyRemoteState]);
   // Manual pull
   const loadFromCloud = async () => {
     if (!stateDocRef || !fbUser) return alert("Supabase not ready.");
     try {
       const data = await loadPosState();
       if (!data) return alert("No cloud state yet to load.");
-      const unpacked = unpackStateFromCloud(data, dayMeta);
-      if (!realtimeOrders && unpacked.orders) setOrders(unpacked.orders);
-      if (unpacked.menu) setMenu(unpacked.menu);
-if (unpacked.workerProfiles) setWorkerProfiles(unpacked.workerProfiles);
-if (unpacked.workerSessions) setWorkerSessions(unpacked.workerSessions);
-      if (unpacked.extraList) setExtraList(unpacked.extraList);
-      if (unpacked.beverageList) setBeverageList(unpacked.beverageList);
-      if (unpacked.inventory) setInventory(unpacked.inventory);
-      applyBulkInventoryFromCloud(unpacked.bulkInventoryItems, unpacked.bulkInventoryHistory);
-      if (unpacked.nextOrderNo != null) setNextOrderNo(unpacked.nextOrderNo);
-      if (unpacked.dark != null) setDark(unpacked.dark);
-      if (unpacked.workers) setWorkers(unpacked.workers);
-      if (unpacked.paymentMethods) setPaymentMethods(unpacked.paymentMethods);
-      if (unpacked.inventoryLocked != null)
-        setInventoryLocked(unpacked.inventoryLocked);
-      if (unpacked.inventorySnapshot)
-        setInventorySnapshot(unpacked.inventorySnapshot);
-      if (unpacked.inventoryLockedAt != null)
-        setInventoryLockedAt(unpacked.inventoryLockedAt);
-      if (unpacked.adminPins)
-        setAdminPins({ ...DEFAULT_ADMIN_PINS, ...unpacked.adminPins });
-      if (unpacked.orderTypes) setOrderTypes(unpacked.orderTypes);
-      if (unpacked.defaultDeliveryFee != null)
-        setDefaultDeliveryFee(unpacked.defaultDeliveryFee);
-      if (unpacked.expenses) setExpenses(unpacked.expenses);
-      if (unpacked.dayMeta) setDayMeta(unpacked.dayMeta);
-       if (unpacked.bankTx) setBankTx(unpacked.bankTx);
-      if (unpacked.historicalOrders) setHistoricalOrders(unpacked.historicalOrders);
-      if (unpacked.historicalExpenses) setHistoricalExpenses(unpacked.historicalExpenses);
-      if (unpacked.historicalPurchases) setHistoricalPurchases(unpacked.historicalPurchases);
-      if (typeof unpacked.reportFilter === "string") setReportFilter(unpacked.reportFilter);
-      if (typeof unpacked.reportDay === "string") setReportDay(unpacked.reportDay);
-      if (typeof unpacked.reportMonth === "string") setReportMonth(unpacked.reportMonth);
-      if (unpacked.customers) setCustomers(dedupeCustomers(unpacked.customers));
-
-       if (unpacked.purchases) setPurchases(unpacked.purchases);
-   if (unpacked.purchaseCategories) {
-   setPurchaseCategories(normalizePurchaseCategories(unpacked.purchaseCategories));
- }
-    if (unpacked.deliveryZones) setDeliveryZones(unpacked.deliveryZones);
-      if (unpacked.onlineOrdersRaw)
-        setOnlineOrdersRaw(unpacked.onlineOrdersRaw);
-      if (unpacked.onlineOrderStatus)
-        setOnlineOrderStatus(unpacked.onlineOrderStatus);
-      if (unpacked.lastSeenOnlineOrderTs != null)
-        setLastSeenOnlineOrderTs(unpacked.lastSeenOnlineOrderTs);
+      applyRemoteState(data, { force: true });
       setCloudStatus((s) => ({ ...s, lastLoadAt: new Date(), error: null }));
       alert("Loaded from cloud ✔");
     } catch (e) {
@@ -5014,6 +5571,8 @@ if (unpacked.workerSessions) setWorkerSessions(unpacked.workerSessions);
  const saveToCloudNow = async () => {
   if (!stateDocRef || !fbUser) return alert("Supabase not ready.");
   try {
+    await writeFullStateToCloud();
+    /*
     const bodyBase = packStateForCloud({
       menu,
       extraList,
@@ -5068,6 +5627,7 @@ if (unpacked.workerSessions) setWorkerSessions(unpacked.workerSessions);
    setLastLocalEditAt(now);
     setLastAppliedCloudAt(now);
     setCloudStatus((s) => ({ ...s, lastSaveAt: new Date(), error: null }));
+    */
 
     alert("Synced to cloud ✔");
   } catch (e) {
@@ -5081,6 +5641,9 @@ useEffect(() => {
 
   (async () => {
     try {
+      await writeFullStateToCloud();
+      if (cancelled) return;
+      /*
  const bodyBase = packStateForCloud({
         menu,
         extraList,
@@ -5136,6 +5699,7 @@ useEffect(() => {
       const now = Date.now();
       setLastAppliedCloudAt(now);
       setCloudStatus((s) => ({ ...s, lastSaveAt: new Date(), error: null }));
+      */
     } catch (e) {
       if (!cancelled) {
         setCloudStatus((s) => ({ ...s, error: String(e) }));
@@ -5151,46 +5715,7 @@ useEffect(() => {
   stateDocRef,
   fbUser,
   hydrated,
-  menu,
-  workerProfiles,
-  workerSessions,
-  extraList,
-  beverageList,
-  orders,
-  inventory,
-  bulkInventoryItems,
-  bulkInventoryHistory,
-  nextOrderNo,
-  dark,
-  workers,
-  paymentMethods,
-  inventoryLocked,
-  inventorySnapshot,
-  inventoryLockedAt,
-  adminPins,
-  orderTypes,
-  defaultDeliveryFee,
-  expenses,
-  purchases,
-  purchaseCategories,
-  customers,
-  deliveryZones,
-  utilityBills,
-  laborProfile,
-  equipmentList,
-  dayMeta,
-  bankTx,
- realtimeOrders,
-  reconHistory,
-  onlineOrdersRaw,
-  onlineOrderStatus,
-  lastSeenOnlineOrderTs,
-  historicalOrders,
-  historicalExpenses,
-  historicalPurchases,
-  reportFilter,
-  reportDay,
-  reportMonth,
+  writeFullStateToCloud,
 ]);
   const startedAtMs = dayMeta?.startedAt
     ? new Date(dayMeta.startedAt).getTime()
@@ -5338,20 +5863,19 @@ useEffect(() => {
 }, [onlineOrders]);
   
   useEffect(() => {
+    if (!localHydrated) return;
     saveLocalPartial({ orderBoardFilter });
-  }, [orderBoardFilter]);
+  }, [orderBoardFilter, localHydrated]);
   
   useEffect(() => {
+    if (!localHydrated) return;
     saveLocalPartial({ lastSeenOnlineOrderTs });
-  }, [lastSeenOnlineOrderTs]);
-  
- useEffect(() => {
-    saveLocalPartial({ lastSeenOnlineOrderTs });
-  }, [lastSeenOnlineOrderTs]);
+  }, [lastSeenOnlineOrderTs, localHydrated]);
   
   useEffect(() => {
+    if (!localHydrated) return;
     saveLocalPartial({ onlineOrderStatus });
-  }, [onlineOrderStatus]);
+  }, [onlineOrderStatus, localHydrated]);
   useEffect(() => {
     if (orderBoardFilter === "online") {
       setOnlineViewCutoff(lastSeenOnlineOrderTs);
@@ -6106,16 +6630,21 @@ const addWorkerProfile = () => {
   setNewWName(""); setNewWPin(""); setNewWRate("");
 };
 const startDayIfNeeded = (starterName) => {
-  if (dayMeta.startedAt) return;
+  if (dayMeta.startedAt && !dayMeta.endedAt) return currentDayId;
+  const startTime = new Date();
+  const dayId = `day_${startTime.getTime()}`;
   setDayMeta({
+    dayId,
     startedBy: starterName || "",
     currentWorker: starterName || "",
-    startedAt: new Date(),
+    startedAt: startTime,
     endedAt: null,
     endedBy: "",
     lastReportAt: null,
     resetBy: "",
     resetAt: null,
+    active: true,
+    updatedAt: nowIso(),
     shiftChanges: [],
   });
   if (!inventoryLocked && inventory.length) {
@@ -6123,11 +6652,12 @@ const startDayIfNeeded = (starterName) => {
       lockInventoryForDay();
     }
   }
+  return dayId;
 };
 const signInByPin = (pin) => {
   const prof = findWorkerByPin(pin);
   if (!prof) return alert("Invalid PIN.");
-  startDayIfNeeded(prof.name);
+  const dayId = startDayIfNeeded(prof.name) || currentDayId;
   const open = (workerSessions || []).find(s => !s.signOutAt && s.name === prof.name);
   if (open) {
     alert(`${prof.name} is already on duty.`);
@@ -6135,13 +6665,18 @@ const signInByPin = (pin) => {
   }
   const sess = {
     id: `ws_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+    dayId: dayId || `day_${toMs(dayMeta.startedAt) || Date.now()}`,
     name: prof.name,
     pin: prof.pin,
     signInAt: new Date(),
     signOutAt: null,
+    active: true,
+    signedIn: true,
+    createdAt: new Date(),
+    updatedAt: new Date(),
   };
   setWorkerSessions(arr => [sess, ...arr]);
-  setDayMeta(d => ({ ...d, currentWorker: prof.name }));
+  setDayMeta(d => ({ ...d, currentWorker: prof.name, active: true, updatedAt: nowIso() }));
 };
 const signOutByPin = (pin) => {
   const prof = findWorkerByPin(pin);
@@ -6159,14 +6694,23 @@ const signOutByPin = (pin) => {
   }
   setWorkerSessions(list => {
     const copy = [...list];
-    copy[idx] = { ...copy[idx], signOutAt: new Date() };
+    const signOutAt = new Date();
+    copy[idx] = {
+      ...copy[idx],
+      signOutAt,
+      endAt: signOutAt,
+      endedAt: signOutAt,
+      active: false,
+      signedIn: false,
+      updatedAt: signOutAt,
+    };
     return copy;
   });
   const stillOpenNames = open.map(s => s.name).filter(n => n !== prof.name);
   if (stillOpenNames.length) {
-    setDayMeta(d => ({ ...d, currentWorker: stillOpenNames[0] }));
+    setDayMeta(d => ({ ...d, currentWorker: stillOpenNames[0], updatedAt: nowIso() }));
   } else {
-    setDayMeta(d => ({ ...d, currentWorker: "" }));
+    setDayMeta(d => ({ ...d, currentWorker: "", updatedAt: nowIso() }));
   }
 };
 const closeOpenSessionsAt = useCallback(
@@ -6176,7 +6720,17 @@ const closeOpenSessionsAt = useCallback(
       ? workerSessionsRef.current
       : [];
     const next = current.map((session) =>
-      session && !session.signOutAt ? { ...session, signOutAt: endStamp } : session
+      session && !session.signOutAt
+        ? {
+            ...session,
+            signOutAt: endStamp,
+            endAt: endStamp,
+            endedAt: endStamp,
+            active: false,
+            signedIn: false,
+            updatedAt: endStamp,
+          }
+        : session
     );
     setWorkerSessions(next);
     saveLocalPartial({
@@ -6184,6 +6738,9 @@ const closeOpenSessionsAt = useCallback(
         ...session,
         signInAt: toIso(session?.signInAt),
         signOutAt: toIso(session?.signOutAt),
+        endAt: toIso(session?.endAt),
+        endedAt: toIso(session?.endedAt),
+        updatedAt: toIso(session?.updatedAt),
       })),
     });
     setLastLocalEditAt(Date.now());
@@ -6194,8 +6751,24 @@ const closeOpenSessionsAt = useCallback(
 const resetWorkerLog = () => {
   const okAdmin = !!promptAdminAndPin();
   if (!okAdmin) return;
-  if (!window.confirm("Delete ALL worker sessions from the Worker Log? This cannot be undone.")) return;
+  const phrase = window.prompt(
+    "Type RESET WORKER LOG to delete all worker sessions.",
+    ""
+  );
+  if (String(phrase || "").trim() !== "RESET WORKER LOG") return;
   setWorkerSessions([]);
+  saveLocalPartial(
+    { workerSessions: [] },
+    {
+      allowHistoryReset: true,
+      sections: [WORKER_SESSIONS_SECTION],
+      resetMarker: {
+        id: `reset_worker_log_${Date.now()}`,
+        type: "workerSessions",
+        resetAt: nowIso(),
+      },
+    }
+  );
   alert("Worker Log cleared ");
 };
 const sumHoursForWorker = (name, sessions, start, end) => {
@@ -6483,7 +7056,7 @@ const workerMonthlyTotalPay = useMemo(
 
 
 const endDay = async () => {
-    if (!dayMeta.startedAt) return alert("Start a shift first.");
+    if (!dayMeta.startedAt || dayMeta.endedAt) return alert("Start an active shift first.");
 
     const who = window.prompt("Enter your name to END THE DAY:", "");
     const endBy = norm(who);
@@ -6508,13 +7081,35 @@ const endDay = async () => {
       return;
     }
 
-    if (!dayMeta.reconciledAt || !dayMeta.startedAt || dayMeta.reconciledAt < dayMeta.startedAt) {
+    const savedReconciliation = latestReconciliationForCurrentDay;
+    const reconciliationSavedAt = savedReconciliation
+      ? new Date(
+          savedReconciliation.savedAt ||
+            savedReconciliation.reconciledAt ||
+            savedReconciliation.at
+        )
+      : null;
+    if (
+      !savedReconciliation ||
+      !reconciliationSavedAt ||
+      Number.isNaN(+reconciliationSavedAt) ||
+      reconciliationSavedAt < new Date(dayMeta.startedAt)
+    ) {
       alert("You must save a Cash Drawer Reconciliation before ending the day. Go to the Reconcile tab.");
       return;
     }
 
     const endTime = new Date();
-    const metaForReport = { ...dayMeta, endedAt: endTime, endedBy: endBy };
+    const metaForReport = {
+      ...dayMeta,
+      dayId: currentDayId,
+      endedAt: endTime,
+      endedBy: endBy,
+      currentWorker: "",
+      active: false,
+      reconciliationId: savedReconciliation.id,
+      updatedAt: nowIso(),
+    };
     generatePDF(false, metaForReport);
 
     if (cloudEnabled && ordersColRef && fbUser) {
@@ -6575,9 +7170,22 @@ const endDay = async () => {
 
     lastLockedRef.current = [];
 
-    const newHistoricalOrders = [...historicalOrders, ...orders];
-    const newHistoricalExpenses = [...historicalExpenses, ...expenses];
-    const newHistoricalPurchases = [...historicalPurchases, ...purchases];
+    const archiveStamp = nowIso();
+    const newHistoricalOrders = mergeByIdPreferNewest(
+      historicalOrders,
+      stampRecords(orders, archiveStamp, "historical_order"),
+      { fallbackPrefix: "historical_order" }
+    );
+    const newHistoricalExpenses = mergeByIdPreferNewest(
+      historicalExpenses,
+      stampRecords(expenses, archiveStamp, "historical_expense"),
+      { fallbackPrefix: "historical_expense" }
+    );
+    const newHistoricalPurchases = mergeByIdPreferNewest(
+      historicalPurchases,
+      stampRecords(purchases, archiveStamp, "historical_purchase"),
+      { fallbackPrefix: "historical_purchase" }
+    );
     setHistoricalOrders(newHistoricalOrders);
     setHistoricalExpenses(newHistoricalExpenses);
     setHistoricalPurchases(newHistoricalPurchases);
@@ -6594,19 +7202,18 @@ const endDay = async () => {
     setOrders(clearedOrders);
     setNextOrderNo(1);
 
-    const resetMeta = {
-      startedBy: "",
+    const endedMeta = {
+      ...dayMeta,
+      dayId: currentDayId,
       currentWorker: "",
-      startedAt: null,
-      endedAt: null,
-      endedBy: "",
-      lastReportAt: null,
-      resetBy: "",
-      resetAt: null,
-      shiftChanges: [],
+      endedAt: endTime,
+      endedBy: endBy,
+      active: false,
+      reconciliationId: savedReconciliation.id,
+      updatedAt: nowIso(),
     };
-    setDayMeta(resetMeta);
-    saveLocalPartial({ dayMeta: resetMeta });
+    setDayMeta(endedMeta);
+    saveLocalPartial({ dayMeta: endedMeta });
     setLastLocalEditAt(Date.now());
 
     setReconCounts({});
@@ -6614,6 +7221,18 @@ const endDay = async () => {
 
     if (cloudEnabled && stateDocRef && fbUser) {
       try {
+        await writeFullStateToCloud({
+          orders: realtimeOrders ? [] : clearedOrders,
+          expenses: clearedExpenses,
+          workerSessions: closedSessions,
+          dayMeta: endedMeta,
+          bankTx: updatedBankTx,
+          nextOrderNo: 1,
+          historicalOrders: newHistoricalOrders,
+          historicalExpenses: newHistoricalExpenses,
+          historicalPurchases: newHistoricalPurchases,
+        });
+        /*
         const bodyBase = packStateForCloud({
           menu,
           extraList,
@@ -6639,7 +7258,7 @@ const endDay = async () => {
           purchaseCategories,
           customers,
           deliveryZones,
-          dayMeta: resetMeta,
+          dayMeta: endedMeta,
           utilityBills,
           laborProfile,
           equipmentList,
@@ -6667,12 +7286,13 @@ const endDay = async () => {
         const now = Date.now();
         setLastAppliedCloudAt(now);
         setCloudStatus((s) => ({ ...s, lastSaveAt: new Date(now), error: null }));
+        */
       } catch (err) {
         console.warn("Immediate cloud sync after endDay failed", err);
       }
     }
 
-    alert(`Day ended by ${endBy}. Report downloaded and day reset ✅`);
+    alert(`Day ended by ${endBy}. Report downloaded and history preserved ✅`);
   };
   const [isCheckingOut, setIsCheckingOut] = useState(false);
 const multiplyUses = (uses = {}, factor = 1) => {
@@ -7828,13 +8448,13 @@ const voidOrderToExpense = async (orderNo) => {
   const resetReports = () => {
     const adminNum = promptAdminAndPin();
     if (!adminNum) return;
-    if (
-      !window.confirm(
-        `Admin ${adminNum}: Reset ALL locally saved report data and filters? This cannot be undone.`
-      )
-    ) {
-      return;
-    }
+    const phrase = window.prompt(
+      `Admin ${adminNum}: type RESET REPORT HISTORY to permanently clear reports.`,
+      ""
+    );
+    if (String(phrase || "").trim() !== "RESET REPORT HISTORY") return;
+    const reason = String(window.prompt("Enter reset reason:", "") || "").trim();
+    if (!reason) return alert("A reset reason is required.");
 
     const now = new Date();
     const isoDay = now.toISOString().slice(0, 10);
@@ -7853,11 +8473,24 @@ const voidOrderToExpense = async (orderNo) => {
     setHistoricalOrders([]);
     setHistoricalExpenses([]);
     setHistoricalPurchases([]);
-    saveLocalPartial({
-      historicalOrders: [],
-      historicalExpenses: [],
-      historicalPurchases: [],
-    });
+    saveLocalPartial(
+      {
+        historicalOrders: [],
+        historicalExpenses: [],
+        historicalPurchases: [],
+      },
+      {
+        allowHistoryReset: true,
+        sections: [HISTORY_SECTION],
+        resetMarker: {
+          id: `reset_reports_${Date.now()}`,
+          type: "reportHistory",
+          admin: adminNum,
+          reason,
+          resetAt: nowIso(),
+        },
+      }
+    );
 
     alert("Report history and filters have been reset.");
   };
@@ -9109,9 +9742,12 @@ const generatePurchasesPDF = () => {
     flexWrap: "wrap",
   }}
 >
-  {!dayMeta.startedAt ? (
+  {!dayMeta.startedAt || dayMeta.endedAt ? (
     <>
-      <span><b>Shift not started.</b></span>
+      <span>
+        <b>{dayMeta.endedAt ? "Shift ended." : "Shift not started."}</b>
+        {dayMeta.endedAt ? ` Ended by ${dayMeta.endedBy || "-"} at ${fmtDate(dayMeta.endedAt)}.` : ""}
+      </span>
       <div style={{ display:"flex", alignItems:"center", gap:8 }}>
         <input
           type="password"
@@ -9320,7 +9956,58 @@ const generatePurchasesPDF = () => {
     ))}
 
     {/* push to the right */}
-    <div style={{ marginLeft: "auto" }}>
+    <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+      {adminHasUnsavedChanges && (
+        <span style={{ fontSize: 12, color: dark ? "#ffcc80" : "#a15c00", fontWeight: 700 }}>
+          Unsaved changes
+        </span>
+      )}
+      {adminSaveStatus.message && (
+        <span
+          style={{
+            fontSize: 12,
+            color:
+              adminSaveStatus.kind === "error"
+                ? "#c62828"
+                : adminSaveStatus.kind === "saved"
+                ? "#2e7d32"
+                : dark
+                ? "#ddd"
+                : "#444",
+            fontWeight: 700,
+          }}
+        >
+          {adminSaveStatus.message}
+        </span>
+      )}
+      <button
+        onClick={saveAdminSettings}
+        disabled={!adminHasUnsavedChanges || adminSaveStatus.kind === "saving"}
+        style={{
+          padding: "6px 10px",
+          borderRadius: 6,
+          border: `1px solid ${btnBorder}`,
+          background:
+            !adminHasUnsavedChanges || adminSaveStatus.kind === "saving"
+              ? dark
+                ? "#333"
+                : "#e0e0e0"
+              : "#2e7d32",
+          color:
+            !adminHasUnsavedChanges || adminSaveStatus.kind === "saving"
+              ? dark
+                ? "#aaa"
+                : "#666"
+              : "#fff",
+          cursor:
+            !adminHasUnsavedChanges || adminSaveStatus.kind === "saving"
+              ? "not-allowed"
+              : "pointer",
+          fontWeight: 800,
+        }}
+      >
+        Save Admin Settings
+      </button>
       <button
         onClick={() => { setAdminUnlocked(false); setActiveTab("orders"); }} // optional: kick out of Admin
         style={{ padding: "6px 10px", borderRadius: 6, border: `1px solid ${btnBorder}` }}
