@@ -5641,7 +5641,8 @@ useEffect(() => {
 
   (async () => {
     try {
-      await writeFullStateToCloud();
+      // Startup cloud sync is intentionally read-only.
+      // Do not write full POS state just because a device opened the app.
       if (cancelled) return;
       /*
  const bodyBase = packStateForCloud({
