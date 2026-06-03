@@ -1,7 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
-import { supabase } from "./supabaseClient";
+import { isSupabaseConfigured, supabase } from "./supabaseClient";
+import { getDeviceId } from "./services/deviceId";
+import { loadLocalState, saveLocalState } from "./services/localStore";
+import { shouldAttemptOnlineSync, SYNC_STATUS } from "./services/syncManager";
 
 export const toIso = (v) => {
   if (!v) return null;
@@ -487,6 +490,7 @@ const POS_STATE_ID = "pos";
 const ONLINE_ORDER_COLLECTIONS = [];
 
 const LS_KEY = "tux_pos_local_state_v1";
+const DEVICE_ID = getDeviceId();
 export function nowIso() {
   return new Date().toISOString();
 }
@@ -605,6 +609,8 @@ function stampRecord(record, stamp = nowIso(), fallbackPrefix = "row", index = 0
     id: record.id || getStableRecordKey(record, fallbackPrefix, index),
     createdAt,
     updatedAt: record.updatedAt || stamp,
+    lastModifiedDeviceId: record.lastModifiedDeviceId || DEVICE_ID,
+    syncStatus: record.syncStatus || SYNC_STATUS.pending,
   };
 }
 
@@ -653,6 +659,27 @@ function shouldApplyRemoteSection(localState = {}, remoteState = {}, section, op
   return allowLegacyWhenLocalEmpty && !hasAnyValueForKeys(localState, keys);
 }
 
+function shouldApplyRemoteKey(localState = {}, remoteState = {}, key, options = {}) {
+  return shouldApplyRemoteSection(localState, remoteState, options.section || sectionForKey(key), {
+    keys: options.keys || [key],
+    allowLegacyWhenLocalEmpty:
+      options.allowLegacyWhenLocalEmpty === undefined
+        ? true
+        : options.allowLegacyWhenLocalEmpty,
+  });
+}
+
+function latestSectionUpdatedMs(state = {}) {
+  const candidates = [state?.updatedAt, state?.lastSyncedAt];
+  const sectionMeta = state?.[SECTION_UPDATED_AT_KEY] || {};
+  for (const value of Object.values(sectionMeta)) candidates.push(value);
+  return candidates.reduce((max, value) => Math.max(max, toMs(value)), 0);
+}
+
+function isRemoteNewerThanLocal(localState = {}, remoteState = {}) {
+  return latestSectionUpdatedMs(remoteState) > latestSectionUpdatedMs(localState);
+}
+
 function addSectionUpdatedAt(base = {}, sections = [], stamp = nowIso()) {
   const next = { ...(base || {}) };
   for (const section of sections) {
@@ -663,10 +690,7 @@ function addSectionUpdatedAt(base = {}, sections = [], stamp = nowIso()) {
 
 function loadLocal() {
 
-  try { 
-    return JSON.parse(localStorage.getItem(LS_KEY) || "{}"); 
-  }
-  catch { return {}; }
+  return loadLocalState(LS_KEY);
 }
 function saveLocalPartial(patch, options = {}) {
   try {
@@ -700,8 +724,11 @@ function saveLocalPartial(patch, options = {}) {
     if (options.resetMarker) {
       next.resetMarkers = [...(Array.isArray(cur.resetMarkers) ? cur.resetMarkers : []), options.resetMarker];
     }
-    localStorage.setItem(LS_KEY, JSON.stringify(next));
-    return true;
+    next.updatedAt = stamp;
+    next.lastModifiedDeviceId = DEVICE_ID;
+    next.syncStatus = options.syncedFromCloud ? SYNC_STATUS.synced : options.syncStatus || SYNC_STATUS.pending;
+    next.pendingSync = !options.syncedFromCloud;
+    return saveLocalState(LS_KEY, next);
   } catch (err) {
     console.warn("Local save failed:", err);
     return false;
@@ -1340,11 +1367,13 @@ export function packStateForCloud(state) {
   const localSectionUpdatedAt = loadLocal()?.[SECTION_UPDATED_AT_KEY] || {};
   const purchases = Array.isArray(state.purchases)
     ? state.purchases.map((p) => ({
-        ...p,
-        id: p.id || getStableRecordKey(p, "purchase"),
-        createdAt: toIso(p.createdAt || p.date || stamp),
-        updatedAt: toIso(p.updatedAt || stamp),
-        date: toIso(p.date),
+      ...p,
+      id: p.id || getStableRecordKey(p, "purchase"),
+      createdAt: toIso(p.createdAt || p.date || stamp),
+      updatedAt: toIso(p.updatedAt || stamp),
+      lastModifiedDeviceId: p.lastModifiedDeviceId || DEVICE_ID,
+      syncStatus: p.syncStatus || SYNC_STATUS.pending,
+      date: toIso(p.date),
       }))
     : [];
   const purchaseCategories = Array.isArray(state.purchaseCategories)
@@ -1356,18 +1385,27 @@ export function packStateForCloud(state) {
         lastOrderAt: toIso(c.lastOrderAt),
         firstOrderAt: toIso(c.firstOrderAt),
         updatedAt: toIso(c.updatedAt),
+        lastModifiedDeviceId: c.lastModifiedDeviceId || DEVICE_ID,
+        syncStatus: c.syncStatus || SYNC_STATUS.pending,
       }))
     : [];
   const deliveryZones = Array.isArray(state.deliveryZones)
     ? state.deliveryZones
     : [];
   const payload = {
+    id: POS_STATE_ID,
+    deviceId: state.deviceId || DEVICE_ID,
+    lastModifiedDeviceId: state.lastModifiedDeviceId || DEVICE_ID,
+    syncStatus: state.syncStatus || SYNC_STATUS.pending,
+    pendingSync: Boolean(state.pendingSync),
  workerProfiles,
     workerSessions: (workerSessions || []).map((session) => ({
       ...session,
       id: session.id || getStableRecordKey(session, "worker_session"),
       createdAt: toIso(session.createdAt || session.signInAt || stamp),
       updatedAt: toIso(session.updatedAt || session.signOutAt || session.endedAt || stamp),
+      lastModifiedDeviceId: session.lastModifiedDeviceId || DEVICE_ID,
+      syncStatus: session.syncStatus || SYNC_STATUS.pending,
       signInAt: toIso(session.signInAt),
       signOutAt: toIso(session.signOutAt),
       endAt: toIso(session.endAt),
@@ -1390,6 +1428,8 @@ export function packStateForCloud(state) {
       id: o.id || getStableRecordKey(o, "order"),
       createdAt: toIso(o.createdAt || o.date || stamp),
       updatedAt: toIso(o.updatedAt || o.restockedAt || stamp),
+      lastModifiedDeviceId: o.lastModifiedDeviceId || DEVICE_ID,
+      syncStatus: o.syncStatus || SYNC_STATUS.pending,
       date: toIso(o.date),
       restockedAt: toIso(o.restockedAt),
     })),
@@ -1411,6 +1451,8 @@ export function packStateForCloud(state) {
       id: e.id || getStableRecordKey(e, "expense"),
       createdAt: toIso(e.createdAt || e.date || stamp),
       updatedAt: toIso(e.updatedAt || stamp),
+      lastModifiedDeviceId: e.lastModifiedDeviceId || DEVICE_ID,
+      syncStatus: e.syncStatus || SYNC_STATUS.pending,
       date: toIso(e.date),
     })),
     purchases,
@@ -1426,6 +1468,8 @@ export function packStateForCloud(state) {
           resetAt: toIso(dayMeta.resetAt),
           reconciledAt: toIso(dayMeta.reconciledAt),
           updatedAt: toIso(dayMeta.updatedAt || stamp),
+          lastModifiedDeviceId: dayMeta.lastModifiedDeviceId || DEVICE_ID,
+          syncStatus: dayMeta.syncStatus || SYNC_STATUS.pending,
           shiftChanges: Array.isArray(dayMeta.shiftChanges)
             ? dayMeta.shiftChanges.map((c) => ({
                 ...c,
@@ -1439,6 +1483,8 @@ export function packStateForCloud(state) {
       id: t.id || getStableRecordKey(t, "bank_tx"),
       createdAt: toIso(t.createdAt || t.date || stamp),
       updatedAt: toIso(t.updatedAt || stamp),
+      lastModifiedDeviceId: t.lastModifiedDeviceId || DEVICE_ID,
+      syncStatus: t.syncStatus || SYNC_STATUS.pending,
       date: toIso(t.date),
     })),
    reconHistory: (reconHistory || []).map((r) => ({
@@ -1446,6 +1492,8 @@ export function packStateForCloud(state) {
       id: r.id || getStableRecordKey(r, "reconciliation"),
       createdAt: toIso(r.createdAt || r.savedAt || r.reconciledAt || r.at || stamp),
       updatedAt: toIso(r.updatedAt || r.savedAt || r.reconciledAt || stamp),
+      lastModifiedDeviceId: r.lastModifiedDeviceId || DEVICE_ID,
+      syncStatus: r.syncStatus || SYNC_STATUS.pending,
       at: toIso(r.at),
       savedAt: toIso(r.savedAt),
       reconciledAt: toIso(r.reconciledAt),
@@ -1490,27 +1538,33 @@ export function packStateForCloud(state) {
       : undefined,
     historicalOrders: Array.isArray(historicalOrders)
       ? stampRecords(historicalOrders, stamp, "historical_order").map((o) => ({
-          ...o,
-          createdAt: toIso(o?.createdAt || o?.date || stamp),
-          updatedAt: toIso(o?.updatedAt || stamp),
-          date: toIso(o?.date),
-          restockedAt: toIso(o?.restockedAt),
+        ...o,
+        createdAt: toIso(o?.createdAt || o?.date || stamp),
+        updatedAt: toIso(o?.updatedAt || stamp),
+        lastModifiedDeviceId: o?.lastModifiedDeviceId || DEVICE_ID,
+        syncStatus: o?.syncStatus || SYNC_STATUS.pending,
+        date: toIso(o?.date),
+        restockedAt: toIso(o?.restockedAt),
         }))
       : [],
     historicalExpenses: Array.isArray(historicalExpenses)
       ? stampRecords(historicalExpenses, stamp, "historical_expense").map((e) => ({
-          ...e,
-          createdAt: toIso(e?.createdAt || e?.date || stamp),
-          updatedAt: toIso(e?.updatedAt || stamp),
-          date: toIso(e?.date),
+        ...e,
+        createdAt: toIso(e?.createdAt || e?.date || stamp),
+        updatedAt: toIso(e?.updatedAt || stamp),
+        lastModifiedDeviceId: e?.lastModifiedDeviceId || DEVICE_ID,
+        syncStatus: e?.syncStatus || SYNC_STATUS.pending,
+        date: toIso(e?.date),
         }))
       : [],
     historicalPurchases: Array.isArray(historicalPurchases)
       ? stampRecords(historicalPurchases, stamp, "historical_purchase").map((p) => ({
-          ...p,
-          createdAt: toIso(p?.createdAt || p?.date || stamp),
-          updatedAt: toIso(p?.updatedAt || stamp),
-          date: toIso(p?.date),
+        ...p,
+        createdAt: toIso(p?.createdAt || p?.date || stamp),
+        updatedAt: toIso(p?.updatedAt || stamp),
+        lastModifiedDeviceId: p?.lastModifiedDeviceId || DEVICE_ID,
+        syncStatus: p?.syncStatus || SYNC_STATUS.pending,
+        date: toIso(p?.date),
         }))
       : [],
     reportFilter: typeof reportFilter === "string" ? reportFilter : undefined,
@@ -1610,7 +1664,9 @@ if (Array.isArray(data.orders)) {
       date: t.date ? new Date(t.date) : new Date(),
     }));
   }
-  if (data.inventoryLockedAt) out.inventoryLockedAt = new Date(data.inventoryLockedAt);
+  if (Object.prototype.hasOwnProperty.call(data, "inventoryLockedAt")) {
+    out.inventoryLockedAt = data.inventoryLockedAt ? new Date(data.inventoryLockedAt) : null;
+  }
   if (data.dayMeta) {
     out.dayMeta = {
       startedBy: data.dayMeta.startedBy || "",
@@ -1816,6 +1872,8 @@ function normalizeOrderForSupabase(order) {
     online_source_doc_id: normalized.onlineSourceDocId || "",
     channel: normalized.channel || "",
     channel_order_no: normalized.channelOrderNo || "",
+    last_modified_device_id: normalized.lastModifiedDeviceId || DEVICE_ID,
+    sync_status: normalized.syncStatus || SYNC_STATUS.pending,
     created_at: toIso(normalized.createdAt) || new Date().toISOString(),
     updated_at: new Date().toISOString(),
   });
@@ -1863,6 +1921,8 @@ function orderFromSupabaseRow(row = {}) {
     onlineSourceDocId: row.online_source_doc_id || "",
     channel: row.channel || "",
     channelOrderNo: row.channel_order_no || "",
+    lastModifiedDeviceId: row.last_modified_device_id || DEVICE_ID,
+    syncStatus: row.sync_status || SYNC_STATUS.synced,
   };
   return enrichOrderWithChannel(order);
 }
@@ -3119,15 +3179,17 @@ function posStateFromRow(row) {
     ...state,
     updatedAt: row.updated_at || state.updatedAt,
     writerId: row.writer_id || state.writerId,
+    lastModifiedDeviceId: row.last_modified_device_id || state.lastModifiedDeviceId,
     writeSeq: Number(row.write_seq || state.writeSeq || 0),
     clientTime: row.client_time ?? state.clientTime,
   };
 }
 
 async function loadPosState() {
+  if (!supabase) throw new Error("Supabase is not configured.");
   const { data, error } = await supabase
     .from("pos_state")
-    .select("state, updated_at, writer_id, write_seq, client_time")
+    .select("state, updated_at, writer_id, last_modified_device_id, write_seq, client_time")
     .eq("id", POS_STATE_ID)
     .eq("shop_id", SHOP_ID)
     .maybeSingle();
@@ -3136,12 +3198,14 @@ async function loadPosState() {
 }
 
 async function savePosState(state) {
+  if (!supabase) throw new Error("Supabase is not configured.");
   const safeState = sanitizeForSupabase(state || {});
   const row = {
     id: POS_STATE_ID,
     shop_id: SHOP_ID,
     state: safeState,
     writer_id: safeState?.writerId || null,
+    last_modified_device_id: safeState?.lastModifiedDeviceId || safeState?.deviceId || DEVICE_ID,
     write_seq: Number(safeState?.writeSeq || 0),
     client_time: safeState?.clientTime != null ? Number(safeState.clientTime) : null,
     updated_at: new Date().toISOString(),
@@ -3151,6 +3215,7 @@ async function savePosState(state) {
 }
 
 function subscribeToPosState(callback) {
+  if (!supabase) return () => {};
   const channel = supabase
     .channel(`pos-state-${SHOP_ID}`)
     .on(
@@ -3171,6 +3236,7 @@ function subscribeToPosState(callback) {
 }
 
 async function loadOrders(startDate, endDate) {
+  if (!supabase) throw new Error("Supabase is not configured.");
   let request = supabase
     .from("orders")
     .select("*")
@@ -3188,6 +3254,7 @@ async function loadOrders(startDate, endDate) {
 }
 
 function subscribeToOrders(callback) {
+  if (!supabase) return () => {};
   const channel = supabase
     .channel(`orders-${SHOP_ID}`)
     .on(
@@ -3208,6 +3275,7 @@ function subscribeToOrders(callback) {
 }
 
 async function addOrder(order) {
+  if (!supabase) throw new Error("Supabase is not configured.");
   const { data, error } = await supabase
     .from("orders")
     .insert(normalizeOrderForSupabase(order))
@@ -3244,6 +3312,8 @@ function normalizeOrderPatchForSupabase(patch = {}) {
     onlineSourceCollection: "online_source_collection",
     onlineSourceDocId: "online_source_doc_id",
     channelOrderNo: "channel_order_no",
+    lastModifiedDeviceId: "last_modified_device_id",
+    syncStatus: "sync_status",
     createdAt: "created_at",
     updatedAt: "updated_at",
   };
@@ -3266,10 +3336,13 @@ function normalizeOrderPatchForSupabase(patch = {}) {
     }
   }
   if (!row.updated_at) row.updated_at = new Date().toISOString();
+  if (!row.last_modified_device_id) row.last_modified_device_id = DEVICE_ID;
+  if (!row.sync_status) row.sync_status = SYNC_STATUS.pending;
   return sanitizeForSupabase(row);
 }
 
 async function updateOrderById(id, patch) {
+  if (!supabase) throw new Error("Supabase is not configured.");
   if (!id) return null;
   const { data, error } = await supabase
     .from("orders")
@@ -3283,6 +3356,7 @@ async function updateOrderById(id, patch) {
 }
 
 async function updateOrderByOrderNo(orderNo, patch) {
+  if (!supabase) throw new Error("Supabase is not configured.");
   const { data, error } = await supabase
     .from("orders")
     .update(normalizeOrderPatchForSupabase(patch))
@@ -3294,6 +3368,7 @@ async function updateOrderByOrderNo(orderNo, patch) {
 }
 
 async function purgeOrdersInRange(startDate, endDate) {
+  if (!supabase) return 0;
   try {
     let selectReq = supabase
       .from("orders")
@@ -3322,6 +3397,7 @@ async function purgeOrdersInRange(startDate, endDate) {
 }
 
 async function allocateOrderNoAtomic() {
+  if (!supabase) throw new Error("Supabase is not configured.");
   const { data, error } = await supabase.rpc("allocate_order_no", {
     p_shop_id: SHOP_ID,
   });
@@ -3330,6 +3406,7 @@ async function allocateOrderNoAtomic() {
 }
 
 async function resetOrderCounter(lastOrderNo = 0) {
+  if (!supabase) throw new Error("Supabase is not configured.");
   const { data, error } = await supabase.rpc("reset_order_counter", {
     p_shop_id: SHOP_ID,
     p_last_order_no: Number(lastOrderNo || 0),
@@ -3339,6 +3416,7 @@ async function resetOrderCounter(lastOrderNo = 0) {
 }
 
 async function loadCounter() {
+  if (!supabase) throw new Error("Supabase is not configured.");
   const { data, error } = await supabase
     .from("counters")
     .select("last_order_no")
@@ -3349,6 +3427,7 @@ async function loadCounter() {
 }
 
 function subscribeToCounter(callback) {
+  if (!supabase) return () => {};
   const channel = supabase
     .channel(`counter-${SHOP_ID}`)
     .on(
@@ -3432,8 +3511,54 @@ function findDefByLine(line, defs){
   return null;
 }
 
-function buildReceiptHTML(order, widthMm = 80) {
+function resolveReceiptAssetUrl(assetName) {
+  const cleanName = String(assetName || "").replace(/^\/+/, "");
+  if (!cleanName) return "";
+  if (typeof window === "undefined") return `/${cleanName}`;
+  try {
+    return new URL(cleanName, window.location.href).href;
+  } catch {
+    return `/${cleanName}`;
+  }
+}
+
+function resolveReceiptImages(images = {}) {
+  return {
+    logo: images.logo || resolveReceiptAssetUrl("tuxlogo.jpg"),
+    menuQr: images.menuQr || resolveReceiptAssetUrl("menu-qr.jpg"),
+    deliveryLogo: images.deliveryLogo || resolveReceiptAssetUrl("delivery-logo.jpg"),
+  };
+}
+
+function getReceiptPrinterBridge() {
+  if (typeof window === "undefined") return null;
+  return window.tuxCashierPrinter || null;
+}
+
+function openReceiptPreviewWindow(html) {
+  const win = window.open("", "_blank", "width=460,height=760");
+  if (!win) {
+    alert("Receipt preview was blocked. Allow popups for this app or use Print.");
+    return;
+  }
+  win.document.open();
+  win.document.write(html);
+  win.document.close();
+  win.focus();
+}
+
+async function promptText(message, defaultValue = "") {
+  const dialogBridge =
+    typeof window !== "undefined" ? window.tuxCashierDialogs : null;
+  if (dialogBridge?.prompt) {
+    return dialogBridge.prompt(message, defaultValue);
+  }
+  return window.prompt(message, defaultValue);
+}
+
+function buildReceiptHTML(order, widthMm = 80, copy = "Customer", images = {}) {
   const m = Math.max(0, Math.min(4, 4)); // padding mm
+  const receiptImages = resolveReceiptImages(images);
   const currency = (v) => `E£${Number(v || 0).toFixed(2)}`;
   const dt = new Date(order.date);
   const orderDateStr = fmtDate(dt);
@@ -3547,7 +3672,7 @@ const cashBlock = (() => {
 <html>
 <head>
 <meta charset="utf-8">
-<title>Receipt</title>
+<title>${escHtml(copy || "Receipt")} Receipt</title>
 <style>
   @page { size: ${widthMm}mm auto; margin: 0; }
   html, body { margin: 0; padding: 0; }
@@ -3615,7 +3740,7 @@ const cashBlock = (() => {
 </head>
 <body>
   <div class="receipt">
-    <div class="brand"><img src="/tuxlogo.jpg" alt="TUX logo"></div>
+    <div class="brand"><img src="${escHtml(receiptImages.logo)}" alt="TUX logo"></div>
    <div class="title">TUX — Burger Truck</div>
     <div class="meta address">El-Saada St – Zahraa El-Maadi</div>
     <!-- Order meta -->
@@ -3648,8 +3773,8 @@ const cashBlock = (() => {
       <div class="thanks">Thank you for choosing TUX
 See you soon</div>
       <div class="logos">
-        <img class="menu" src="/menu-qr.jpg" alt="Menu QR">
-        <img class="delivery" src="/delivery-logo.jpg" alt="Delivery">
+        <img class="menu" src="${escHtml(receiptImages.menuQr)}" alt="Menu QR">
+        <img class="delivery" src="${escHtml(receiptImages.deliveryLogo)}" alt="Delivery">
       </div>
     </div>
   </div>
@@ -3657,8 +3782,17 @@ See you soon</div>
 </html>
 `;
 }
-function printReceiptHTML(order, widthMm = 80, copy = "Customer", images) {
+async function printReceiptHTML(order, widthMm = 80, copy = "Customer", images) {
   const html = buildReceiptHTML(order, widthMm, copy, images);
+  const printerBridge = getReceiptPrinterBridge();
+  if (printerBridge?.printReceipt) {
+    try {
+      return await printerBridge.printReceipt(html, { widthMm, copy });
+    } catch (err) {
+      console.warn("Native receipt print failed; falling back to browser print.", err);
+    }
+  }
+
   const ifr = document.createElement("iframe");
   Object.assign(ifr.style, { position:"fixed", right:0, bottom:0, width:0, height:0, border:0 });
   let htmlWritten = false;
@@ -3683,6 +3817,19 @@ function printReceiptHTML(order, widthMm = 80, copy = "Customer", images) {
   doc.close();
   htmlWritten = true;
   setTimeout(() => { try { if (document.body.contains(ifr)) ifr.remove(); } catch {} }, 12000);
+}
+async function previewReceiptHTML(order, widthMm = 80, copy = "Preview", images) {
+  const html = buildReceiptHTML(order, widthMm, copy, images);
+  const printerBridge = getReceiptPrinterBridge();
+  if (printerBridge?.previewReceipt) {
+    try {
+      return await printerBridge.previewReceipt(html, { widthMm, copy });
+    } catch (err) {
+      console.warn("Native receipt preview failed; falling back to browser preview.", err);
+    }
+  }
+  openReceiptPreviewWindow(html);
+  return { success: true };
 }
 const normalizePhone = (s) => {
   let digits = String(s || "").replace(/\D/g, "");
@@ -4294,8 +4441,8 @@ const [usageMonth, setUsageMonth] = useState(() => {
   const l = loadLocal();
   return l?.usageMonth || new Date().toISOString().slice(0, 7);
 });
-const resetUsageViewAdmin = () => {
-  const okAdmin = !!promptAdminAndPin();
+const resetUsageViewAdmin = async () => {
+  const okAdmin = !!(await promptAdminAndPin());
   if (!okAdmin) return;
 
   setUsageFilter("week");
@@ -4462,10 +4609,10 @@ const allTimeVarianceTotal = useMemo(
   () => Object.values(allTimeVarianceByMethod).reduce((s, v) => s + Number(v || 0), 0),
   [allTimeVarianceByMethod]
 );
-const resetAllReconciliations = () => {
-  const okAdmin = !!promptAdminAndPin();
+const resetAllReconciliations = async () => {
+  const okAdmin = !!(await promptAdminAndPin());
   if (!okAdmin) return;
-  const phrase = window.prompt(
+  const phrase = await promptText(
     "Type RESET RECONCILIATIONS to clear saved reconciliations and variance totals.",
     ""
   );
@@ -4572,8 +4719,17 @@ if (!hasMeaningfulActualCounts) {
     totalVariance: Number(totalVariance.toFixed(2)),
     status: Math.abs(Number(totalVariance || 0)) < 0.01 ? "balanced" : "variance",
   };
-  setReconHistory(arr => [rec, ...(arr || []).filter((row) => row?.id !== rec.id)]);
-  setDayMeta(d => ({ ...d, dayId, reconciledAt: savedAt, reconciliationId: rec.id, updatedAt: nowIso() }));
+  const nextDayMeta = { ...dayMeta, dayId, reconciledAt: savedAt, reconciliationId: rec.id, updatedAt: nowIso() };
+  const nextReconHistory = [rec, ...(reconHistory || []).filter((row) => row?.id !== rec.id)];
+  setReconHistory(nextReconHistory);
+  setDayMeta(nextDayMeta);
+  saveLocalPartial(
+    {
+      reconHistory: nextReconHistory,
+      dayMeta: nextDayMeta,
+    },
+    { sections: [RECONCILIATION_SECTION, DAY_META_SECTION], updatedAt: toIso(savedAt) }
+  );
   alert("Reconciliation saved ✅");
 };
   const [menu, setMenu] = useState(BASE_MENU);
@@ -4677,21 +4833,21 @@ const [newInvName, setNewInvName] = useState("");
 const [newInvUnit, setNewInvUnit] = useState("");
 const [newInvQty, setNewInvQty] = useState(0);
   const [adminPins, setAdminPins] = useState({ ...DEFAULT_ADMIN_PINS });
-const verifyAdminPin = (n) => {
+const verifyAdminPin = async (n) => {
   const expected = norm(adminPins[n] || "");
   if (!expected) {
     alert(`Admin ${n} has no PIN set; add it in Settings → Admin PINs.`);
     return false;
   }
-  const entered = window.prompt(`Enter PIN for Admin ${n}:`, "");
+  const entered = await promptText(`Enter PIN for Admin ${n}:`, "");
   if (entered == null) return false;
   return norm(entered) === expected;
 };
 const lockAdminPin = (n) => {
   setUnlockedPins((u) => ({ ...u, [n]: false }));
 };
-const unlockAdminPin = (n) => {
-  if (!verifyAdminPin(n)) return;
+const unlockAdminPin = async (n) => {
+  if (!(await verifyAdminPin(n))) return;
   setUnlockedPins((u) => ({ ...u, [n]: true }));
 };
   const [unlockedPins, setUnlockedPins] = useState({}); 
@@ -4796,7 +4952,7 @@ const [lastLocalEditAt, setLastLocalEditAt] = useState(0);
   const [hydrated, setHydrated] = useState(false);
   const [lastAppliedCloudAt, setLastAppliedCloudAt] = useState(0);
   // Prevent our own cloud writes from boomeranging back
-const clientIdRef = useRef(`cli_${Math.random().toString(36).slice(2)}`);
+const clientIdRef = useRef(DEVICE_ID);
 const writeSeqRef = useRef(0);
   // Printing preferences (kept)
   const [autoPrintOnCheckout, setAutoPrintOnCheckout] = useState(true);
@@ -4814,6 +4970,12 @@ const writeSeqRef = useRef(0);
     try {
       setFbReady(true);
       setFbUser({ uid: clientIdRef.current });
+      if (!isSupabaseConfigured) {
+        setCloudStatus((s) => ({
+          ...s,
+          error: "Supabase is not configured. Local offline mode is active.",
+        }));
+      }
     } catch (e) {
       setCloudStatus((s) => ({ ...s, error: String(e) }));
     }
@@ -5085,8 +5247,8 @@ useEffect(() => { if (!localHydrated) return; saveLocalPartial({ inventoryLocked
 useEffect(() => { if (!localHydrated) return; saveLocalPartial({ nextOrderNo }); }, [nextOrderNo, localHydrated]);
 useEffect(() => {
   if (!localHydrated) return;
-  if (!realtimeOrders) saveLocalPartial({ orders });
-}, [orders, realtimeOrders, localHydrated]);
+  saveLocalPartial({ orders });
+}, [orders, localHydrated]);
 
 useEffect(() => {
   setLastLocalEditAt(Date.now());
@@ -5226,7 +5388,7 @@ const buildFullStateForCloud = useCallback(
   (overrides = {}, options = {}) =>
     withPersistedAdminSettings(
       {
-        orders: realtimeOrders ? [] : orders,
+        orders,
         inventory,
         bulkInventoryItems,
         bulkInventoryHistory,
@@ -5279,7 +5441,7 @@ const buildFullStateForCloud = useCallback(
     reportMonth,
   ]
 );
-const supabaseReady = fbReady;
+const supabaseReady = fbReady && isSupabaseConfigured;
 const stateDocRef = supabaseReady;
 const ordersColRef = supabaseReady;
 const counterDocRef = supabaseReady;
@@ -5287,15 +5449,21 @@ const onlineOrderCollections = useMemo(() => ONLINE_ORDER_COLLECTIONS, []);
 const writeFullStateToCloud = useCallback(
   async (overrides = {}, options = {}) => {
     if (!stateDocRef || !fbUser) throw new Error("Supabase not ready.");
+    if (!shouldAttemptOnlineSync()) throw new Error("Offline. Local changes are saved and pending sync.");
     const bodyBase = packStateForCloud(buildFullStateForCloud(overrides, options));
     writeSeqRef.current += 1;
     const body = {
       ...bodyBase,
       writerId: clientIdRef.current,
+      deviceId: clientIdRef.current,
+      lastModifiedDeviceId: clientIdRef.current,
+      syncStatus: SYNC_STATUS.synced,
+      pendingSync: false,
       writeSeq: writeSeqRef.current,
       clientTime: Date.now(),
     };
     await savePosState(body);
+    saveLocalPartial({}, { updatedAt: body.updatedAt || nowIso(), syncedFromCloud: true });
     const now = Date.now();
     setLastLocalEditAt(now);
     setLastAppliedCloudAt(now);
@@ -5363,22 +5531,61 @@ const applyRemoteState = useCallback(
     const unpacked = unpackStateFromCloud(rawData, dayMeta);
     const localState = loadLocal();
 
-    if (!realtimeOrders && unpacked.orders) setOrders(unpacked.orders);
-    if (unpacked.inventory) setInventory(unpacked.inventory);
-    applyBulkInventoryFromCloud(unpacked.bulkInventoryItems, unpacked.bulkInventoryHistory);
-    if (unpacked.nextOrderNo != null) setNextOrderNo(unpacked.nextOrderNo);
-    if (unpacked.customers) setCustomers(dedupeCustomers(unpacked.customers));
-    if (unpacked.inventoryLocked != null) setInventoryLocked(unpacked.inventoryLocked);
-    if (unpacked.inventorySnapshot) setInventorySnapshot(unpacked.inventorySnapshot);
-    if (unpacked.inventoryLockedAt != null) setInventoryLockedAt(unpacked.inventoryLockedAt);
-    if (unpacked.expenses) setExpenses(unpacked.expenses);
-    if (unpacked.bankTx) setBankTx(unpacked.bankTx);
-    if (unpacked.onlineOrdersRaw) setOnlineOrdersRaw(unpacked.onlineOrdersRaw);
-    if (unpacked.onlineOrderStatus) setOnlineOrderStatus(unpacked.onlineOrderStatus);
-    if (unpacked.lastSeenOnlineOrderTs != null)
+    if (unpacked.orders && shouldApplyRemoteKey(localState, rawData, "orders")) {
+      setOrders((prev) =>
+        mergeByIdPreferNewest(prev, unpacked.orders, { fallbackPrefix: "order" }).map(enrichOrderWithChannel)
+      );
+    }
+    if (unpacked.inventory && shouldApplyRemoteKey(localState, rawData, "inventory")) {
+      setInventory(unpacked.inventory);
+    }
+    applyBulkInventoryFromCloud(
+      shouldApplyRemoteKey(localState, rawData, "bulkInventoryItems")
+        ? unpacked.bulkInventoryItems
+        : undefined,
+      shouldApplyRemoteKey(localState, rawData, "bulkInventoryHistory")
+        ? unpacked.bulkInventoryHistory
+        : undefined
+    );
+    if (unpacked.nextOrderNo != null && shouldApplyRemoteKey(localState, rawData, "nextOrderNo")) {
+      setNextOrderNo(unpacked.nextOrderNo);
+    }
+    if (unpacked.customers && shouldApplyRemoteKey(localState, rawData, "customers")) {
+      setCustomers(dedupeCustomers(unpacked.customers));
+    }
+    if (unpacked.inventoryLocked != null && shouldApplyRemoteKey(localState, rawData, "inventoryLocked")) {
+      setInventoryLocked(unpacked.inventoryLocked);
+    }
+    if (unpacked.inventorySnapshot && shouldApplyRemoteKey(localState, rawData, "inventorySnapshot")) {
+      setInventorySnapshot(unpacked.inventorySnapshot);
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(unpacked, "inventoryLockedAt") &&
+      shouldApplyRemoteKey(localState, rawData, "inventoryLockedAt")
+    ) {
+      setInventoryLockedAt(unpacked.inventoryLockedAt);
+    }
+    if (unpacked.expenses && shouldApplyRemoteKey(localState, rawData, "expenses")) {
+      setExpenses(unpacked.expenses);
+    }
+    if (unpacked.bankTx && shouldApplyRemoteKey(localState, rawData, "bankTx")) {
+      setBankTx(unpacked.bankTx);
+    }
+    if (unpacked.onlineOrdersRaw && shouldApplyRemoteKey(localState, rawData, "onlineOrdersRaw")) {
+      setOnlineOrdersRaw(unpacked.onlineOrdersRaw);
+    }
+    if (unpacked.onlineOrderStatus && shouldApplyRemoteKey(localState, rawData, "onlineOrderStatus")) {
+      setOnlineOrderStatus(unpacked.onlineOrderStatus);
+    }
+    if (
+      unpacked.lastSeenOnlineOrderTs != null &&
+      shouldApplyRemoteKey(localState, rawData, "lastSeenOnlineOrderTs")
+    )
       setLastSeenOnlineOrderTs(unpacked.lastSeenOnlineOrderTs);
-    if (unpacked.purchases) setPurchases(unpacked.purchases);
-    if (unpacked.purchaseCategories)
+    if (unpacked.purchases && shouldApplyRemoteKey(localState, rawData, "purchases")) {
+      setPurchases(unpacked.purchases);
+    }
+    if (unpacked.purchaseCategories && shouldApplyRemoteKey(localState, rawData, "purchaseCategories"))
       setPurchaseCategories(normalizePurchaseCategories(unpacked.purchaseCategories));
 
     if (
@@ -5391,35 +5598,41 @@ const applyRemoteState = useCallback(
       });
     }
 
-    if (unpacked.workerSessions) {
+    if (
+      unpacked.workerSessions &&
+      shouldApplyRemoteSection(localState, rawData, WORKER_SESSIONS_SECTION)
+    ) {
       setWorkerSessions((prev) =>
         mergeByIdPreferNewest(prev, unpacked.workerSessions, {
           fallbackPrefix: "worker_session",
         })
       );
     }
-    if (unpacked.reconHistory) {
+    if (
+      unpacked.reconHistory &&
+      shouldApplyRemoteSection(localState, rawData, RECONCILIATION_SECTION)
+    ) {
       setReconHistory((prev) =>
         mergeByIdPreferNewest(prev, unpacked.reconHistory, {
           fallbackPrefix: "reconciliation",
         })
       );
     }
-    if (unpacked.historicalOrders) {
+    if (unpacked.historicalOrders && shouldApplyRemoteSection(localState, rawData, HISTORY_SECTION)) {
       setHistoricalOrders((prev) =>
         mergeByIdPreferNewest(prev, unpacked.historicalOrders, {
           fallbackPrefix: "historical_order",
         })
       );
     }
-    if (unpacked.historicalExpenses) {
+    if (unpacked.historicalExpenses && shouldApplyRemoteSection(localState, rawData, HISTORY_SECTION)) {
       setHistoricalExpenses((prev) =>
         mergeByIdPreferNewest(prev, unpacked.historicalExpenses, {
           fallbackPrefix: "historical_expense",
         })
       );
     }
-    if (unpacked.historicalPurchases) {
+    if (unpacked.historicalPurchases && shouldApplyRemoteSection(localState, rawData, HISTORY_SECTION)) {
       setHistoricalPurchases((prev) =>
         mergeByIdPreferNewest(prev, unpacked.historicalPurchases, {
           fallbackPrefix: "historical_purchase",
@@ -5475,7 +5688,7 @@ const applyRemoteState = useCallback(
           [SECTION_UPDATED_AT_KEY]: sectionUpdatedAt,
           adminSettingsUpdatedAt: remoteStamp,
         },
-        { sections: [ADMIN_SETTINGS_SECTION], updatedAt: remoteStamp }
+        { sections: [ADMIN_SETTINGS_SECTION], updatedAt: remoteStamp, syncedFromCloud: true }
       );
       setAdminSavedSnapshot(remoteAdminSnapshot);
       setAdminSaveStatus({ kind: "idle", message: "" });
@@ -5511,6 +5724,11 @@ const applyRemoteState = useCallback(
       unsub();
     };
   }, [counterDocRef, fbUser]);
+  useEffect(() => {
+    if (fbReady && !stateDocRef && !hydrated) {
+      setHydrated(true);
+    }
+  }, [fbReady, stateDocRef, hydrated]);
   useEffect(() => {
     if (!stateDocRef || !fbUser || hydrated) return;
     (async () => {
@@ -5554,8 +5772,48 @@ if (ts && lastLocalEditAt && ts < lastLocalEditAt) return;
 
   return () => unsub();
 }, [cloudEnabled, stateDocRef, fbUser, lastAppliedCloudAt, lastLocalEditAt, applyRemoteState]);
+  const syncWithCloudNow = useCallback(
+    async (notify = false) => {
+      if (!stateDocRef || !fbUser) {
+        const message = "Supabase is not configured. Local offline mode is active.";
+        setCloudStatus((s) => ({ ...s, error: message }));
+        if (notify) alert(message);
+        return false;
+      }
+
+      try {
+        let remoteState = null;
+        try {
+          remoteState = await loadPosState();
+        } catch (loadError) {
+          console.warn("Cloud load before sync failed:", loadError);
+        }
+
+        const localState = loadLocal();
+        if (remoteState) {
+          applyRemoteState(remoteState);
+          setCloudStatus((s) => ({ ...s, lastLoadAt: new Date(), error: null }));
+        }
+
+        if (!remoteState || !isRemoteNewerThanLocal(localState, remoteState) || localState.pendingSync) {
+          await writeFullStateToCloud();
+        }
+
+        setCloudStatus((s) => ({ ...s, error: null }));
+        if (notify) alert("Refresh/Sync complete");
+        return true;
+      } catch (e) {
+        const message = String(e?.message || e);
+        setCloudStatus((s) => ({ ...s, error: message }));
+        if (notify) alert("Sync failed: " + message);
+        return false;
+      }
+    },
+    [stateDocRef, fbUser, applyRemoteState, writeFullStateToCloud]
+  );
   // Manual pull
   const loadFromCloud = async () => {
+    return syncWithCloudNow(true);
     if (!stateDocRef || !fbUser) return alert("Supabase not ready.");
     try {
       const data = await loadPosState();
@@ -5569,6 +5827,7 @@ if (ts && lastLocalEditAt && ts < lastLocalEditAt) return;
     }
  };
  const saveToCloudNow = async () => {
+  return syncWithCloudNow(true);
   if (!stateDocRef || !fbUser) return alert("Supabase not ready.");
   try {
     await writeFullStateToCloud();
@@ -5637,12 +5896,9 @@ if (ts && lastLocalEditAt && ts < lastLocalEditAt) return;
 useEffect(() => {
   if (!cloudEnabled || !stateDocRef || !fbUser || !hydrated) return undefined;
 
-  let cancelled = false;
-
-  (async () => {
+  const timeoutId = window.setTimeout(async () => {
     try {
       await writeFullStateToCloud();
-      if (cancelled) return;
       /*
  const bodyBase = packStateForCloud({
         menu,
@@ -5701,14 +5957,12 @@ useEffect(() => {
       setCloudStatus((s) => ({ ...s, lastSaveAt: new Date(), error: null }));
       */
     } catch (e) {
-      if (!cancelled) {
-        setCloudStatus((s) => ({ ...s, error: String(e) }));
-      }
+      setCloudStatus((s) => ({ ...s, error: String(e) }));
     }
-  })();
+  }, 1500);
 
   return () => {
-    cancelled = true;
+    window.clearTimeout(timeoutId);
   };
 }, [
   cloudEnabled,
@@ -5717,6 +5971,21 @@ useEffect(() => {
   hydrated,
   writeFullStateToCloud,
 ]);
+useEffect(() => {
+  if (!cloudEnabled || !stateDocRef || !fbUser || !hydrated) return undefined;
+
+  const retrySync = () => {
+    syncWithCloudNow(false);
+  };
+
+  window.addEventListener("online", retrySync);
+  const intervalId = window.setInterval(retrySync, 120000);
+
+  return () => {
+    window.removeEventListener("online", retrySync);
+    window.clearInterval(intervalId);
+  };
+}, [cloudEnabled, stateDocRef, fbUser, hydrated, syncWithCloudNow]);
   const startedAtMs = dayMeta?.startedAt
     ? new Date(dayMeta.startedAt).getTime()
     : null;
@@ -5730,6 +5999,7 @@ useEffect(() => {
       return;
     }
     let active = true;
+    let refreshTimer = null;
     const refreshOrders = async () => {
       try {
         const arr = await loadOrders(new Date(startedAtMs), endedAtMs ? new Date(endedAtMs) : null);
@@ -5739,10 +6009,15 @@ useEffect(() => {
         setCloudStatus((s) => ({ ...s, error: String(err) }));
       }
     };
+    const scheduleRefreshOrders = () => {
+      if (refreshTimer) window.clearTimeout(refreshTimer);
+      refreshTimer = window.setTimeout(refreshOrders, 350);
+    };
     refreshOrders();
-    const unsub = subscribeToOrders(refreshOrders);
+    const unsub = subscribeToOrders(scheduleRefreshOrders);
    return () => {
       active = false;
+      if (refreshTimer) window.clearTimeout(refreshTimer);
       unsub();
     };
   }, [realtimeOrders, ordersColRef, fbUser, startedAtMs, endedAtMs]);
@@ -6748,10 +7023,10 @@ const closeOpenSessionsAt = useCallback(
   },
   [setLastLocalEditAt]
 );
-const resetWorkerLog = () => {
-  const okAdmin = !!promptAdminAndPin();
+const resetWorkerLog = async () => {
+  const okAdmin = !!(await promptAdminAndPin());
   if (!okAdmin) return;
-  const phrase = window.prompt(
+  const phrase = await promptText(
     "Type RESET WORKER LOG to delete all worker sessions.",
     ""
   );
@@ -6852,8 +7127,8 @@ const workerMonthlyTotalPay = useMemo(
   () => workerMonthlyStats.reduce((s, r) => s + Number(r.pay || 0), 0),
   [workerMonthlyStats]
 );
-  const promptAdminAndPin = () => {
-    const adminStr = window.prompt("Enter Admin number (1 to 6):", "1");
+  const promptAdminAndPin = async () => {
+    const adminStr = await promptText("Enter Admin number (1 to 6):", "1");
     if (!adminStr) return null;
     const n = Number(adminStr);
     if (![1, 2, 3, 4, 5, 6].includes(n)) {
@@ -6862,7 +7137,7 @@ const workerMonthlyTotalPay = useMemo(
     }
 
 
-    const entered = window.prompt(`Enter PIN for Admin ${n}:`, "");
+    const entered = await promptText(`Enter PIN for Admin ${n}:`, "");
     if (entered == null) return null;
 
     const expected = norm(adminPins[n]);
@@ -6989,18 +7264,18 @@ const workerMonthlyTotalPay = useMemo(
     });
     setBulkRefillQty("");
   };
-  const handleBulkRemoveItem = (itemId) => {
+  const handleBulkRemoveItem = async (itemId) => {
     const target = (bulkInventoryItems || []).find((it) => it.id === itemId);
     if (!target) return;
-    const adminNum = promptAdminAndPin();
+    const adminNum = await promptAdminAndPin();
     if (!adminNum) return;
     if (!window.confirm(`Admin ${adminNum}: Remove ${target.name}?`)) return;
     setBulkInventoryItems((rows) => rows.filter((it) => it.id !== itemId));
     setBulkInventoryHistory((rows) => rows.filter((row) => row.itemId !== itemId));
     if (bulkRefillItemId === itemId) setBulkRefillItemId("");
   };
-  const handleBulkResetAll = () => {
-    const adminNum = promptAdminAndPin();
+  const handleBulkResetAll = async () => {
+    const adminNum = await promptAdminAndPin();
     if (!adminNum) return;
     if (!window.confirm(`Admin ${adminNum}: Reset all Bulk Inventory data?`)) return;
     setBulkInventoryItems([]);
@@ -7009,8 +7284,8 @@ const workerMonthlyTotalPay = useMemo(
     setBulkHistoryItemId("all");
   };
 
-  const resetAllCustomerContacts = () => {
-    const adminNum = promptAdminAndPin();
+  const resetAllCustomerContacts = async () => {
+    const adminNum = await promptAdminAndPin();
     if (!adminNum) return;
     if (
       !window.confirm(
@@ -7044,9 +7319,9 @@ const workerMonthlyTotalPay = useMemo(
     setInventoryLockedAt(new Date());
   };
 
-  const unlockInventoryWithPin = () => {
+  const unlockInventoryWithPin = async () => {
     if (!inventoryLocked) return alert("Inventory is already unlocked.");
-    const adminNum = promptAdminAndPin();
+    const adminNum = await promptAdminAndPin();
     if (!adminNum) return;
     if (!window.confirm(`Admin ${adminNum}: Unlock inventory for editing? Snapshot will be kept.`))
       return;
@@ -7058,7 +7333,7 @@ const workerMonthlyTotalPay = useMemo(
 const endDay = async () => {
     if (!dayMeta.startedAt || dayMeta.endedAt) return alert("Start an active shift first.");
 
-    const who = window.prompt("Enter your name to END THE DAY:", "");
+    const who = await promptText("Enter your name to END THE DAY:", "");
     const endBy = norm(who);
     if (!endBy) return alert("Name is required.");
 
@@ -7081,7 +7356,16 @@ const endDay = async () => {
       return;
     }
 
-    const savedReconciliation = latestReconciliationForCurrentDay;
+    const metaReconciledAt = dayMeta.reconciledAt ? new Date(dayMeta.reconciledAt) : null;
+    const savedReconciliation =
+      latestReconciliationForCurrentDay ||
+      (metaReconciledAt && !Number.isNaN(+metaReconciledAt)
+        ? {
+            id: dayMeta.reconciliationId || `rec_${currentDayId}`,
+            savedAt: metaReconciledAt,
+            reconciledAt: metaReconciledAt,
+          }
+        : null);
     const reconciliationSavedAt = savedReconciliation
       ? new Date(
           savedReconciliation.savedAt ||
@@ -7201,6 +7485,8 @@ const endDay = async () => {
     const closedSessions = closeOpenSessionsAt(endTime) || [];
     setOrders(clearedOrders);
     setNextOrderNo(1);
+    setInventoryLocked(false);
+    setInventoryLockedAt(null);
 
     const endedMeta = {
       ...dayMeta,
@@ -7213,7 +7499,22 @@ const endDay = async () => {
       updatedAt: nowIso(),
     };
     setDayMeta(endedMeta);
-    saveLocalPartial({ dayMeta: endedMeta });
+    saveLocalPartial(
+      {
+        orders: clearedOrders,
+        expenses: clearedExpenses,
+        workerSessions: closedSessions,
+        dayMeta: endedMeta,
+        bankTx: updatedBankTx,
+        nextOrderNo: 1,
+        inventoryLocked: false,
+        inventoryLockedAt: null,
+        historicalOrders: newHistoricalOrders,
+        historicalExpenses: newHistoricalExpenses,
+        historicalPurchases: newHistoricalPurchases,
+      },
+      { sections: [DAY_META_SECTION, WORKER_SESSIONS_SECTION, HISTORY_SECTION] }
+    );
     setLastLocalEditAt(Date.now());
 
     setReconCounts({});
@@ -7222,12 +7523,14 @@ const endDay = async () => {
     if (cloudEnabled && stateDocRef && fbUser) {
       try {
         await writeFullStateToCloud({
-          orders: realtimeOrders ? [] : clearedOrders,
+          orders: clearedOrders,
           expenses: clearedExpenses,
           workerSessions: closedSessions,
           dayMeta: endedMeta,
           bankTx: updatedBankTx,
           nextOrderNo: 1,
+          inventoryLocked: false,
+          inventoryLockedAt: null,
           historicalOrders: newHistoricalOrders,
           historicalExpenses: newHistoricalExpenses,
           historicalPurchases: newHistoricalPurchases,
@@ -7538,6 +7841,83 @@ const recordCustomerFromOrder = (order) => {
     return upsertCustomer(prev, updated);
   });
 };
+const buildCurrentReceiptOrder = () => {
+  const total = currentOrderTotal;
+  const itemsTotal = roundMoney(Math.max(0, cartItemsSubtotal - currentDiscountAmount));
+  const orderCustomerName =
+    orderType === "Delivery"
+      ? String(deliveryName || "").trim()
+      : String(customerName || "").trim();
+  const orderCustomerPhone =
+    orderType === "Delivery"
+      ? normalizePhone(deliveryPhone)
+      : normalizePhone(customerPhone);
+
+  let paymentLabel = payment || "Unspecified";
+  let paymentParts = [];
+  if (splitPay) {
+    if (payA) paymentParts.push({ method: payA, amount: Math.max(0, Number(amtA || 0)) });
+    if (payB) paymentParts.push({ method: payB, amount: Math.max(0, Number(amtB || 0)) });
+    paymentLabel = summarizePaymentParts(paymentParts, "Split");
+  } else {
+    paymentParts = [{ method: paymentLabel, amount: total }];
+    paymentLabel = summarizePaymentParts(paymentParts, paymentLabel);
+  }
+
+  let cashVal = null;
+  let changeDue = null;
+  if (splitPay) {
+    const cashPart = paymentParts.find((p) => p.method === "Cash");
+    if (cashPart) {
+      cashVal = Number(cashReceivedSplit || 0);
+      changeDue = Math.max(0, cashVal - Number(cashPart.amount || 0));
+    }
+  } else if (payment === "Cash") {
+    cashVal = Number(cashReceived || 0);
+    changeDue = Math.max(0, cashVal - total);
+  }
+
+  const now = new Date();
+  return enrichOrderWithChannel({
+    orderNo: nextOrderNo,
+    date: now,
+    createdAt: now,
+    updatedAt: now,
+    lastModifiedDeviceId: DEVICE_ID,
+    syncStatus: SYNC_STATUS.pending,
+    worker: worker || "Not selected",
+    payment: paymentLabel,
+    paymentParts,
+    orderType,
+    deliveryFee: currentDeliveryFee,
+    deliveryName: orderCustomerName,
+    deliveryPhone: orderCustomerPhone,
+    deliveryAddress: orderType === "Delivery" ? String(deliveryAddress || "").trim() : "",
+    deliveryZoneId: orderType === "Delivery" ? deliveryZoneId || "" : "",
+    notifyViaWhatsapp: false,
+    whatsappSentAt: null,
+    total,
+    itemsTotal,
+    discountPercentage: 0,
+    discountAmount: currentDiscountAmount,
+    cashReceived: cashVal,
+    changeDue,
+    cart,
+    done: false,
+    voided: false,
+    restockedAt: undefined,
+    note: orderNote.trim(),
+    source: "onsite",
+  });
+};
+const previewCurrentReceipt = async () => {
+  if (cart.length === 0) return alert("Cart is empty.");
+  await previewReceiptHTML(
+    buildCurrentReceiptOrder(),
+    Number(preferredPaperWidthMm) || 80,
+    "Preview"
+  );
+};
 const checkout = async () => {
   if (isCheckingOut) return;
   setIsCheckingOut(true);
@@ -7664,6 +8044,10 @@ const checkout = async () => {
     let order = enrichOrderWithChannel({
       orderNo: optimisticNo,
       date: new Date(),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      lastModifiedDeviceId: DEVICE_ID,
+      syncStatus: SYNC_STATUS.pending,
       worker,
       payment: paymentLabel,
       paymentParts,
@@ -7692,9 +8076,6 @@ const checkout = async () => {
       source: "onsite",
     });
     recordCustomerFromOrder(order);
-    if (autoPrintOnCheckout) {
-      printReceiptHTML(order, Number(preferredPaperWidthMm) || 80, "Customer");
-    }
     setNextOrderNo(optimisticNo + 1);
     let allocatedNo = optimisticNo;
     if (cloudEnabled && counterDocRef && fbUser) {
@@ -7712,20 +8093,23 @@ const checkout = async () => {
         console.warn("Atomic order number allocation failed, using optimistic number.", e);
       }
     }
-    if (!realtimeOrders) setOrders((o) => [order, ...o]);
+    setOrders((o) => dedupeOrders([order, ...o]));
     if (cloudEnabled && ordersColRef && fbUser) {
       try {
         const ref = await addOrder(order);
-        if (!realtimeOrders) {
-          setOrders((prev) =>
-            prev.map((oo) =>
-              oo.orderNo === order.orderNo ? { ...oo, cloudId: ref.id } : oo
-            )
-          );
-        }
+        setOrders((prev) =>
+          prev.map((oo) =>
+            oo.orderNo === order.orderNo ? { ...oo, cloudId: ref.id, syncStatus: SYNC_STATUS.synced } : oo
+          )
+        );
       } catch (e) {
         console.warn("Cloud order write failed:", e);
       }
+    }
+    if (autoPrintOnCheckout) {
+      void printReceiptHTML(order, Number(preferredPaperWidthMm) || 80, "Customer").catch((err) => {
+        console.warn("Receipt auto-print failed:", err);
+      });
     }
     setCart([]);
     setWorker("");
@@ -7945,6 +8329,10 @@ const onlineFallbackId =
   let posOrder = enrichOrderWithChannel({
     orderNo,
     date: new Date(),
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    lastModifiedDeviceId: DEVICE_ID,
+    syncStatus: SYNC_STATUS.pending,
     worker: dayMeta.currentWorker || "Online",
     payment: paymentLabel,
     paymentParts,
@@ -8193,18 +8581,16 @@ const onlineFallbackId =
     }
   }
 
-  if (!realtimeOrders) setOrders((o) => [posOrder, ...o]);
+  setOrders((o) => dedupeOrders([posOrder, ...o]));
   if (cloudEnabled && ordersColRef && fbUser) {
     try {
       const ref = await addOrder(posOrder);
       posOrder.cloudId = ref.id;
-      if (!realtimeOrders) {
-        setOrders((prev) =>
-          prev.map((ord) =>
-            ord.orderNo === posOrder.orderNo ? { ...ord, cloudId: ref.id } : ord
-          )
-        );
-      }
+      setOrders((prev) =>
+        prev.map((ord) =>
+          ord.orderNo === posOrder.orderNo ? { ...ord, cloudId: ref.id, syncStatus: SYNC_STATUS.synced } : ord
+        )
+      );
     } catch (err) {
       console.warn("Cloud write failed for online order integration:", err);
     }
@@ -8233,23 +8619,29 @@ const onlineFallbackId =
   return posOrder;
 };
 const markOrderDone = async (orderNo) => {
-  // If not live, update locally
-  if (!realtimeOrders) {
-    setOrders((o) =>
-      o.map((ordr) =>
-        ordr.orderNo !== orderNo || ordr.done
-          ? ordr
-          : { ...ordr, done: true }
-      )
-    );
-  }
+  const updatedAt = new Date().toISOString();
+  setOrders((o) =>
+    o.map((ordr) =>
+      ordr.orderNo !== orderNo || ordr.done
+        ? ordr
+        : {
+            ...ordr,
+            done: true,
+            updatedAt,
+            lastModifiedDeviceId: DEVICE_ID,
+            syncStatus: SYNC_STATUS.pending,
+          }
+    )
+  );
 
   try {
     if (!cloudEnabled || !ordersColRef || !fbUser) return;
     let targetId = orders.find((o) => o.orderNo === orderNo)?.cloudId;
     const payload = {
       done: true,
-      updatedAt: new Date().toISOString(),
+      updatedAt,
+      lastModifiedDeviceId: DEVICE_ID,
+      syncStatus: SYNC_STATUS.synced,
     };
     if (targetId) await updateOrderById(targetId, payload);
     else await updateOrderByOrderNo(orderNo, payload);
@@ -8316,7 +8708,7 @@ const voidOrderAndRestock = async (orderNo) => {
   if (ord.done) return alert("This order is DONE and cannot be cancelled.");
   if (ord.voided) return alert("This order is already cancelled/returned.");
 
-  const reasonRaw = window.prompt(
+  const reasonRaw = await promptText(
     `Reason for CANCEL (restock) — order #${orderNo}:`,
     ""
   );
@@ -8338,15 +8730,21 @@ const voidOrderAndRestock = async (orderNo) => {
   );
 
   const when = new Date();
-  if (!realtimeOrders) {
-    setOrders((o) =>
-      o.map((x) =>
-        x.orderNo === orderNo
-          ? { ...x, voided: true, restockedAt: when, voidReason: reason }
-          : x
-      )
-    );
-  }
+  setOrders((o) =>
+    o.map((x) =>
+      x.orderNo === orderNo
+        ? {
+            ...x,
+            voided: true,
+            restockedAt: when,
+            voidReason: reason,
+            updatedAt: when,
+            lastModifiedDeviceId: DEVICE_ID,
+            syncStatus: SYNC_STATUS.pending,
+          }
+        : x
+    )
+  );
 
   try {
     if (!cloudEnabled || !ordersColRef || !fbUser) return;
@@ -8356,6 +8754,8 @@ const voidOrderAndRestock = async (orderNo) => {
       voidReason: reason,
       restockedAt: toIso(when),
       updatedAt: new Date().toISOString(),
+      lastModifiedDeviceId: DEVICE_ID,
+      syncStatus: SYNC_STATUS.synced,
     };
     if (targetId) await updateOrderById(targetId, payload);
     else await updateOrderByOrderNo(orderNo, payload);
@@ -8371,7 +8771,7 @@ const voidOrderToExpense = async (orderNo) => {
   if (!isExpenseVoidEligible(ord.orderType)) {
     return alert("This action is only for non Dine-in / Take-Away orders.");
   }
-  const reasonRaw = window.prompt(
+  const reasonRaw = await promptText(
     `Reason for RETURN (no restock) — order #${orderNo}:`,
     ""
   );
@@ -8386,6 +8786,7 @@ const voidOrderToExpense = async (orderNo) => {
     `Void order #${orderNo} WITHOUT restock and add expense for wasted items (E£${itemsOnly.toFixed(2)})?`
   );
   if (!ok) return;
+  const when = new Date();
   const expRow = {
     id: `exp_ret_${orderNo}_${Date.now()}`,
     name: `Returned order #${orderNo} — ${ord.orderType || "-"}`,
@@ -8393,21 +8794,31 @@ const voidOrderToExpense = async (orderNo) => {
     qty: 1,
     unitPrice: itemsOnly,
     note: reason,
-    date: new Date(),
+    date: when,
     locked: true,
     source: "order_return",
     orderNo,
+    createdAt: when,
+    updatedAt: when,
+    lastModifiedDeviceId: DEVICE_ID,
+    syncStatus: SYNC_STATUS.pending,
   };
   setExpenses((arr) => [expRow, ...arr]);
-  if (!realtimeOrders) {
-    setOrders((o) =>
-      o.map((x) =>
-        x.orderNo === orderNo
-          ? { ...x, voided: true, restockedAt: undefined, voidReason: reason }
-          : x
-      )
-    );
-  }
+  setOrders((o) =>
+    o.map((x) =>
+      x.orderNo === orderNo
+        ? {
+            ...x,
+            voided: true,
+            restockedAt: undefined,
+            voidReason: reason,
+            updatedAt: when,
+            lastModifiedDeviceId: DEVICE_ID,
+            syncStatus: SYNC_STATUS.pending,
+          }
+        : x
+    )
+  );
 
   try {
     if (cloudEnabled && ordersColRef && fbUser) {
@@ -8416,6 +8827,8 @@ const voidOrderToExpense = async (orderNo) => {
         voided: true,
         voidReason: reason,
         updatedAt: new Date().toISOString(),
+        lastModifiedDeviceId: DEVICE_ID,
+        syncStatus: SYNC_STATUS.synced,
       };
       if (targetId) await updateOrderById(targetId, payload);
       else await updateOrderByOrderNo(orderNo, payload);
@@ -8445,15 +8858,15 @@ const voidOrderToExpense = async (orderNo) => {
   }, [reportFilter, reportDay, reportMonth, dayMeta]);
 
 
-  const resetReports = () => {
-    const adminNum = promptAdminAndPin();
+  const resetReports = async () => {
+    const adminNum = await promptAdminAndPin();
     if (!adminNum) return;
-    const phrase = window.prompt(
+    const phrase = await promptText(
       `Admin ${adminNum}: type RESET REPORT HISTORY to permanently clear reports.`,
       ""
     );
     if (String(phrase || "").trim() !== "RESET REPORT HISTORY") return;
-    const reason = String(window.prompt("Enter reset reason:", "") || "").trim();
+    const reason = String((await promptText("Enter reset reason:", "")) || "").trim();
     if (!reason) return alert("A reset reason is required.");
 
     const now = new Date();
@@ -9198,8 +9611,8 @@ if (targetItem) {
   setNewCategoryName("");
   setNewCategoryUnit("piece");
 };
-const resetAllPurchases = () => {
-  const okAdmin = !!promptAdminAndPin();
+const resetAllPurchases = async () => {
+  const okAdmin = !!(await promptAdminAndPin());
   if (!okAdmin) return;
   if (!window.confirm("Reset ALL purchases (cannot be undone)?")) return;
   setPurchases([]);
@@ -9510,10 +9923,10 @@ const endedStr   = m.endedAt   ? fmtDateTime(m.endedAt)   : "—";
     transition: "background 0.2s ease, color 0.2s ease",
   };
 
-const handleTabClick = (key) => {
+const handleTabClick = async (key) => {
   if (key === "admin") {
     if (!adminUnlocked) {
-      const ok = !!promptAdminAndPin(); // uses your existing Admin PINs (1..6)
+      const ok = !!(await promptAdminAndPin()); // uses your existing Admin PINs (1..6)
       if (!ok) return;                  // stay on current tab if PIN fails/cancelled
       setAdminUnlocked(true);
     }
@@ -11770,6 +12183,22 @@ const cogs = Number(
 
               <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                 <button
+                  type="button"
+                  onClick={previewCurrentReceipt}
+                  disabled={cart.length === 0}
+                  style={{
+                    background: cart.length === 0 ? "#bdbdbd" : "#1565c0",
+                    color: "white",
+                    border: "none",
+                    borderRadius: 8,
+                    padding: "10px 14px",
+                    cursor: cart.length === 0 ? "not-allowed" : "pointer",
+                    minWidth: 132,
+                  }}
+                >
+                  Preview Receipt
+                </button>
+                <button
                   onClick={checkout}
                   disabled={isCheckingOut}
                   style={{
@@ -12334,6 +12763,22 @@ const cogs = Number(
                         )}
 
                         {/* Single Print button (removed all other print options) */}
+                        <button
+                          onClick={() =>
+                            previewReceiptHTML(o, Number(preferredPaperWidthMm) || 80, "Preview")
+                          }
+                          disabled={o.voided}
+                          style={{
+                            background: o.voided ? "#5e35b188" : "#5e35b1",
+                            color: "white",
+                            border: "none",
+                            borderRadius: 6,
+                            padding: "6px 10px",
+                            cursor: o.voided ? "not-allowed" : "pointer",
+                          }}
+                        >
+                          Preview
+                        </button>
                         <button
                           onClick={() =>
                             printReceiptHTML(o, Number(preferredPaperWidthMm) || 80, "Customer")
@@ -14496,8 +14941,8 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
       ))}
 {/* Add this reset button */}
       <button
-        onClick={() => {
-          const okAdmin = !!promptAdminAndPin();
+        onClick={async () => {
+          const okAdmin = !!(await promptAdminAndPin());
           if (!okAdmin) return;
           if (!window.confirm("Reset ALL bank transactions? This cannot be undone.")) return;
           skipLockedBankReinsertRef.current = true;
@@ -16687,10 +17132,13 @@ setExtraList((arr) => [
     Sync to Cloud
   </button>
   <button onClick={loadFromCloud} style={{ background: "#1976d2", color: "#fff", border: "none", borderRadius: 6, padding: "6px 10px" }}>
-    Load from Cloud
+    Refresh/Sync
   </button>
   <small style={{ opacity: 0.8 }}>
     Last save: {cloudStatus.lastSaveAt ? cloudStatus.lastSaveAt.toLocaleString() : "—"} • Last load: {cloudStatus.lastLoadAt ? cloudStatus.lastLoadAt.toLocaleString() : "—"}
+  </small>
+  <small style={{ opacity: 0.8 }}>
+    Device: {DEVICE_ID} {isSupabaseConfigured ? "" : "Local mode"}
   </small>
   {cloudStatus.error && (
     <small style={{ color: "#c62828" }}>Error: {String(cloudStatus.error)}</small>

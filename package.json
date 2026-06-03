@@ -2,6 +2,8 @@
   "name": "burger-pos",
   "version": "0.1.0",
   "private": true,
+  "main": "electron/main.js",
+  "homepage": "./",
   "dependencies": {
     "@supabase/supabase-js": "^2.106.2",
     "@testing-library/dom": "^10.4.1",
@@ -16,10 +18,69 @@
     "web-vitals": "^2.1.4"
   },
   "scripts": {
+    "dev": "react-scripts start",
     "start": "react-scripts start",
     "build": "react-scripts build",
+    "electron": "concurrently -k \"npm:start\" \"npm:electron:dev\"",
+    "electron:dev": "wait-on http://localhost:3000 && cross-env ELECTRON_START_URL=http://localhost:3000 electron .",
+    "package": "npm run build && electron-builder --win dir --publish never",
+    "dist": "npm run build && electron-builder --win nsis portable --publish never",
     "test": "react-scripts test",
     "eject": "react-scripts eject"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "electron": "^39.2.7",
+    "electron-builder": "^26.0.12",
+    "wait-on": "^9.0.3"
+  },
+  "build": {
+    "extends": null,
+    "appId": "com.tuxcashier.windows",
+    "productName": "TUX Cashier",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "build/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "supabase/schema.sql",
+        "to": "supabase/schema.sql"
+      }
+    ],
+    "win": {
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "artifactName": "TUX Cashier Setup.exe",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "TUX Cashier"
+    },
+    "portable": {
+      "artifactName": "TUX Cashier Portable.exe"
+    }
   },
   "eslintConfig": {
     "extends": [
