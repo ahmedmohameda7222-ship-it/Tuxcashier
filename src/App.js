@@ -3187,6 +3187,68 @@ async function loadOrders(startDate, endDate) {
   return (data || []).map(orderFromSupabaseRow);
 }
 
+async function loadCompleteCloudState() {
+  const warnings = [];
+  let remoteState = null;
+  let cloudOrders = [];
+  let counterLastOrderNo = 0;
+
+  try {
+    remoteState = await loadPosState();
+  } catch (err) {
+    warnings.push(`pos_state read failed: ${String(err?.message || err)}`);
+  }
+
+  try {
+    // Important: no date filter here. Manual Load from Cloud must recover all
+    // cloud orders even when local dayMeta is empty, stale, or overwritten.
+    cloudOrders = await loadOrders();
+  } catch (err) {
+    warnings.push(`orders read failed: ${String(err?.message || err)}`);
+  }
+
+  try {
+    counterLastOrderNo = await loadCounter();
+  } catch (err) {
+    warnings.push(`counter read failed: ${String(err?.message || err)}`);
+  }
+
+  if (!remoteState && !cloudOrders.length) {
+    if (warnings.length) throw new Error(warnings.join(" | "));
+    return null;
+  }
+
+  const snapshot = remoteState && typeof remoteState === "object" ? { ...remoteState } : {};
+  const stateOrders = Array.isArray(snapshot.orders) ? snapshot.orders : [];
+  const mergedOrders = dedupeOrders([...stateOrders, ...cloudOrders]).map(enrichOrderWithChannel);
+
+  // The orders table is authoritative for active/current orders. This prevents
+  // an empty pos_state.orders array from hiding orders that still exist in Supabase.
+  snapshot.orders = mergedOrders;
+
+  const maxLoadedOrderNo = mergedOrders.reduce((max, order) => {
+    const n = Number(order?.orderNo || 0);
+    return Number.isFinite(n) ? Math.max(max, n) : max;
+  }, 0);
+  const nextCandidates = [
+    Number(snapshot.nextOrderNo || 0),
+    Number(counterLastOrderNo || 0) + 1,
+    maxLoadedOrderNo + 1,
+  ].filter((n) => Number.isFinite(n) && n > 0);
+  if (nextCandidates.length) snapshot.nextOrderNo = Math.max(...nextCandidates);
+
+  snapshot.updatedAt = snapshot.updatedAt || nowIso();
+  snapshot.__cloudLoadMeta = {
+    posStateFound: Boolean(remoteState),
+    ordersLoadedFromOrdersTable: cloudOrders.length,
+    totalOrdersLoaded: mergedOrders.length,
+    counterLastOrderNo: Number(counterLastOrderNo || 0),
+    warnings,
+  };
+
+  return snapshot;
+}
+
 function subscribeToOrders(callback) {
   const channel = supabase
     .channel(`orders-${SHOP_ID}`)
@@ -5363,7 +5425,9 @@ const applyRemoteState = useCallback(
     const unpacked = unpackStateFromCloud(rawData, dayMeta);
     const localState = loadLocal();
 
-    if (!realtimeOrders && unpacked.orders) setOrders(unpacked.orders);
+    if (unpacked.orders && (force || !realtimeOrders)) {
+      setOrders(dedupeOrders(unpacked.orders).map(enrichOrderWithChannel));
+    }
     if (unpacked.inventory) setInventory(unpacked.inventory);
     applyBulkInventoryFromCloud(unpacked.bulkInventoryItems, unpacked.bulkInventoryHistory);
     if (unpacked.nextOrderNo != null) setNextOrderNo(unpacked.nextOrderNo);
@@ -5515,10 +5579,15 @@ const applyRemoteState = useCallback(
     if (!stateDocRef || !fbUser || hydrated) return;
     (async () => {
       try {
-        const data = await loadPosState();
+        const data = await loadCompleteCloudState();
         if (data) {
           applyRemoteState(data);
-          setCloudStatus((s) => ({ ...s, lastLoadAt: new Date(), error: null }));
+          const warnings = data.__cloudLoadMeta?.warnings || [];
+          setCloudStatus((s) => ({
+            ...s,
+            lastLoadAt: new Date(),
+            error: warnings.length ? warnings.join(" | ") : null,
+          }));
         }
       } catch (e) {
         console.warn("Initial cloud load failed:", e);
@@ -5554,23 +5623,49 @@ if (ts && lastLocalEditAt && ts < lastLocalEditAt) return;
 
   return () => unsub();
 }, [cloudEnabled, stateDocRef, fbUser, lastAppliedCloudAt, lastLocalEditAt, applyRemoteState]);
-  // Manual pull
+  // Manual pull: read-only. It loads pos_state plus every row from the orders table.
   const loadFromCloud = async () => {
     if (!stateDocRef || !fbUser) return alert("Supabase not ready.");
     try {
-      const data = await loadPosState();
-      if (!data) return alert("No cloud state yet to load.");
+      const data = await loadCompleteCloudState();
+      if (!data) return alert("No cloud data yet to load.");
       applyRemoteState(data, { force: true });
-      setCloudStatus((s) => ({ ...s, lastLoadAt: new Date(), error: null }));
-      alert("Loaded from cloud ✔");
+      const warnings = data.__cloudLoadMeta?.warnings || [];
+      const totalOrdersLoaded = Number(data.__cloudLoadMeta?.totalOrdersLoaded || 0);
+      setCloudStatus((s) => ({
+        ...s,
+        lastLoadAt: new Date(),
+        error: warnings.length ? warnings.join(" | ") : null,
+      }));
+      alert(
+        `Loaded from cloud ✔
+Orders loaded: ${totalOrdersLoaded}` +
+          (warnings.length ? `
+Warnings: ${warnings.join(" | ")}` : "")
+      );
+      return true;
     } catch (e) {
-      setCloudStatus((s) => ({ ...s, error: String(e) }));
-      alert("Cloud load failed: " + e);
+      const message = String(e?.message || e);
+      setCloudStatus((s) => ({ ...s, error: message }));
+      alert("Cloud load failed: " + message);
+      return false;
     }
  };
  const saveToCloudNow = async () => {
   if (!stateDocRef || !fbUser) return alert("Supabase not ready.");
   try {
+    const cloudOrders = await loadOrders().catch((err) => {
+      console.warn("Pre-sync cloud order safety check failed:", err);
+      return [];
+    });
+    if ((!orders || orders.length === 0) && cloudOrders.length > 0) {
+      const message =
+        `Sync blocked for safety. This local app has 0 orders, but Supabase has ${cloudOrders.length} active order(s). ` +
+        "Press Load from Cloud first. This prevents an empty app from overwriting cloud state.";
+      setCloudStatus((s) => ({ ...s, error: message }));
+      alert(message);
+      return false;
+    }
     await writeFullStateToCloud();
     /*
     const bodyBase = packStateForCloud({
@@ -5726,24 +5821,28 @@ useEffect(() => {
     : null;
   useEffect(() => {
     if (!realtimeOrders || !ordersColRef || !fbUser) return;
-    if (!startedAtMs) {
-      setOrders([]);
-      return;
-    }
     let active = true;
+    let refreshTimer = null;
     const refreshOrders = async () => {
       try {
-        const arr = await loadOrders(new Date(startedAtMs), endedAtMs ? new Date(endedAtMs) : null);
+        const arr = startedAtMs
+          ? await loadOrders(new Date(startedAtMs), endedAtMs ? new Date(endedAtMs) : null)
+          : await loadOrders();
         if (active) setOrders(dedupeOrders(arr).map(enrichOrderWithChannel));
       } catch (err) {
         console.warn("Realtime orders load failed:", err);
         setCloudStatus((s) => ({ ...s, error: String(err) }));
       }
     };
+    const scheduleRefreshOrders = () => {
+      if (refreshTimer) window.clearTimeout(refreshTimer);
+      refreshTimer = window.setTimeout(refreshOrders, 350);
+    };
     refreshOrders();
-    const unsub = subscribeToOrders(refreshOrders);
+    const unsub = subscribeToOrders(scheduleRefreshOrders);
    return () => {
       active = false;
+      if (refreshTimer) window.clearTimeout(refreshTimer);
       unsub();
     };
   }, [realtimeOrders, ordersColRef, fbUser, startedAtMs, endedAtMs]);
