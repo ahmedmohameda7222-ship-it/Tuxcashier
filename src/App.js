@@ -1,10 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
-import { isSupabaseConfigured, supabase } from "./supabaseClient";
-import { getDeviceId } from "./services/deviceId";
-import { loadLocalState, saveLocalState } from "./services/localStore";
-import { shouldAttemptOnlineSync, SYNC_STATUS } from "./services/syncManager";
+import { supabase } from "./supabaseClient";
 
 export const toIso = (v) => {
   if (!v) return null;
@@ -490,7 +487,6 @@ const POS_STATE_ID = "pos";
 const ONLINE_ORDER_COLLECTIONS = [];
 
 const LS_KEY = "tux_pos_local_state_v1";
-const DEVICE_ID = getDeviceId();
 export function nowIso() {
   return new Date().toISOString();
 }
@@ -609,8 +605,6 @@ function stampRecord(record, stamp = nowIso(), fallbackPrefix = "row", index = 0
     id: record.id || getStableRecordKey(record, fallbackPrefix, index),
     createdAt,
     updatedAt: record.updatedAt || stamp,
-    lastModifiedDeviceId: record.lastModifiedDeviceId || DEVICE_ID,
-    syncStatus: record.syncStatus || SYNC_STATUS.pending,
   };
 }
 
@@ -659,16 +653,6 @@ function shouldApplyRemoteSection(localState = {}, remoteState = {}, section, op
   return allowLegacyWhenLocalEmpty && !hasAnyValueForKeys(localState, keys);
 }
 
-function shouldApplyRemoteKey(localState = {}, remoteState = {}, key, options = {}) {
-  return shouldApplyRemoteSection(localState, remoteState, options.section || sectionForKey(key), {
-    keys: options.keys || [key],
-    allowLegacyWhenLocalEmpty:
-      options.allowLegacyWhenLocalEmpty === undefined
-        ? true
-        : options.allowLegacyWhenLocalEmpty,
-  });
-}
-
 function addSectionUpdatedAt(base = {}, sections = [], stamp = nowIso()) {
   const next = { ...(base || {}) };
   for (const section of sections) {
@@ -679,7 +663,10 @@ function addSectionUpdatedAt(base = {}, sections = [], stamp = nowIso()) {
 
 function loadLocal() {
 
-  return loadLocalState(LS_KEY);
+  try { 
+    return JSON.parse(localStorage.getItem(LS_KEY) || "{}"); 
+  }
+  catch { return {}; }
 }
 function saveLocalPartial(patch, options = {}) {
   try {
@@ -713,11 +700,8 @@ function saveLocalPartial(patch, options = {}) {
     if (options.resetMarker) {
       next.resetMarkers = [...(Array.isArray(cur.resetMarkers) ? cur.resetMarkers : []), options.resetMarker];
     }
-    next.updatedAt = stamp;
-    next.lastModifiedDeviceId = DEVICE_ID;
-    next.syncStatus = options.syncedFromCloud ? SYNC_STATUS.synced : options.syncStatus || SYNC_STATUS.pending;
-    next.pendingSync = !options.syncedFromCloud;
-    return saveLocalState(LS_KEY, next);
+    localStorage.setItem(LS_KEY, JSON.stringify(next));
+    return true;
   } catch (err) {
     console.warn("Local save failed:", err);
     return false;
@@ -1356,13 +1340,11 @@ export function packStateForCloud(state) {
   const localSectionUpdatedAt = loadLocal()?.[SECTION_UPDATED_AT_KEY] || {};
   const purchases = Array.isArray(state.purchases)
     ? state.purchases.map((p) => ({
-      ...p,
-      id: p.id || getStableRecordKey(p, "purchase"),
-      createdAt: toIso(p.createdAt || p.date || stamp),
-      updatedAt: toIso(p.updatedAt || stamp),
-      lastModifiedDeviceId: p.lastModifiedDeviceId || DEVICE_ID,
-      syncStatus: p.syncStatus || SYNC_STATUS.pending,
-      date: toIso(p.date),
+        ...p,
+        id: p.id || getStableRecordKey(p, "purchase"),
+        createdAt: toIso(p.createdAt || p.date || stamp),
+        updatedAt: toIso(p.updatedAt || stamp),
+        date: toIso(p.date),
       }))
     : [];
   const purchaseCategories = Array.isArray(state.purchaseCategories)
@@ -1374,27 +1356,18 @@ export function packStateForCloud(state) {
         lastOrderAt: toIso(c.lastOrderAt),
         firstOrderAt: toIso(c.firstOrderAt),
         updatedAt: toIso(c.updatedAt),
-        lastModifiedDeviceId: c.lastModifiedDeviceId || DEVICE_ID,
-        syncStatus: c.syncStatus || SYNC_STATUS.pending,
       }))
     : [];
   const deliveryZones = Array.isArray(state.deliveryZones)
     ? state.deliveryZones
     : [];
   const payload = {
-    id: POS_STATE_ID,
-    deviceId: state.deviceId || DEVICE_ID,
-    lastModifiedDeviceId: state.lastModifiedDeviceId || DEVICE_ID,
-    syncStatus: state.syncStatus || SYNC_STATUS.pending,
-    pendingSync: Boolean(state.pendingSync),
  workerProfiles,
     workerSessions: (workerSessions || []).map((session) => ({
       ...session,
       id: session.id || getStableRecordKey(session, "worker_session"),
       createdAt: toIso(session.createdAt || session.signInAt || stamp),
       updatedAt: toIso(session.updatedAt || session.signOutAt || session.endedAt || stamp),
-      lastModifiedDeviceId: session.lastModifiedDeviceId || DEVICE_ID,
-      syncStatus: session.syncStatus || SYNC_STATUS.pending,
       signInAt: toIso(session.signInAt),
       signOutAt: toIso(session.signOutAt),
       endAt: toIso(session.endAt),
@@ -1417,16 +1390,10 @@ export function packStateForCloud(state) {
       id: o.id || getStableRecordKey(o, "order"),
       createdAt: toIso(o.createdAt || o.date || stamp),
       updatedAt: toIso(o.updatedAt || o.restockedAt || stamp),
-      lastModifiedDeviceId: o.lastModifiedDeviceId || DEVICE_ID,
-      syncStatus: o.syncStatus || SYNC_STATUS.pending,
       date: toIso(o.date),
       restockedAt: toIso(o.restockedAt),
     })),
     inventory,
-    inventoryLedger: Array.isArray(state.inventoryLedger) ? state.inventoryLedger.map(il => ({
-      ...il,
-      id: il.id || getStableRecordKey(il, "inv_ledger")
-    })) : [],
     bulkInventoryItems: Array.isArray(bulkInventoryItems) ? bulkInventoryItems : [],
     bulkInventoryHistory: Array.isArray(bulkInventoryHistory) ? bulkInventoryHistory : [],
     nextOrderNo,
@@ -1444,8 +1411,6 @@ export function packStateForCloud(state) {
       id: e.id || getStableRecordKey(e, "expense"),
       createdAt: toIso(e.createdAt || e.date || stamp),
       updatedAt: toIso(e.updatedAt || stamp),
-      lastModifiedDeviceId: e.lastModifiedDeviceId || DEVICE_ID,
-      syncStatus: e.syncStatus || SYNC_STATUS.pending,
       date: toIso(e.date),
     })),
     purchases,
@@ -1461,8 +1426,6 @@ export function packStateForCloud(state) {
           resetAt: toIso(dayMeta.resetAt),
           reconciledAt: toIso(dayMeta.reconciledAt),
           updatedAt: toIso(dayMeta.updatedAt || stamp),
-          lastModifiedDeviceId: dayMeta.lastModifiedDeviceId || DEVICE_ID,
-          syncStatus: dayMeta.syncStatus || SYNC_STATUS.pending,
           shiftChanges: Array.isArray(dayMeta.shiftChanges)
             ? dayMeta.shiftChanges.map((c) => ({
                 ...c,
@@ -1476,8 +1439,6 @@ export function packStateForCloud(state) {
       id: t.id || getStableRecordKey(t, "bank_tx"),
       createdAt: toIso(t.createdAt || t.date || stamp),
       updatedAt: toIso(t.updatedAt || stamp),
-      lastModifiedDeviceId: t.lastModifiedDeviceId || DEVICE_ID,
-      syncStatus: t.syncStatus || SYNC_STATUS.pending,
       date: toIso(t.date),
     })),
    reconHistory: (reconHistory || []).map((r) => ({
@@ -1485,8 +1446,6 @@ export function packStateForCloud(state) {
       id: r.id || getStableRecordKey(r, "reconciliation"),
       createdAt: toIso(r.createdAt || r.savedAt || r.reconciledAt || r.at || stamp),
       updatedAt: toIso(r.updatedAt || r.savedAt || r.reconciledAt || stamp),
-      lastModifiedDeviceId: r.lastModifiedDeviceId || DEVICE_ID,
-      syncStatus: r.syncStatus || SYNC_STATUS.pending,
       at: toIso(r.at),
       savedAt: toIso(r.savedAt),
       reconciledAt: toIso(r.reconciledAt),
@@ -1531,33 +1490,27 @@ export function packStateForCloud(state) {
       : undefined,
     historicalOrders: Array.isArray(historicalOrders)
       ? stampRecords(historicalOrders, stamp, "historical_order").map((o) => ({
-        ...o,
-        createdAt: toIso(o?.createdAt || o?.date || stamp),
-        updatedAt: toIso(o?.updatedAt || stamp),
-        lastModifiedDeviceId: o?.lastModifiedDeviceId || DEVICE_ID,
-        syncStatus: o?.syncStatus || SYNC_STATUS.pending,
-        date: toIso(o?.date),
-        restockedAt: toIso(o?.restockedAt),
+          ...o,
+          createdAt: toIso(o?.createdAt || o?.date || stamp),
+          updatedAt: toIso(o?.updatedAt || stamp),
+          date: toIso(o?.date),
+          restockedAt: toIso(o?.restockedAt),
         }))
       : [],
     historicalExpenses: Array.isArray(historicalExpenses)
       ? stampRecords(historicalExpenses, stamp, "historical_expense").map((e) => ({
-        ...e,
-        createdAt: toIso(e?.createdAt || e?.date || stamp),
-        updatedAt: toIso(e?.updatedAt || stamp),
-        lastModifiedDeviceId: e?.lastModifiedDeviceId || DEVICE_ID,
-        syncStatus: e?.syncStatus || SYNC_STATUS.pending,
-        date: toIso(e?.date),
+          ...e,
+          createdAt: toIso(e?.createdAt || e?.date || stamp),
+          updatedAt: toIso(e?.updatedAt || stamp),
+          date: toIso(e?.date),
         }))
       : [],
     historicalPurchases: Array.isArray(historicalPurchases)
       ? stampRecords(historicalPurchases, stamp, "historical_purchase").map((p) => ({
-        ...p,
-        createdAt: toIso(p?.createdAt || p?.date || stamp),
-        updatedAt: toIso(p?.updatedAt || stamp),
-        lastModifiedDeviceId: p?.lastModifiedDeviceId || DEVICE_ID,
-        syncStatus: p?.syncStatus || SYNC_STATUS.pending,
-        date: toIso(p?.date),
+          ...p,
+          createdAt: toIso(p?.createdAt || p?.date || stamp),
+          updatedAt: toIso(p?.updatedAt || stamp),
+          date: toIso(p?.date),
         }))
       : [],
     reportFilter: typeof reportFilter === "string" ? reportFilter : undefined,
@@ -1657,9 +1610,7 @@ if (Array.isArray(data.orders)) {
       date: t.date ? new Date(t.date) : new Date(),
     }));
   }
-  if (Object.prototype.hasOwnProperty.call(data, "inventoryLockedAt")) {
-    out.inventoryLockedAt = data.inventoryLockedAt ? new Date(data.inventoryLockedAt) : null;
-  }
+  if (data.inventoryLockedAt) out.inventoryLockedAt = new Date(data.inventoryLockedAt);
   if (data.dayMeta) {
     out.dayMeta = {
       startedBy: data.dayMeta.startedBy || "",
@@ -1729,7 +1680,6 @@ if (Array.isArray(data.orders)) {
   if (data.extras) out.extraList = normalizeExtraList(data.extras);
   if (data.beverages) out.beverageList = normalizeBeverageList(data.beverages);
   if (data.inventory) out.inventory = data.inventory;
-  if (Array.isArray(data.inventoryLedger)) out.inventoryLedger = data.inventoryLedger;
   if (Array.isArray(data.bulkInventoryItems)) out.bulkInventoryItems = data.bulkInventoryItems;
   if (Array.isArray(data.bulkInventoryHistory)) out.bulkInventoryHistory = data.bulkInventoryHistory;
   if (typeof data.nextOrderNo === "number") out.nextOrderNo = data.nextOrderNo;
@@ -1866,8 +1816,6 @@ function normalizeOrderForSupabase(order) {
     online_source_doc_id: normalized.onlineSourceDocId || "",
     channel: normalized.channel || "",
     channel_order_no: normalized.channelOrderNo || "",
-    last_modified_device_id: normalized.lastModifiedDeviceId || DEVICE_ID,
-    sync_status: normalized.syncStatus || SYNC_STATUS.pending,
     created_at: toIso(normalized.createdAt) || new Date().toISOString(),
     updated_at: new Date().toISOString(),
   });
@@ -1915,8 +1863,6 @@ function orderFromSupabaseRow(row = {}) {
     onlineSourceDocId: row.online_source_doc_id || "",
     channel: row.channel || "",
     channelOrderNo: row.channel_order_no || "",
-    lastModifiedDeviceId: row.last_modified_device_id || DEVICE_ID,
-    syncStatus: row.sync_status || SYNC_STATUS.synced,
   };
   return enrichOrderWithChannel(order);
 }
@@ -3173,17 +3119,15 @@ function posStateFromRow(row) {
     ...state,
     updatedAt: row.updated_at || state.updatedAt,
     writerId: row.writer_id || state.writerId,
-    lastModifiedDeviceId: row.last_modified_device_id || state.lastModifiedDeviceId,
     writeSeq: Number(row.write_seq || state.writeSeq || 0),
     clientTime: row.client_time ?? state.clientTime,
   };
 }
 
 async function loadPosState() {
-  if (!supabase) throw new Error("Supabase is not configured.");
   const { data, error } = await supabase
     .from("pos_state")
-    .select("state, updated_at, writer_id, last_modified_device_id, write_seq, client_time")
+    .select("state, updated_at, writer_id, write_seq, client_time")
     .eq("id", POS_STATE_ID)
     .eq("shop_id", SHOP_ID)
     .maybeSingle();
@@ -3191,42 +3135,22 @@ async function loadPosState() {
   return posStateFromRow(data);
 }
 
-async function savePosStateOptimistic(state, expectedSeq) {
-  if (!supabase) throw new Error("Supabase is not configured.");
+async function savePosState(state) {
   const safeState = sanitizeForSupabase(state || {});
   const row = {
     id: POS_STATE_ID,
     shop_id: SHOP_ID,
     state: safeState,
     writer_id: safeState?.writerId || null,
-    last_modified_device_id: safeState?.lastModifiedDeviceId || safeState?.deviceId || DEVICE_ID,
     write_seq: Number(safeState?.writeSeq || 0),
     client_time: safeState?.clientTime != null ? Number(safeState.clientTime) : null,
     updated_at: new Date().toISOString(),
   };
-
-  if (!expectedSeq) {
-    const { error } = await supabase.from("pos_state").upsert(row, { onConflict: "id" });
-    if (error) throw error;
-    return true;
-  }
-
-  const { data, error } = await supabase
-    .from("pos_state")
-    .update(row)
-    .eq("id", POS_STATE_ID)
-    .eq("write_seq", expectedSeq)
-    .select("id");
-
+  const { error } = await supabase.from("pos_state").upsert(row, { onConflict: "id" });
   if (error) throw error;
-  if (!data || data.length === 0) {
-    return false; // OCC Conflict
-  }
-  return true;
 }
 
 function subscribeToPosState(callback) {
-  if (!supabase) return () => {};
   const channel = supabase
     .channel(`pos-state-${SHOP_ID}`)
     .on(
@@ -3247,7 +3171,6 @@ function subscribeToPosState(callback) {
 }
 
 async function loadOrders(startDate, endDate) {
-  if (!supabase) throw new Error("Supabase is not configured.");
   let request = supabase
     .from("orders")
     .select("*")
@@ -3264,72 +3187,7 @@ async function loadOrders(startDate, endDate) {
   return (data || []).map(orderFromSupabaseRow);
 }
 
-async function loadCompleteCloudState() {
-  if (!supabase) throw new Error("Supabase is not configured.");
-
-  const warnings = [];
-  let remoteState = null;
-  let cloudOrders = [];
-  let counterLastOrderNo = 0;
-
-  try {
-    remoteState = await loadPosState();
-  } catch (err) {
-    warnings.push(`pos_state read failed: ${String(err?.message || err)}`);
-  }
-
-  try {
-    // Important: no date filter here. Manual Refresh/Sync must recover all active
-    // cloud orders even when local dayMeta is empty, stale, or was overwritten.
-    cloudOrders = await loadOrders();
-  } catch (err) {
-    warnings.push(`orders read failed: ${String(err?.message || err)}`);
-  }
-
-  try {
-    counterLastOrderNo = await loadCounter();
-  } catch (err) {
-    warnings.push(`counter read failed: ${String(err?.message || err)}`);
-  }
-
-  if (!remoteState && !cloudOrders.length) {
-    if (warnings.length) throw new Error(warnings.join(" | "));
-    return null;
-  }
-
-  const snapshot = remoteState && typeof remoteState === "object" ? { ...remoteState } : {};
-  const stateOrders = Array.isArray(snapshot.orders) ? snapshot.orders : [];
-  const mergedOrders = dedupeOrders([...stateOrders, ...cloudOrders]).map(enrichOrderWithChannel);
-
-  // The orders table is authoritative for current active orders. This prevents an
-  // empty pos_state.orders array from hiding orders that still exist in Supabase.
-  snapshot.orders = mergedOrders;
-
-  const maxLoadedOrderNo = mergedOrders.reduce((max, order) => {
-    const n = Number(order?.orderNo || 0);
-    return Number.isFinite(n) ? Math.max(max, n) : max;
-  }, 0);
-  const nextCandidates = [
-    Number(snapshot.nextOrderNo || 0),
-    Number(counterLastOrderNo || 0) + 1,
-    maxLoadedOrderNo + 1,
-  ].filter((n) => Number.isFinite(n) && n > 0);
-  if (nextCandidates.length) snapshot.nextOrderNo = Math.max(...nextCandidates);
-
-  snapshot.updatedAt = snapshot.updatedAt || nowIso();
-  snapshot.__cloudLoadMeta = {
-    posStateFound: Boolean(remoteState),
-    ordersLoadedFromOrdersTable: cloudOrders.length,
-    totalOrdersLoaded: mergedOrders.length,
-    counterLastOrderNo: Number(counterLastOrderNo || 0),
-    warnings,
-  };
-
-  return snapshot;
-}
-
 function subscribeToOrders(callback) {
-  if (!supabase) return () => {};
   const channel = supabase
     .channel(`orders-${SHOP_ID}`)
     .on(
@@ -3350,7 +3208,6 @@ function subscribeToOrders(callback) {
 }
 
 async function addOrder(order) {
-  if (!supabase) throw new Error("Supabase is not configured.");
   const { data, error } = await supabase
     .from("orders")
     .insert(normalizeOrderForSupabase(order))
@@ -3387,8 +3244,6 @@ function normalizeOrderPatchForSupabase(patch = {}) {
     onlineSourceCollection: "online_source_collection",
     onlineSourceDocId: "online_source_doc_id",
     channelOrderNo: "channel_order_no",
-    lastModifiedDeviceId: "last_modified_device_id",
-    syncStatus: "sync_status",
     createdAt: "created_at",
     updatedAt: "updated_at",
   };
@@ -3411,13 +3266,10 @@ function normalizeOrderPatchForSupabase(patch = {}) {
     }
   }
   if (!row.updated_at) row.updated_at = new Date().toISOString();
-  if (!row.last_modified_device_id) row.last_modified_device_id = DEVICE_ID;
-  if (!row.sync_status) row.sync_status = SYNC_STATUS.pending;
   return sanitizeForSupabase(row);
 }
 
 async function updateOrderById(id, patch) {
-  if (!supabase) throw new Error("Supabase is not configured.");
   if (!id) return null;
   const { data, error } = await supabase
     .from("orders")
@@ -3431,7 +3283,6 @@ async function updateOrderById(id, patch) {
 }
 
 async function updateOrderByOrderNo(orderNo, patch) {
-  if (!supabase) throw new Error("Supabase is not configured.");
   const { data, error } = await supabase
     .from("orders")
     .update(normalizeOrderPatchForSupabase(patch))
@@ -3443,7 +3294,6 @@ async function updateOrderByOrderNo(orderNo, patch) {
 }
 
 async function purgeOrdersInRange(startDate, endDate) {
-  if (!supabase) return 0;
   try {
     let selectReq = supabase
       .from("orders")
@@ -3472,7 +3322,6 @@ async function purgeOrdersInRange(startDate, endDate) {
 }
 
 async function allocateOrderNoAtomic() {
-  if (!supabase) throw new Error("Supabase is not configured.");
   const { data, error } = await supabase.rpc("allocate_order_no", {
     p_shop_id: SHOP_ID,
   });
@@ -3481,7 +3330,6 @@ async function allocateOrderNoAtomic() {
 }
 
 async function resetOrderCounter(lastOrderNo = 0) {
-  if (!supabase) throw new Error("Supabase is not configured.");
   const { data, error } = await supabase.rpc("reset_order_counter", {
     p_shop_id: SHOP_ID,
     p_last_order_no: Number(lastOrderNo || 0),
@@ -3491,7 +3339,6 @@ async function resetOrderCounter(lastOrderNo = 0) {
 }
 
 async function loadCounter() {
-  if (!supabase) throw new Error("Supabase is not configured.");
   const { data, error } = await supabase
     .from("counters")
     .select("last_order_no")
@@ -3502,7 +3349,6 @@ async function loadCounter() {
 }
 
 function subscribeToCounter(callback) {
-  if (!supabase) return () => {};
   const channel = supabase
     .channel(`counter-${SHOP_ID}`)
     .on(
@@ -3586,47 +3432,8 @@ function findDefByLine(line, defs){
   return null;
 }
 
-function resolveReceiptAssetUrl(assetName) {
-  const cleanName = String(assetName || "").replace(/^\/+/, "");
-  if (!cleanName) return "";
-  if (typeof window === "undefined" || !window.location) return `/${cleanName}`;
-  try {
-    const isFileProto = window.location.protocol === "file:";
-    if (isFileProto) {
-      const url = new URL(cleanName, window.location.href);
-      return url.href;
-    }
-    return new URL(cleanName, window.location.href).href;
-  } catch {
-    return `/${cleanName}`;
-  }
-}
-
-function resolveReceiptImages(images = {}) {
-  return {
-    logo: images.logo || resolveReceiptAssetUrl("tuxlogo.jpg"),
-    menuQr: images.menuQr || resolveReceiptAssetUrl("menu-qr.jpg"),
-    deliveryLogo: images.deliveryLogo || resolveReceiptAssetUrl("delivery-logo.jpg"),
-  };
-}
-
-function getReceiptPrinterBridge() {
-  if (typeof window === "undefined") return null;
-  return window.tuxCashierPrinter || null;
-}
-
-async function promptText(message, defaultValue = "") {
-  const dialogBridge =
-    typeof window !== "undefined" ? window.tuxCashierDialogs : null;
-  if (dialogBridge?.prompt) {
-    return dialogBridge.prompt(message, defaultValue);
-  }
-  return window.prompt(message, defaultValue);
-}
-
-function buildReceiptHTML(order, widthMm = 80, copy = "Customer", images = {}) {
+function buildReceiptHTML(order, widthMm = 80) {
   const m = Math.max(0, Math.min(4, 4)); // padding mm
-  const receiptImages = resolveReceiptImages(images);
   const currency = (v) => `E£${Number(v || 0).toFixed(2)}`;
   const dt = new Date(order.date);
   const orderDateStr = fmtDate(dt);
@@ -3740,7 +3547,7 @@ const cashBlock = (() => {
 <html>
 <head>
 <meta charset="utf-8">
-<title>${escHtml(copy || "Receipt")} Receipt</title>
+<title>Receipt</title>
 <style>
   @page { size: ${widthMm}mm auto; margin: 0; }
   html, body { margin: 0; padding: 0; }
@@ -3808,7 +3615,7 @@ const cashBlock = (() => {
 </head>
 <body>
   <div class="receipt">
-    <div class="brand"><img src="${escHtml(receiptImages.logo)}" alt="TUX logo"></div>
+    <div class="brand"><img src="/tuxlogo.jpg" alt="TUX logo"></div>
    <div class="title">TUX — Burger Truck</div>
     <div class="meta address">El-Saada St – Zahraa El-Maadi</div>
     <!-- Order meta -->
@@ -3841,8 +3648,8 @@ const cashBlock = (() => {
       <div class="thanks">Thank you for choosing TUX
 See you soon</div>
       <div class="logos">
-        <img class="menu" src="${escHtml(receiptImages.menuQr)}" alt="Menu QR">
-        <img class="delivery" src="${escHtml(receiptImages.deliveryLogo)}" alt="Delivery">
+        <img class="menu" src="/menu-qr.jpg" alt="Menu QR">
+        <img class="delivery" src="/delivery-logo.jpg" alt="Delivery">
       </div>
     </div>
   </div>
@@ -3850,17 +3657,8 @@ See you soon</div>
 </html>
 `;
 }
-async function printReceiptHTML(order, widthMm = 80, copy = "Customer", images) {
+function printReceiptHTML(order, widthMm = 80, copy = "Customer", images) {
   const html = buildReceiptHTML(order, widthMm, copy, images);
-  const printerBridge = getReceiptPrinterBridge();
-  if (printerBridge?.printReceipt) {
-    try {
-      return await printerBridge.printReceipt(html, { widthMm, copy });
-    } catch (err) {
-      console.warn("Native receipt print failed; falling back to browser print.", err);
-    }
-  }
-
   const ifr = document.createElement("iframe");
   Object.assign(ifr.style, { position:"fixed", right:0, bottom:0, width:0, height:0, border:0 });
   let htmlWritten = false;
@@ -4202,30 +4000,7 @@ setMenu((arr) => [
   setNewItemPrice(0);
   setNewItemColor("#ffffff");
 };
-const [baseInventory, setBaseInventory] = useState(DEFAULT_INVENTORY);
-  const [inventoryLedger, setInventoryLedger] = useState([]);
-
-  const inventory = useMemo(() => {
-    if (!baseInventory) return [];
-    const ledgerSums = {};
-    for (const item of (inventoryLedger || [])) {
-      ledgerSums[item.itemId] = (ledgerSums[item.itemId] || 0) + (Number(item.qty) || 0);
-    }
-    return baseInventory.map(it => ({ ...it, qty: (Number(it.qty) || 0) + (ledgerSums[it.id] || 0) }));
-  }, [baseInventory, inventoryLedger]);
-
-  const setInventory = useCallback((action) => {
-    setBaseInventory(prevBase => {
-      const ledgerSums = {};
-      for (const item of (inventoryLedger || [])) {
-        ledgerSums[item.itemId] = (ledgerSums[item.itemId] || 0) + (Number(item.qty) || 0);
-      }
-      const currentEffective = (prevBase || []).map(it => ({ ...it, qty: (Number(it.qty) || 0) + (ledgerSums[it.id] || 0) }));
-      const nextEffective = typeof action === 'function' ? action(currentEffective) : action;
-      if (!Array.isArray(nextEffective)) return nextEffective;
-      return nextEffective.map(it => ({ ...it, qty: (Number(it.qty) || 0) - (ledgerSums[it.id] || 0) }));
-    });
-  }, [inventoryLedger]);
+const [inventory, setInventory] = useState(DEFAULT_INVENTORY);
 const [bulkInventoryItems, setBulkInventoryItems] = useState(() => {
   const l = loadLocal();
   return Array.isArray(l.bulkInventoryItems) ? l.bulkInventoryItems : [];
@@ -4519,8 +4294,8 @@ const [usageMonth, setUsageMonth] = useState(() => {
   const l = loadLocal();
   return l?.usageMonth || new Date().toISOString().slice(0, 7);
 });
-const resetUsageViewAdmin = async () => {
-  const okAdmin = !!(await promptAdminAndPin());
+const resetUsageViewAdmin = () => {
+  const okAdmin = !!promptAdminAndPin();
   if (!okAdmin) return;
 
   setUsageFilter("week");
@@ -4687,10 +4462,10 @@ const allTimeVarianceTotal = useMemo(
   () => Object.values(allTimeVarianceByMethod).reduce((s, v) => s + Number(v || 0), 0),
   [allTimeVarianceByMethod]
 );
-const resetAllReconciliations = async () => {
-  const okAdmin = !!(await promptAdminAndPin());
+const resetAllReconciliations = () => {
+  const okAdmin = !!promptAdminAndPin();
   if (!okAdmin) return;
-  const phrase = await promptText(
+  const phrase = window.prompt(
     "Type RESET RECONCILIATIONS to clear saved reconciliations and variance totals.",
     ""
   );
@@ -4797,17 +4572,8 @@ if (!hasMeaningfulActualCounts) {
     totalVariance: Number(totalVariance.toFixed(2)),
     status: Math.abs(Number(totalVariance || 0)) < 0.01 ? "balanced" : "variance",
   };
-  const nextDayMeta = { ...dayMeta, dayId, reconciledAt: savedAt, reconciliationId: rec.id, updatedAt: nowIso() };
-  const nextReconHistory = [rec, ...(reconHistory || []).filter((row) => row?.id !== rec.id)];
-  setReconHistory(nextReconHistory);
-  setDayMeta(nextDayMeta);
-  saveLocalPartial(
-    {
-      reconHistory: nextReconHistory,
-      dayMeta: nextDayMeta,
-    },
-    { sections: [RECONCILIATION_SECTION, DAY_META_SECTION], updatedAt: toIso(savedAt) }
-  );
+  setReconHistory(arr => [rec, ...(arr || []).filter((row) => row?.id !== rec.id)]);
+  setDayMeta(d => ({ ...d, dayId, reconciledAt: savedAt, reconciliationId: rec.id, updatedAt: nowIso() }));
   alert("Reconciliation saved ✅");
 };
   const [menu, setMenu] = useState(BASE_MENU);
@@ -4911,21 +4677,21 @@ const [newInvName, setNewInvName] = useState("");
 const [newInvUnit, setNewInvUnit] = useState("");
 const [newInvQty, setNewInvQty] = useState(0);
   const [adminPins, setAdminPins] = useState({ ...DEFAULT_ADMIN_PINS });
-const verifyAdminPin = async (n) => {
+const verifyAdminPin = (n) => {
   const expected = norm(adminPins[n] || "");
   if (!expected) {
     alert(`Admin ${n} has no PIN set; add it in Settings → Admin PINs.`);
     return false;
   }
-  const entered = await promptText(`Enter PIN for Admin ${n}:`, "");
+  const entered = window.prompt(`Enter PIN for Admin ${n}:`, "");
   if (entered == null) return false;
   return norm(entered) === expected;
 };
 const lockAdminPin = (n) => {
   setUnlockedPins((u) => ({ ...u, [n]: false }));
 };
-const unlockAdminPin = async (n) => {
-  if (!(await verifyAdminPin(n))) return;
+const unlockAdminPin = (n) => {
+  if (!verifyAdminPin(n)) return;
   setUnlockedPins((u) => ({ ...u, [n]: true }));
 };
   const [unlockedPins, setUnlockedPins] = useState({}); 
@@ -5030,7 +4796,7 @@ const [lastLocalEditAt, setLastLocalEditAt] = useState(0);
   const [hydrated, setHydrated] = useState(false);
   const [lastAppliedCloudAt, setLastAppliedCloudAt] = useState(0);
   // Prevent our own cloud writes from boomeranging back
-const clientIdRef = useRef(DEVICE_ID);
+const clientIdRef = useRef(`cli_${Math.random().toString(36).slice(2)}`);
 const writeSeqRef = useRef(0);
   // Printing preferences (kept)
   const [autoPrintOnCheckout, setAutoPrintOnCheckout] = useState(true);
@@ -5048,12 +4814,6 @@ const writeSeqRef = useRef(0);
     try {
       setFbReady(true);
       setFbUser({ uid: clientIdRef.current });
-      if (!isSupabaseConfigured) {
-        setCloudStatus((s) => ({
-          ...s,
-          error: "Supabase is not configured. Local offline mode is active.",
-        }));
-      }
     } catch (e) {
       setCloudStatus((s) => ({ ...s, error: String(e) }));
     }
@@ -5104,7 +4864,6 @@ useEffect(() => {
     }
     return changed ? out : prev;
   });
-// eslint-disable-next-line react-hooks/exhaustive-deps
 }, [purchaseCategories, localHydrated, hydrated]);
 useEffect(() => {
   if (!newPurchase.categoryId || newPurchase.ingredientId) return;
@@ -5163,7 +4922,7 @@ useEffect(() => {
  if (l.paymentMethods) setPaymentMethods(l.paymentMethods);
   if (l.orderTypes) setOrderTypes(l.orderTypes);
   if (typeof l.defaultDeliveryFee === "number") setDefaultDeliveryFee(l.defaultDeliveryFee);
-  if (l.inventory) setBaseInventory(l.inventory);
+  if (l.inventory) setInventory(l.inventory);
   if (Array.isArray(l.bulkInventoryItems)) setBulkInventoryItems(l.bulkInventoryItems);
   if (Array.isArray(l.bulkInventoryHistory)) setBulkInventoryHistory(l.bulkInventoryHistory);
   if (l.utilityBills) setUtilityBills(normalizeUtilityBills(l.utilityBills));
@@ -5286,8 +5045,7 @@ useEffect(() => {
   saveLocalPartial({ usageFilter, usageWeekDate, usageMonth });
 }, [usageFilter, usageWeekDate, usageMonth, localHydrated]);
 useEffect(() => { if (!localHydrated) return; saveLocalPartial({ customers }); }, [customers, localHydrated]);                  // ⬅️ NEW
-useEffect(() => { if (!localHydrated) return; saveLocalPartial({ inventory: baseInventory }); }, [baseInventory, localHydrated]);
-useEffect(() => { if (!localHydrated) return; saveLocalPartial({ inventoryLedger }); }, [inventoryLedger, localHydrated]);
+useEffect(() => { if (!localHydrated) return; saveLocalPartial({ inventory }); }, [inventory, localHydrated]);
 useEffect(() => { if (!localHydrated) return; saveLocalPartial({ bulkInventoryItems }); }, [bulkInventoryItems, localHydrated]);
 useEffect(() => { if (!localHydrated) return; saveLocalPartial({ bulkInventoryHistory }); }, [bulkInventoryHistory, localHydrated]);
 useEffect(() => {
@@ -5327,8 +5085,8 @@ useEffect(() => { if (!localHydrated) return; saveLocalPartial({ inventoryLocked
 useEffect(() => { if (!localHydrated) return; saveLocalPartial({ nextOrderNo }); }, [nextOrderNo, localHydrated]);
 useEffect(() => {
   if (!localHydrated) return;
-  saveLocalPartial({ orders });
-}, [orders, localHydrated]);
+  if (!realtimeOrders) saveLocalPartial({ orders });
+}, [orders, realtimeOrders, localHydrated]);
 
 useEffect(() => {
   setLastLocalEditAt(Date.now());
@@ -5367,7 +5125,7 @@ const [syncCostsFromPurchases, setSyncCostsFromPurchases] = useState(() => {
 });
 useEffect(() => {
   if (!purchases?.length || !syncCostsFromPurchases) return;
-  setBaseInventory(current => {
+  setInventory(current => {
     let changed = false;
     const next = current.map(it => {
       const last = getLatestPurchaseForInv(it, purchases, purchaseCategories);
@@ -5468,8 +5226,8 @@ const buildFullStateForCloud = useCallback(
   (overrides = {}, options = {}) =>
     withPersistedAdminSettings(
       {
-        orders,
-        inventory: baseInventory,
+        orders: realtimeOrders ? [] : orders,
+        inventory,
         bulkInventoryItems,
         bulkInventoryHistory,
         nextOrderNo,
@@ -5494,7 +5252,6 @@ const buildFullStateForCloud = useCallback(
       },
       options
     ),
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   [
     withPersistedAdminSettings,
     realtimeOrders,
@@ -5522,7 +5279,7 @@ const buildFullStateForCloud = useCallback(
     reportMonth,
   ]
 );
-const supabaseReady = fbReady && isSupabaseConfigured;
+const supabaseReady = fbReady;
 const stateDocRef = supabaseReady;
 const ordersColRef = supabaseReady;
 const counterDocRef = supabaseReady;
@@ -5530,95 +5287,21 @@ const onlineOrderCollections = useMemo(() => ONLINE_ORDER_COLLECTIONS, []);
 const writeFullStateToCloud = useCallback(
   async (overrides = {}, options = {}) => {
     if (!stateDocRef || !fbUser) throw new Error("Supabase not ready.");
-    if (!shouldAttemptOnlineSync()) throw new Error("Offline. Local changes are saved and pending sync.");
-
-    let currentWriteSeq = writeSeqRef.current;
-    let attempt = 0;
-    const maxAttempts = 5;
-    let currentLocalState = buildFullStateForCloud(overrides, options);
-
-    while (attempt < maxAttempts) {
-      attempt++;
-      const bodyBase = packStateForCloud(currentLocalState);
-      const nextWriteSeq = currentWriteSeq + 1;
-      const body = {
-        ...bodyBase,
-        writerId: clientIdRef.current,
-        deviceId: clientIdRef.current,
-        lastModifiedDeviceId: clientIdRef.current,
-        syncStatus: SYNC_STATUS.synced,
-        pendingSync: false,
-        writeSeq: nextWriteSeq,
-        clientTime: Date.now(),
-      };
-
-      const success = await savePosStateOptimistic(body, currentWriteSeq);
-      if (success) {
-        writeSeqRef.current = nextWriteSeq;
-        saveLocalPartial({}, { updatedAt: body.updatedAt || nowIso(), syncedFromCloud: true });
-        const now = Date.now();
-        setLastLocalEditAt(now);
-        setLastAppliedCloudAt(now);
-        setCloudStatus((s) => ({ ...s, lastSaveAt: new Date(now), error: null }));
-        console.log(`OCC Save successful on attempt ${attempt}. Next seq: ${nextWriteSeq}`);
-        
-        // Also call syncWithCloudNow in the background to ensure React state reflects any merges
-        if (attempt > 1) {
-          syncWithCloudNow(true, { force: false }).catch(err => console.warn("Background resync failed:", err));
-        }
-        
-        return body;
-      }
-
-      console.warn(`OCC Conflict detected (attempt ${attempt}/${maxAttempts}). Fetching latest cloud state...`);
-      if (attempt >= maxAttempts) break;
-
-      const latestRaw = await loadCompleteCloudState();
-      if (!latestRaw) throw new Error("OCC Conflict but cloud state is empty.");
-
-      currentWriteSeq = Number(latestRaw.write_seq || 0);
-      writeSeqRef.current = currentWriteSeq;
-      const unpacked = unpackStateFromCloud(latestRaw, currentLocalState.dayMeta);
-
-      // Merge dynamic arrays using stable IDs
-      currentLocalState.expenses = mergeByIdPreferNewest(currentLocalState.expenses, unpacked.expenses, { fallbackPrefix: "expense" });
-      currentLocalState.purchases = mergeByIdPreferNewest(currentLocalState.purchases, unpacked.purchases, { fallbackPrefix: "purchase" });
-      currentLocalState.customers = mergeByIdPreferNewest(currentLocalState.customers, unpacked.customers, { fallbackPrefix: "customer" });
-      currentLocalState.workerSessions = mergeByIdPreferNewest(currentLocalState.workerSessions, unpacked.workerSessions, { fallbackPrefix: "worker_session" });
-      currentLocalState.bankTx = mergeByIdPreferNewest(currentLocalState.bankTx, unpacked.bankTx, { fallbackPrefix: "bank_tx" });
-      currentLocalState.reconHistory = mergeByIdPreferNewest(currentLocalState.reconHistory, unpacked.reconHistory, { fallbackPrefix: "recon" });
-      currentLocalState.historicalOrders = mergeByIdPreferNewest(currentLocalState.historicalOrders, unpacked.historicalOrders, { fallbackPrefix: "h_order" });
-      currentLocalState.historicalExpenses = mergeByIdPreferNewest(currentLocalState.historicalExpenses, unpacked.historicalExpenses, { fallbackPrefix: "h_expense" });
-      currentLocalState.historicalPurchases = mergeByIdPreferNewest(currentLocalState.historicalPurchases, unpacked.historicalPurchases, { fallbackPrefix: "h_purchase" });
-
-      // Merge single-object settings if remote is newer
-      const localMeta = currentLocalState[SECTION_UPDATED_AT_KEY] || {};
-      const remoteMeta = unpacked[SECTION_UPDATED_AT_KEY] || {};
-      
-      if (toMs(remoteMeta[ADMIN_SETTINGS_SECTION]) > toMs(localMeta[ADMIN_SETTINGS_SECTION])) {
-        currentLocalState.menu = unpacked.menu;
-        currentLocalState.extraList = unpacked.extras;
-        currentLocalState.beverageList = unpacked.beverages;
-      }
-      if (toMs(remoteMeta[ADMIN_SETTINGS_SECTION]) > toMs(localMeta[ADMIN_SETTINGS_SECTION])) {
-        currentLocalState.paymentMethods = unpacked.paymentMethods;
-        currentLocalState.orderTypes = unpacked.orderTypes;
-        currentLocalState.workers = unpacked.workers;
-        currentLocalState.adminPins = unpacked.adminPins;
-        currentLocalState.deliveryZones = unpacked.deliveryZones;
-        currentLocalState.equipmentList = unpacked.equipmentList;
-        currentLocalState.utilityBills = unpacked.utilityBills;
-        currentLocalState.laborProfile = unpacked.laborProfile;
-      }
-      if (toMs(remoteMeta[DAY_META_SECTION]) > toMs(localMeta[DAY_META_SECTION])) {
-        currentLocalState.dayMeta = unpacked.dayMeta;
-      }
-    }
-    
-    console.error("Failed to sync to cloud after maximum OCC retry attempts.");
-    throw new Error("Failed to sync to cloud due to high concurrency. Please try again.");
+    const bodyBase = packStateForCloud(buildFullStateForCloud(overrides, options));
+    writeSeqRef.current += 1;
+    const body = {
+      ...bodyBase,
+      writerId: clientIdRef.current,
+      writeSeq: writeSeqRef.current,
+      clientTime: Date.now(),
+    };
+    await savePosState(body);
+    const now = Date.now();
+    setLastLocalEditAt(now);
+    setLastAppliedCloudAt(now);
+    setCloudStatus((s) => ({ ...s, lastSaveAt: new Date(now), error: null }));
+    return body;
   },
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   [stateDocRef, fbUser, buildFullStateForCloud]
 );
 const saveAdminSettings = useCallback(async () => {
@@ -5679,142 +5362,73 @@ const applyRemoteState = useCallback(
     const force = Boolean(options.force);
     const unpacked = unpackStateFromCloud(rawData, dayMeta);
     const localState = loadLocal();
-    const canUseRemoteKey = (key, options = {}) =>
-      force || shouldApplyRemoteKey(localState, rawData, key, options);
-    const canUseRemoteSection = (section, options = {}) =>
-      force || shouldApplyRemoteSection(localState, rawData, section, options);
 
-    if (unpacked.orders && canUseRemoteKey("orders")) {
-      setOrders((prev) => {
-        const pending = prev.filter(o => o.syncStatus === SYNC_STATUS.pending);
-        return mergeByIdPreferNewest(force ? pending : prev, unpacked.orders, { fallbackPrefix: "order" }).map(enrichOrderWithChannel);
-      });
-    }
-    if (unpacked.inventory && canUseRemoteKey("inventory")) {
-      setBaseInventory(unpacked.inventory);
-    }
-    if (unpacked.inventoryLedger && canUseRemoteKey("inventoryLedger")) {
-      setInventoryLedger((prev) => {
-        const pending = prev.filter(il => il.syncStatus === SYNC_STATUS.pending);
-        return mergeByIdPreferNewest(force ? pending : prev, unpacked.inventoryLedger, { fallbackPrefix: "inv_ledger" });
-      });
-    }
-    applyBulkInventoryFromCloud(
-      canUseRemoteKey("bulkInventoryItems")
-        ? unpacked.bulkInventoryItems
-        : undefined,
-      canUseRemoteKey("bulkInventoryHistory")
-        ? unpacked.bulkInventoryHistory
-        : undefined
-    );
-    if (unpacked.nextOrderNo != null && canUseRemoteKey("nextOrderNo")) {
-      setNextOrderNo(unpacked.nextOrderNo);
-    }
-    if (unpacked.customers && canUseRemoteKey("customers")) {
-      setCustomers((prev) => {
-        const pending = prev.filter(c => c.syncStatus === SYNC_STATUS.pending);
-        const merged = mergeByIdPreferNewest(force ? pending : prev, unpacked.customers, { fallbackPrefix: "customer" });
-        return dedupeCustomers(merged);
-      });
-    }
-    if (unpacked.inventoryLocked != null && canUseRemoteKey("inventoryLocked")) {
-      setInventoryLocked(unpacked.inventoryLocked);
-    }
-    if (unpacked.inventorySnapshot && canUseRemoteKey("inventorySnapshot")) {
-      setInventorySnapshot(unpacked.inventorySnapshot);
-    }
-    if (
-      Object.prototype.hasOwnProperty.call(unpacked, "inventoryLockedAt") &&
-      canUseRemoteKey("inventoryLockedAt")
-    ) {
-      setInventoryLockedAt(unpacked.inventoryLockedAt);
-    }
-    if (unpacked.expenses && canUseRemoteKey("expenses")) {
-      setExpenses((prev) => {
-        const pending = prev.filter(e => e.syncStatus === SYNC_STATUS.pending);
-        return mergeByIdPreferNewest(force ? pending : prev, unpacked.expenses, { fallbackPrefix: "expense" });
-      });
-    }
-    if (unpacked.bankTx && canUseRemoteKey("bankTx")) {
-      setBankTx((prev) => {
-        const pending = prev.filter(t => t.syncStatus === SYNC_STATUS.pending);
-        return mergeByIdPreferNewest(force ? pending : prev, unpacked.bankTx, { fallbackPrefix: "bank_tx" });
-      });
-    }
-    if (unpacked.onlineOrdersRaw && canUseRemoteKey("onlineOrdersRaw")) {
-      setOnlineOrdersRaw(unpacked.onlineOrdersRaw);
-    }
-    if (unpacked.onlineOrderStatus && canUseRemoteKey("onlineOrderStatus")) {
-      setOnlineOrderStatus(unpacked.onlineOrderStatus);
-    }
-    if (
-      unpacked.lastSeenOnlineOrderTs != null &&
-      canUseRemoteKey("lastSeenOnlineOrderTs")
-    )
+    if (!realtimeOrders && unpacked.orders) setOrders(unpacked.orders);
+    if (unpacked.inventory) setInventory(unpacked.inventory);
+    applyBulkInventoryFromCloud(unpacked.bulkInventoryItems, unpacked.bulkInventoryHistory);
+    if (unpacked.nextOrderNo != null) setNextOrderNo(unpacked.nextOrderNo);
+    if (unpacked.customers) setCustomers(dedupeCustomers(unpacked.customers));
+    if (unpacked.inventoryLocked != null) setInventoryLocked(unpacked.inventoryLocked);
+    if (unpacked.inventorySnapshot) setInventorySnapshot(unpacked.inventorySnapshot);
+    if (unpacked.inventoryLockedAt != null) setInventoryLockedAt(unpacked.inventoryLockedAt);
+    if (unpacked.expenses) setExpenses(unpacked.expenses);
+    if (unpacked.bankTx) setBankTx(unpacked.bankTx);
+    if (unpacked.onlineOrdersRaw) setOnlineOrdersRaw(unpacked.onlineOrdersRaw);
+    if (unpacked.onlineOrderStatus) setOnlineOrderStatus(unpacked.onlineOrderStatus);
+    if (unpacked.lastSeenOnlineOrderTs != null)
       setLastSeenOnlineOrderTs(unpacked.lastSeenOnlineOrderTs);
-    if (unpacked.purchases && canUseRemoteKey("purchases")) {
-      setPurchases((prev) => {
-        const pending = prev.filter(p => p.syncStatus === SYNC_STATUS.pending);
-        return mergeByIdPreferNewest(force ? pending : prev, unpacked.purchases, { fallbackPrefix: "purchase" });
-      });
-    }
-    if (unpacked.purchaseCategories && canUseRemoteKey("purchaseCategories"))
+    if (unpacked.purchases) setPurchases(unpacked.purchases);
+    if (unpacked.purchaseCategories)
       setPurchaseCategories(normalizePurchaseCategories(unpacked.purchaseCategories));
 
     if (
       unpacked.dayMeta &&
-      (force || canUseRemoteSection(DAY_META_SECTION))
+      (force || shouldApplyRemoteSection(localState, rawData, DAY_META_SECTION))
     ) {
       setDayMeta((prev) => {
         if (!force && prev?.endedAt && !unpacked.dayMeta?.endedAt) return prev;
-        if (force && prev?.syncStatus === SYNC_STATUS.pending) {
-          const localMs = recordUpdatedMs(prev);
-          const remoteMs = recordUpdatedMs(unpacked.dayMeta);
-          if (localMs > remoteMs) return prev;
-        }
         return unpacked.dayMeta;
       });
     }
 
-    if (
-      unpacked.workerSessions &&
-      canUseRemoteSection(WORKER_SESSIONS_SECTION)
-    ) {
-      setWorkerSessions((prev) => {
-        const pending = prev.filter(s => s.syncStatus === SYNC_STATUS.pending);
-        return mergeByIdPreferNewest(force ? pending : prev, unpacked.workerSessions, { fallbackPrefix: "worker_session" });
-      });
+    if (unpacked.workerSessions) {
+      setWorkerSessions((prev) =>
+        mergeByIdPreferNewest(prev, unpacked.workerSessions, {
+          fallbackPrefix: "worker_session",
+        })
+      );
     }
-    if (
-      unpacked.reconHistory &&
-      canUseRemoteSection(RECONCILIATION_SECTION)
-    ) {
-      setReconHistory((prev) => {
-        const pending = prev.filter(r => r.syncStatus === SYNC_STATUS.pending);
-        return mergeByIdPreferNewest(force ? pending : prev, unpacked.reconHistory, { fallbackPrefix: "reconciliation" });
-      });
+    if (unpacked.reconHistory) {
+      setReconHistory((prev) =>
+        mergeByIdPreferNewest(prev, unpacked.reconHistory, {
+          fallbackPrefix: "reconciliation",
+        })
+      );
     }
-    if (unpacked.historicalOrders && canUseRemoteSection(HISTORY_SECTION)) {
-      setHistoricalOrders((prev) => {
-        const pending = prev.filter(o => o.syncStatus === SYNC_STATUS.pending);
-        return mergeByIdPreferNewest(force ? pending : prev, unpacked.historicalOrders, { fallbackPrefix: "historical_order" });
-      });
+    if (unpacked.historicalOrders) {
+      setHistoricalOrders((prev) =>
+        mergeByIdPreferNewest(prev, unpacked.historicalOrders, {
+          fallbackPrefix: "historical_order",
+        })
+      );
     }
-    if (unpacked.historicalExpenses && canUseRemoteSection(HISTORY_SECTION)) {
-      setHistoricalExpenses((prev) => {
-        const pending = prev.filter(e => e.syncStatus === SYNC_STATUS.pending);
-        return mergeByIdPreferNewest(force ? pending : prev, unpacked.historicalExpenses, { fallbackPrefix: "historical_expense" });
-      });
+    if (unpacked.historicalExpenses) {
+      setHistoricalExpenses((prev) =>
+        mergeByIdPreferNewest(prev, unpacked.historicalExpenses, {
+          fallbackPrefix: "historical_expense",
+        })
+      );
     }
-    if (unpacked.historicalPurchases && canUseRemoteSection(HISTORY_SECTION)) {
-      setHistoricalPurchases((prev) => {
-        const pending = prev.filter(p => p.syncStatus === SYNC_STATUS.pending);
-        return mergeByIdPreferNewest(force ? pending : prev, unpacked.historicalPurchases, { fallbackPrefix: "historical_purchase" });
-      });
+    if (unpacked.historicalPurchases) {
+      setHistoricalPurchases((prev) =>
+        mergeByIdPreferNewest(prev, unpacked.historicalPurchases, {
+          fallbackPrefix: "historical_purchase",
+        })
+      );
     }
 
     const canApplyReportFilters =
-      force || canUseRemoteSection(REPORT_FILTERS_SECTION);
+      force || shouldApplyRemoteSection(localState, rawData, REPORT_FILTERS_SECTION);
     if (canApplyReportFilters) {
       if (typeof unpacked.reportFilter === "string") setReportFilter(unpacked.reportFilter);
       if (typeof unpacked.reportDay === "string") setReportDay(unpacked.reportDay);
@@ -5824,7 +5438,7 @@ const applyRemoteState = useCallback(
     const canApplyAdminSettings =
       force ||
       (!adminHasUnsavedChanges &&
-        canUseRemoteSection(ADMIN_SETTINGS_SECTION));
+        shouldApplyRemoteSection(localState, rawData, ADMIN_SETTINGS_SECTION));
     if (canApplyAdminSettings) {
       if (unpacked.menu) setMenu(unpacked.menu);
       if (unpacked.extraList) setExtraList(unpacked.extraList);
@@ -5861,7 +5475,7 @@ const applyRemoteState = useCallback(
           [SECTION_UPDATED_AT_KEY]: sectionUpdatedAt,
           adminSettingsUpdatedAt: remoteStamp,
         },
-        { sections: [ADMIN_SETTINGS_SECTION], updatedAt: remoteStamp, syncedFromCloud: true }
+        { sections: [ADMIN_SETTINGS_SECTION], updatedAt: remoteStamp }
       );
       setAdminSavedSnapshot(remoteAdminSnapshot);
       setAdminSaveStatus({ kind: "idle", message: "" });
@@ -5869,7 +5483,6 @@ const applyRemoteState = useCallback(
 
     return unpacked;
   },
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   [
     dayMeta,
     realtimeOrders,
@@ -5899,23 +5512,13 @@ const applyRemoteState = useCallback(
     };
   }, [counterDocRef, fbUser]);
   useEffect(() => {
-    if (fbReady && !stateDocRef && !hydrated) {
-      setHydrated(true);
-    }
-  }, [fbReady, stateDocRef, hydrated]);
-  useEffect(() => {
     if (!stateDocRef || !fbUser || hydrated) return;
     (async () => {
       try {
-        const data = await loadCompleteCloudState();
+        const data = await loadPosState();
         if (data) {
           applyRemoteState(data);
-          const warnings = data.__cloudLoadMeta?.warnings || [];
-          setCloudStatus((s) => ({
-            ...s,
-            lastLoadAt: new Date(),
-            error: warnings.length ? warnings.join(" | ") : null,
-          }));
+          setCloudStatus((s) => ({ ...s, lastLoadAt: new Date(), error: null }));
         }
       } catch (e) {
         console.warn("Initial cloud load failed:", e);
@@ -5951,141 +5554,170 @@ if (ts && lastLocalEditAt && ts < lastLocalEditAt) return;
 
   return () => unsub();
 }, [cloudEnabled, stateDocRef, fbUser, lastAppliedCloudAt, lastLocalEditAt, applyRemoteState]);
-  const syncWithCloudNow = useCallback(
-    async (notify = false, options = {}) => {
-      const forceRemoteLoad = Boolean(options?.force);
-      if (!stateDocRef || !fbUser) {
-        const message = "Supabase is not configured. Local offline mode is active.";
-        setCloudStatus((s) => ({ ...s, error: message }));
-        if (notify) alert(message);
-        return false;
-      }
-
-      try {
-        const localState = loadLocal();
-        const pendingOrders = (localState.orders || []).filter(o => o.syncStatus === SYNC_STATUS.pending);
-        if (pendingOrders.length > 0) {
-          const updatedLocalOrders = [...(localState.orders || [])];
-          let changed = false;
-          for (let i = 0; i < updatedLocalOrders.length; i++) {
-            const o = updatedLocalOrders[i];
-            if (o.syncStatus === SYNC_STATUS.pending) {
-              try {
-                const { data: existing } = await supabase.from("orders").select("id").eq("shop_id", SHOP_ID).eq("order_no", o.orderNo).maybeSingle();
-                const dbOrder = normalizeOrderForSupabase(o);
-                if (existing) {
-                  dbOrder.id = existing.id;
-                  await supabase.from("orders").update(dbOrder).eq("id", existing.id);
-                  updatedLocalOrders[i] = { ...o, cloudId: existing.id, syncStatus: SYNC_STATUS.synced };
-                  changed = true;
-                } else {
-                  const { data: inserted, error: insertErr } = await supabase.from("orders").insert(dbOrder).select("id").maybeSingle();
-                  if (insertErr) throw insertErr;
-                  if (inserted) {
-                    updatedLocalOrders[i] = { ...o, cloudId: inserted.id, syncStatus: SYNC_STATUS.synced };
-                    changed = true;
-                  }
-                }
-              } catch(e) {
-                console.warn(`Sync failed for order #${o.orderNo}:`, e);
-              }
-            }
-          }
-          if (changed) {
-            saveLocalPartial({ orders: updatedLocalOrders });
-          }
-        }
-
-        const remoteState = await loadCompleteCloudState();
-        if (!remoteState) {
-          const message = "No cloud data yet to load.";
-          setCloudStatus((s) => ({ ...s, error: message }));
-          if (notify) alert(message);
-          return false;
-        }
-
-        applyRemoteState(remoteState, { force: forceRemoteLoad });
-        const remoteUpdatedAt = remoteState.updatedAt ? new Date(remoteState.updatedAt).getTime() : Date.now();
-        const appliedAt = Number.isFinite(remoteUpdatedAt) ? remoteUpdatedAt : Date.now();
-        const warnings = remoteState.__cloudLoadMeta?.warnings || [];
-        const totalOrdersLoaded = Number(remoteState.__cloudLoadMeta?.totalOrdersLoaded || 0);
-        setLastAppliedCloudAt(appliedAt);
-        setCloudStatus((s) => ({
-          ...s,
-          lastLoadAt: new Date(),
-          error: warnings.length ? warnings.join(" | ") : null,
-        }));
-        if (notify) {
-          alert(
-            `Loaded from cloud ✔\nOrders loaded: ${totalOrdersLoaded}` +
-              (warnings.length ? `\nWarnings: ${warnings.join(" | ")}` : "")
-          );
-        }
-        return true;
-      } catch (e) {
-        const message = String(e?.message || e);
-        setCloudStatus((s) => ({ ...s, error: message }));
-        if (notify) alert("Cloud load failed: " + message);
-        return false;
-      }
-    },
-    [stateDocRef, fbUser, applyRemoteState]
-  );
-
-  // Manual pull: read-only. This loads the latest POS state from Supabase and never writes back.
-  const loadFromCloud = async () => syncWithCloudNow(true, { force: true });
-
-  // Manual push: this is the only cloud button here that writes the full POS state to Supabase.
-  const saveToCloudNow = async () => {
+  // Manual pull
+  const loadFromCloud = async () => {
     if (!stateDocRef || !fbUser) return alert("Supabase not ready.");
     try {
-      const cloudOrders = await loadOrders().catch((err) => {
-        console.warn("Pre-sync cloud order safety check failed:", err);
-        return [];
-      });
-      if ((!orders || orders.length === 0) && cloudOrders.length > 0) {
-        const message =
-          `Sync blocked for safety. This local app has 0 orders, but Supabase has ${cloudOrders.length} active order(s). ` +
-          "Press Refresh from Cloud first. This prevents an empty app from overwriting cloud state.";
-        setCloudStatus((s) => ({ ...s, error: message }));
-        alert(message);
-        return false;
-      }
-      await writeFullStateToCloud();
-      alert("Synced to cloud ✔");
-      return true;
+      const data = await loadPosState();
+      if (!data) return alert("No cloud state yet to load.");
+      applyRemoteState(data, { force: true });
+      setCloudStatus((s) => ({ ...s, lastLoadAt: new Date(), error: null }));
+      alert("Loaded from cloud ✔");
     } catch (e) {
-      const message = String(e?.message || e);
-      setCloudStatus((s) => ({ ...s, error: message }));
-      alert("Sync to cloud failed: " + message);
-      return false;
+      setCloudStatus((s) => ({ ...s, error: String(e) }));
+      alert("Cloud load failed: " + e);
     }
-  };
+ };
+ const saveToCloudNow = async () => {
+  if (!stateDocRef || !fbUser) return alert("Supabase not ready.");
+  try {
+    await writeFullStateToCloud();
+    /*
+    const bodyBase = packStateForCloud({
+      menu,
+      extraList,
+      beverageList,
+      orders: realtimeOrders ? [] : orders,
+      inventory,
+      bulkInventoryItems,
+      bulkInventoryHistory,
+      nextOrderNo,
+       reconHistory,
+        workerProfiles,
+ workerSessions,
+      dark,
+      workers,
+      paymentMethods,
+      inventoryLocked,
+      inventorySnapshot,
+      inventoryLockedAt,
+      adminPins,
+      orderTypes,
+      defaultDeliveryFee,
+      expenses,
+      purchases,
+      purchaseCategories,
+     customers,
+      deliveryZones,
+      dayMeta,
+      utilityBills,
+      laborProfile,
+      equipmentList,
+      bankTx,
+      realtimeOrders,
+      onlineOrdersRaw,
+      onlineOrderStatus,
+      lastSeenOnlineOrderTs,
+      historicalOrders,
+      historicalExpenses,
+      historicalPurchases,
+      reportFilter,
+      reportDay,
+      reportMonth,
+    });
+    writeSeqRef.current += 1;
+    const body = {
+      ...bodyBase,
+      writerId: clientIdRef.current,
+      writeSeq: writeSeqRef.current,
+      clientTime: Date.now(),
+    };
+    await savePosState(body);
+    const now = Date.now();
+   setLastLocalEditAt(now);
+    setLastAppliedCloudAt(now);
+    setCloudStatus((s) => ({ ...s, lastSaveAt: new Date(), error: null }));
+    */
+
+    alert("Synced to cloud ✔");
+  } catch (e) {
+    alert("Sync failed: " + e);
+  }
+};
 useEffect(() => {
   if (!cloudEnabled || !stateDocRef || !fbUser || !hydrated) return undefined;
 
-  // Startup cloud sync is intentionally read-only.
-  // Load the newest data from the cloud on startup, preserving local pending changes.
-  syncWithCloudNow(false, { force: true }).catch(err => {
-    console.warn("Startup cloud sync failed", err);
-  });
-  return undefined;
-}, [cloudEnabled, stateDocRef, fbUser, hydrated, syncWithCloudNow]);
-useEffect(() => {
-  if (!cloudEnabled || !stateDocRef || !fbUser || !hydrated) return undefined;
+  let cancelled = false;
 
-  const retrySync = () => {
-    syncWithCloudNow(false);
-  };
+  (async () => {
+    try {
+      // Startup cloud sync is intentionally read-only.
+      // Do not write full POS state just because a device opened the app.
+      if (cancelled) return;
+      /*
+ const bodyBase = packStateForCloud({
+        menu,
+        extraList,
+        beverageList,
+        orders: realtimeOrders ? [] : orders,
+        inventory,
+        bulkInventoryItems,
+        bulkInventoryHistory,
+        nextOrderNo,
+        dark,
+        workers,
+        paymentMethods,
+        inventoryLocked,
+        inventorySnapshot,
+        inventoryLockedAt,
+        adminPins,
+        orderTypes,
+        defaultDeliveryFee,
+        expenses,
+        purchases,
+        purchaseCategories,
+        customers,
+        deliveryZones,
+        utilityBills,
+        laborProfile,
+        equipmentList,
+          workerProfiles,
+         workerSessions,
+        dayMeta,
+        bankTx,
+         realtimeOrders,
+         reconHistory,
+        onlineOrdersRaw,
+        onlineOrderStatus,
+        lastSeenOnlineOrderTs,
+        historicalOrders,
+        historicalExpenses,
+        historicalPurchases,
+        reportFilter,
+        reportDay,
+        reportMonth,
+      });
+      writeSeqRef.current += 1;
+      const body = {
+        ...bodyBase,
+        writerId: clientIdRef.current,
+        writeSeq: writeSeqRef.current,
+        clientTime: Date.now(),
+      };
 
-  window.addEventListener("online", retrySync);
-  const intervalId = window.setInterval(retrySync, 120000);
+      await savePosState(body);
+      if (cancelled) return;
+      const now = Date.now();
+      setLastAppliedCloudAt(now);
+      setCloudStatus((s) => ({ ...s, lastSaveAt: new Date(), error: null }));
+      */
+    } catch (e) {
+      if (!cancelled) {
+        setCloudStatus((s) => ({ ...s, error: String(e) }));
+      }
+    }
+  })();
 
   return () => {
-    window.removeEventListener("online", retrySync);
-    window.clearInterval(intervalId);
+    cancelled = true;
   };
-}, [cloudEnabled, stateDocRef, fbUser, hydrated, syncWithCloudNow]);
+}, [
+  cloudEnabled,
+  stateDocRef,
+  fbUser,
+  hydrated,
+  writeFullStateToCloud,
+]);
   const startedAtMs = dayMeta?.startedAt
     ? new Date(dayMeta.startedAt).getTime()
     : null;
@@ -6094,34 +5726,24 @@ useEffect(() => {
     : null;
   useEffect(() => {
     if (!realtimeOrders || !ordersColRef || !fbUser) return;
+    if (!startedAtMs) {
+      setOrders([]);
+      return;
+    }
     let active = true;
-    let refreshTimer = null;
     const refreshOrders = async () => {
       try {
-        const arr = startedAtMs
-          ? await loadOrders(new Date(startedAtMs), endedAtMs ? new Date(endedAtMs) : null)
-          : await loadOrders();
-        if (active) {
-          setOrders(prev => {
-            const pending = prev.filter(o => o.syncStatus === SYNC_STATUS.pending);
-            const merged = mergeByIdPreferNewest(pending, arr, { fallbackPrefix: "order" });
-            return dedupeOrders(merged).map(enrichOrderWithChannel);
-          });
-        }
+        const arr = await loadOrders(new Date(startedAtMs), endedAtMs ? new Date(endedAtMs) : null);
+        if (active) setOrders(dedupeOrders(arr).map(enrichOrderWithChannel));
       } catch (err) {
         console.warn("Realtime orders load failed:", err);
         setCloudStatus((s) => ({ ...s, error: String(err) }));
       }
     };
-    const scheduleRefreshOrders = () => {
-      if (refreshTimer) window.clearTimeout(refreshTimer);
-      refreshTimer = window.setTimeout(refreshOrders, 350);
-    };
     refreshOrders();
-    const unsub = subscribeToOrders(scheduleRefreshOrders);
+    const unsub = subscribeToOrders(refreshOrders);
    return () => {
       active = false;
-      if (refreshTimer) window.clearTimeout(refreshTimer);
       unsub();
     };
   }, [realtimeOrders, ordersColRef, fbUser, startedAtMs, endedAtMs]);
@@ -7127,10 +6749,10 @@ const closeOpenSessionsAt = useCallback(
   },
   [setLastLocalEditAt]
 );
-const resetWorkerLog = async () => {
-  const okAdmin = !!(await promptAdminAndPin());
+const resetWorkerLog = () => {
+  const okAdmin = !!promptAdminAndPin();
   if (!okAdmin) return;
-  const phrase = await promptText(
+  const phrase = window.prompt(
     "Type RESET WORKER LOG to delete all worker sessions.",
     ""
   );
@@ -7231,8 +6853,8 @@ const workerMonthlyTotalPay = useMemo(
   () => workerMonthlyStats.reduce((s, r) => s + Number(r.pay || 0), 0),
   [workerMonthlyStats]
 );
-  const promptAdminAndPin = async () => {
-    const adminStr = await promptText("Enter Admin number (1 to 6):", "1");
+  const promptAdminAndPin = () => {
+    const adminStr = window.prompt("Enter Admin number (1 to 6):", "1");
     if (!adminStr) return null;
     const n = Number(adminStr);
     if (![1, 2, 3, 4, 5, 6].includes(n)) {
@@ -7241,7 +6863,7 @@ const workerMonthlyTotalPay = useMemo(
     }
 
 
-    const entered = await promptText(`Enter PIN for Admin ${n}:`, "");
+    const entered = window.prompt(`Enter PIN for Admin ${n}:`, "");
     if (entered == null) return null;
 
     const expected = norm(adminPins[n]);
@@ -7368,18 +6990,18 @@ const workerMonthlyTotalPay = useMemo(
     });
     setBulkRefillQty("");
   };
-  const handleBulkRemoveItem = async (itemId) => {
+  const handleBulkRemoveItem = (itemId) => {
     const target = (bulkInventoryItems || []).find((it) => it.id === itemId);
     if (!target) return;
-    const adminNum = await promptAdminAndPin();
+    const adminNum = promptAdminAndPin();
     if (!adminNum) return;
     if (!window.confirm(`Admin ${adminNum}: Remove ${target.name}?`)) return;
     setBulkInventoryItems((rows) => rows.filter((it) => it.id !== itemId));
     setBulkInventoryHistory((rows) => rows.filter((row) => row.itemId !== itemId));
     if (bulkRefillItemId === itemId) setBulkRefillItemId("");
   };
-  const handleBulkResetAll = async () => {
-    const adminNum = await promptAdminAndPin();
+  const handleBulkResetAll = () => {
+    const adminNum = promptAdminAndPin();
     if (!adminNum) return;
     if (!window.confirm(`Admin ${adminNum}: Reset all Bulk Inventory data?`)) return;
     setBulkInventoryItems([]);
@@ -7388,8 +7010,8 @@ const workerMonthlyTotalPay = useMemo(
     setBulkHistoryItemId("all");
   };
 
-  const resetAllCustomerContacts = async () => {
-    const adminNum = await promptAdminAndPin();
+  const resetAllCustomerContacts = () => {
+    const adminNum = promptAdminAndPin();
     if (!adminNum) return;
     if (
       !window.confirm(
@@ -7423,9 +7045,9 @@ const workerMonthlyTotalPay = useMemo(
     setInventoryLockedAt(new Date());
   };
 
-  const unlockInventoryWithPin = async () => {
+  const unlockInventoryWithPin = () => {
     if (!inventoryLocked) return alert("Inventory is already unlocked.");
-    const adminNum = await promptAdminAndPin();
+    const adminNum = promptAdminAndPin();
     if (!adminNum) return;
     if (!window.confirm(`Admin ${adminNum}: Unlock inventory for editing? Snapshot will be kept.`))
       return;
@@ -7437,7 +7059,7 @@ const workerMonthlyTotalPay = useMemo(
 const endDay = async () => {
     if (!dayMeta.startedAt || dayMeta.endedAt) return alert("Start an active shift first.");
 
-    const who = await promptText("Enter your name to END THE DAY:", "");
+    const who = window.prompt("Enter your name to END THE DAY:", "");
     const endBy = norm(who);
     if (!endBy) return alert("Name is required.");
 
@@ -7460,16 +7082,7 @@ const endDay = async () => {
       return;
     }
 
-    const metaReconciledAt = dayMeta.reconciledAt ? new Date(dayMeta.reconciledAt) : null;
-    const savedReconciliation =
-      latestReconciliationForCurrentDay ||
-      (metaReconciledAt && !Number.isNaN(+metaReconciledAt)
-        ? {
-            id: dayMeta.reconciliationId || `rec_${currentDayId}`,
-            savedAt: metaReconciledAt,
-            reconciledAt: metaReconciledAt,
-          }
-        : null);
+    const savedReconciliation = latestReconciliationForCurrentDay;
     const reconciliationSavedAt = savedReconciliation
       ? new Date(
           savedReconciliation.savedAt ||
@@ -7589,8 +7202,6 @@ const endDay = async () => {
     const closedSessions = closeOpenSessionsAt(endTime) || [];
     setOrders(clearedOrders);
     setNextOrderNo(1);
-    setInventoryLocked(false);
-    setInventoryLockedAt(null);
 
     const endedMeta = {
       ...dayMeta,
@@ -7603,22 +7214,7 @@ const endDay = async () => {
       updatedAt: nowIso(),
     };
     setDayMeta(endedMeta);
-    saveLocalPartial(
-      {
-        orders: clearedOrders,
-        expenses: clearedExpenses,
-        workerSessions: closedSessions,
-        dayMeta: endedMeta,
-        bankTx: updatedBankTx,
-        nextOrderNo: 1,
-        inventoryLocked: false,
-        inventoryLockedAt: null,
-        historicalOrders: newHistoricalOrders,
-        historicalExpenses: newHistoricalExpenses,
-        historicalPurchases: newHistoricalPurchases,
-      },
-      { sections: [DAY_META_SECTION, WORKER_SESSIONS_SECTION, HISTORY_SECTION] }
-    );
+    saveLocalPartial({ dayMeta: endedMeta });
     setLastLocalEditAt(Date.now());
 
     setReconCounts({});
@@ -7627,14 +7223,12 @@ const endDay = async () => {
     if (cloudEnabled && stateDocRef && fbUser) {
       try {
         await writeFullStateToCloud({
-          orders: clearedOrders,
+          orders: realtimeOrders ? [] : clearedOrders,
           expenses: clearedExpenses,
           workerSessions: closedSessions,
           dayMeta: endedMeta,
           bankTx: updatedBankTx,
           nextOrderNo: 1,
-          inventoryLocked: false,
-          inventoryLockedAt: null,
           historicalOrders: newHistoricalOrders,
           historicalExpenses: newHistoricalExpenses,
           historicalPurchases: newHistoricalPurchases,
@@ -7945,76 +7539,6 @@ const recordCustomerFromOrder = (order) => {
     return upsertCustomer(prev, updated);
   });
 };
-// eslint-disable-next-line no-unused-vars
-const buildCurrentReceiptOrder = () => {
-  const total = currentOrderTotal;
-  const itemsTotal = roundMoney(Math.max(0, cartItemsSubtotal - currentDiscountAmount));
-  const orderCustomerName =
-    orderType === "Delivery"
-      ? String(deliveryName || "").trim()
-      : String(customerName || "").trim();
-  const orderCustomerPhone =
-    orderType === "Delivery"
-      ? normalizePhone(deliveryPhone)
-      : normalizePhone(customerPhone);
-
-  let paymentLabel = payment || "Unspecified";
-  let paymentParts = [];
-  if (splitPay) {
-    if (payA) paymentParts.push({ method: payA, amount: Math.max(0, Number(amtA || 0)) });
-    if (payB) paymentParts.push({ method: payB, amount: Math.max(0, Number(amtB || 0)) });
-    paymentLabel = summarizePaymentParts(paymentParts, "Split");
-  } else {
-    paymentParts = [{ method: paymentLabel, amount: total }];
-    paymentLabel = summarizePaymentParts(paymentParts, paymentLabel);
-  }
-
-  let cashVal = null;
-  let changeDue = null;
-  if (splitPay) {
-    const cashPart = paymentParts.find((p) => p.method === "Cash");
-    if (cashPart) {
-      cashVal = Number(cashReceivedSplit || 0);
-      changeDue = Math.max(0, cashVal - Number(cashPart.amount || 0));
-    }
-  } else if (payment === "Cash") {
-    cashVal = Number(cashReceived || 0);
-    changeDue = Math.max(0, cashVal - total);
-  }
-
-  const now = new Date();
-  return enrichOrderWithChannel({
-    orderNo: nextOrderNo,
-    date: now,
-    createdAt: now,
-    updatedAt: now,
-    lastModifiedDeviceId: DEVICE_ID,
-    syncStatus: SYNC_STATUS.pending,
-    worker: worker || "Not selected",
-    payment: paymentLabel,
-    paymentParts,
-    orderType,
-    deliveryFee: currentDeliveryFee,
-    deliveryName: orderCustomerName,
-    deliveryPhone: orderCustomerPhone,
-    deliveryAddress: orderType === "Delivery" ? String(deliveryAddress || "").trim() : "",
-    deliveryZoneId: orderType === "Delivery" ? deliveryZoneId || "" : "",
-    notifyViaWhatsapp: false,
-    whatsappSentAt: null,
-    total,
-    itemsTotal,
-    discountPercentage: 0,
-    discountAmount: currentDiscountAmount,
-    cashReceived: cashVal,
-    changeDue,
-    cart,
-    done: false,
-    voided: false,
-    restockedAt: undefined,
-    note: orderNote.trim(),
-    source: "onsite",
-  });
-};
 const checkout = async () => {
   if (isCheckingOut) return;
   setIsCheckingOut(true);
@@ -8091,23 +7615,12 @@ const checkout = async () => {
         );
       }
     }
-    const ts = Date.now();
-    const newLedgerItems = [];
-    for (const [id, need] of Object.entries(required)) {
-      if (need) {
-        newLedgerItems.push({
-          id: `il_${clientIdRef.current}_${ts}_${id}_${Math.random().toString(36).substring(2, 7)}`,
-          itemId: id,
-          qty: -need,
-          createdAt: new Date(ts).toISOString(),
-          updatedAt: new Date(ts).toISOString(),
-          syncStatus: SYNC_STATUS.pending
-        });
-      }
-    }
-    if (newLedgerItems.length > 0) {
-      setInventoryLedger(prev => [...prev, ...newLedgerItems]);
-    }
+    setInventory((inv) =>
+      inv.map((it) => {
+        const need = Number(required[it.id] || 0);
+        return need ? { ...it, qty: it.qty - need } : it;
+      })
+    );
 
     const itemsTotal = roundMoney(Math.max(0, cartItemsSubtotal - currentDiscountAmount));
     const delFee = currentDeliveryFee;
@@ -8152,10 +7665,6 @@ const checkout = async () => {
     let order = enrichOrderWithChannel({
       orderNo: optimisticNo,
       date: new Date(),
-      createdAt: new Date(),
-      updatedAt: new Date(),
-      lastModifiedDeviceId: DEVICE_ID,
-      syncStatus: SYNC_STATUS.pending,
       worker,
       payment: paymentLabel,
       paymentParts,
@@ -8184,6 +7693,9 @@ const checkout = async () => {
       source: "onsite",
     });
     recordCustomerFromOrder(order);
+    if (autoPrintOnCheckout) {
+      printReceiptHTML(order, Number(preferredPaperWidthMm) || 80, "Customer");
+    }
     setNextOrderNo(optimisticNo + 1);
     let allocatedNo = optimisticNo;
     if (cloudEnabled && counterDocRef && fbUser) {
@@ -8201,23 +7713,20 @@ const checkout = async () => {
         console.warn("Atomic order number allocation failed, using optimistic number.", e);
       }
     }
-    setOrders((o) => dedupeOrders([order, ...o]));
+    if (!realtimeOrders) setOrders((o) => [order, ...o]);
     if (cloudEnabled && ordersColRef && fbUser) {
       try {
         const ref = await addOrder(order);
-        setOrders((prev) =>
-          prev.map((oo) =>
-            oo.orderNo === order.orderNo ? { ...oo, cloudId: ref.id, syncStatus: SYNC_STATUS.synced } : oo
-          )
-        );
+        if (!realtimeOrders) {
+          setOrders((prev) =>
+            prev.map((oo) =>
+              oo.orderNo === order.orderNo ? { ...oo, cloudId: ref.id } : oo
+            )
+          );
+        }
       } catch (e) {
         console.warn("Cloud order write failed:", e);
       }
-    }
-    if (autoPrintOnCheckout) {
-      void printReceiptHTML(order, Number(preferredPaperWidthMm) || 80, "Customer").catch((err) => {
-        console.warn("Receipt auto-print failed:", err);
-      });
     }
     setCart([]);
     setWorker("");
@@ -8274,23 +7783,14 @@ const integrateOnlineOrder = async (onlineOrder) => {
     return { ...prev, [key]: entry };
   });
 
-  const ts = Date.now();
-  const newLedgerItems = [];
-  for (const [id, need] of Object.entries(required)) {
-    if (need) {
-      newLedgerItems.push({
-        id: `il_${clientIdRef.current}_${ts}_${id}_${Math.random().toString(36).substring(2, 7)}`,
-        itemId: id,
-        qty: -need,
-        createdAt: new Date(ts).toISOString(),
-        updatedAt: new Date(ts).toISOString(),
-        syncStatus: SYNC_STATUS.pending
-      });
-    }
-  }
-  if (newLedgerItems.length > 0) {
-    setInventoryLedger(prev => [...prev, ...newLedgerItems]);
-  }
+  setInventory((inv) =>
+    inv.map((item) => {
+      const need = Number(required[item.id] || 0);
+      if (!need) return item;
+      const nextQty = Number(item.qty || 0) - need;
+      return { ...item, qty: Number(nextQty.toFixed(4)) };
+    })
+  );
 
   const deliveryFee = Number(onlineOrder.deliveryFee || 0);
   const computedItemsTotal = cartWithUses.reduce((sum, line) => {
@@ -8446,10 +7946,6 @@ const onlineFallbackId =
   let posOrder = enrichOrderWithChannel({
     orderNo,
     date: new Date(),
-    createdAt: new Date(),
-    updatedAt: new Date(),
-    lastModifiedDeviceId: DEVICE_ID,
-    syncStatus: SYNC_STATUS.pending,
     worker: dayMeta.currentWorker || "Online",
     payment: paymentLabel,
     paymentParts,
@@ -8698,16 +8194,18 @@ const onlineFallbackId =
     }
   }
 
-  setOrders((o) => dedupeOrders([posOrder, ...o]));
+  if (!realtimeOrders) setOrders((o) => [posOrder, ...o]);
   if (cloudEnabled && ordersColRef && fbUser) {
     try {
       const ref = await addOrder(posOrder);
       posOrder.cloudId = ref.id;
-      setOrders((prev) =>
-        prev.map((ord) =>
-          ord.orderNo === posOrder.orderNo ? { ...ord, cloudId: ref.id, syncStatus: SYNC_STATUS.synced } : ord
-        )
-      );
+      if (!realtimeOrders) {
+        setOrders((prev) =>
+          prev.map((ord) =>
+            ord.orderNo === posOrder.orderNo ? { ...ord, cloudId: ref.id } : ord
+          )
+        );
+      }
     } catch (err) {
       console.warn("Cloud write failed for online order integration:", err);
     }
@@ -8736,29 +8234,23 @@ const onlineFallbackId =
   return posOrder;
 };
 const markOrderDone = async (orderNo) => {
-  const updatedAt = new Date().toISOString();
-  setOrders((o) =>
-    o.map((ordr) =>
-      ordr.orderNo !== orderNo || ordr.done
-        ? ordr
-        : {
-            ...ordr,
-            done: true,
-            updatedAt,
-            lastModifiedDeviceId: DEVICE_ID,
-            syncStatus: SYNC_STATUS.pending,
-          }
-    )
-  );
+  // If not live, update locally
+  if (!realtimeOrders) {
+    setOrders((o) =>
+      o.map((ordr) =>
+        ordr.orderNo !== orderNo || ordr.done
+          ? ordr
+          : { ...ordr, done: true }
+      )
+    );
+  }
 
   try {
     if (!cloudEnabled || !ordersColRef || !fbUser) return;
     let targetId = orders.find((o) => o.orderNo === orderNo)?.cloudId;
     const payload = {
       done: true,
-      updatedAt,
-      lastModifiedDeviceId: DEVICE_ID,
-      syncStatus: SYNC_STATUS.synced,
+      updatedAt: new Date().toISOString(),
     };
     if (targetId) await updateOrderById(targetId, payload);
     else await updateOrderByOrderNo(orderNo, payload);
@@ -8825,7 +8317,7 @@ const voidOrderAndRestock = async (orderNo) => {
   if (ord.done) return alert("This order is DONE and cannot be cancelled.");
   if (ord.voided) return alert("This order is already cancelled/returned.");
 
-  const reasonRaw = await promptText(
+  const reasonRaw = window.prompt(
     `Reason for CANCEL (restock) — order #${orderNo}:`,
     ""
   );
@@ -8839,40 +8331,23 @@ const voidOrderAndRestock = async (orderNo) => {
       giveBack[k] = (giveBack[k] || 0) + (uses[k] || 0);
     }
   }
-  const ts = Date.now();
-  const newLedgerItems = [];
-  for (const [id, back] of Object.entries(giveBack)) {
-    if (back) {
-      newLedgerItems.push({
-        id: `il_${clientIdRef.current}_${ts}_${id}_${Math.random().toString(36).substring(2, 7)}`,
-        itemId: id,
-        qty: back,
-        createdAt: new Date(ts).toISOString(),
-        updatedAt: new Date(ts).toISOString(),
-        syncStatus: SYNC_STATUS.pending
-      });
-    }
-  }
-  if (newLedgerItems.length > 0) {
-    setInventoryLedger(prev => [...prev, ...newLedgerItems]);
-  }
+  setInventory((inv) =>
+    inv.map((it) => {
+      const back = giveBack[it.id] || 0;
+      return back ? { ...it, qty: it.qty + back } : it;
+    })
+  );
 
   const when = new Date();
-  setOrders((o) =>
-    o.map((x) =>
-      x.orderNo === orderNo
-        ? {
-            ...x,
-            voided: true,
-            restockedAt: when,
-            voidReason: reason,
-            updatedAt: when,
-            lastModifiedDeviceId: DEVICE_ID,
-            syncStatus: SYNC_STATUS.pending,
-          }
-        : x
-    )
-  );
+  if (!realtimeOrders) {
+    setOrders((o) =>
+      o.map((x) =>
+        x.orderNo === orderNo
+          ? { ...x, voided: true, restockedAt: when, voidReason: reason }
+          : x
+      )
+    );
+  }
 
   try {
     if (!cloudEnabled || !ordersColRef || !fbUser) return;
@@ -8882,8 +8357,6 @@ const voidOrderAndRestock = async (orderNo) => {
       voidReason: reason,
       restockedAt: toIso(when),
       updatedAt: new Date().toISOString(),
-      lastModifiedDeviceId: DEVICE_ID,
-      syncStatus: SYNC_STATUS.synced,
     };
     if (targetId) await updateOrderById(targetId, payload);
     else await updateOrderByOrderNo(orderNo, payload);
@@ -8899,7 +8372,7 @@ const voidOrderToExpense = async (orderNo) => {
   if (!isExpenseVoidEligible(ord.orderType)) {
     return alert("This action is only for non Dine-in / Take-Away orders.");
   }
-  const reasonRaw = await promptText(
+  const reasonRaw = window.prompt(
     `Reason for RETURN (no restock) — order #${orderNo}:`,
     ""
   );
@@ -8914,7 +8387,6 @@ const voidOrderToExpense = async (orderNo) => {
     `Void order #${orderNo} WITHOUT restock and add expense for wasted items (E£${itemsOnly.toFixed(2)})?`
   );
   if (!ok) return;
-  const when = new Date();
   const expRow = {
     id: `exp_ret_${orderNo}_${Date.now()}`,
     name: `Returned order #${orderNo} — ${ord.orderType || "-"}`,
@@ -8922,31 +8394,21 @@ const voidOrderToExpense = async (orderNo) => {
     qty: 1,
     unitPrice: itemsOnly,
     note: reason,
-    date: when,
+    date: new Date(),
     locked: true,
     source: "order_return",
     orderNo,
-    createdAt: when,
-    updatedAt: when,
-    lastModifiedDeviceId: DEVICE_ID,
-    syncStatus: SYNC_STATUS.pending,
   };
   setExpenses((arr) => [expRow, ...arr]);
-  setOrders((o) =>
-    o.map((x) =>
-      x.orderNo === orderNo
-        ? {
-            ...x,
-            voided: true,
-            restockedAt: undefined,
-            voidReason: reason,
-            updatedAt: when,
-            lastModifiedDeviceId: DEVICE_ID,
-            syncStatus: SYNC_STATUS.pending,
-          }
-        : x
-    )
-  );
+  if (!realtimeOrders) {
+    setOrders((o) =>
+      o.map((x) =>
+        x.orderNo === orderNo
+          ? { ...x, voided: true, restockedAt: undefined, voidReason: reason }
+          : x
+      )
+    );
+  }
 
   try {
     if (cloudEnabled && ordersColRef && fbUser) {
@@ -8955,8 +8417,6 @@ const voidOrderToExpense = async (orderNo) => {
         voided: true,
         voidReason: reason,
         updatedAt: new Date().toISOString(),
-        lastModifiedDeviceId: DEVICE_ID,
-        syncStatus: SYNC_STATUS.synced,
       };
       if (targetId) await updateOrderById(targetId, payload);
       else await updateOrderByOrderNo(orderNo, payload);
@@ -8986,15 +8446,15 @@ const voidOrderToExpense = async (orderNo) => {
   }, [reportFilter, reportDay, reportMonth, dayMeta]);
 
 
-  const resetReports = async () => {
-    const adminNum = await promptAdminAndPin();
+  const resetReports = () => {
+    const adminNum = promptAdminAndPin();
     if (!adminNum) return;
-    const phrase = await promptText(
+    const phrase = window.prompt(
       `Admin ${adminNum}: type RESET REPORT HISTORY to permanently clear reports.`,
       ""
     );
     if (String(phrase || "").trim() !== "RESET REPORT HISTORY") return;
-    const reason = String((await promptText("Enter reset reason:", "")) || "").trim();
+    const reason = String(window.prompt("Enter reset reason:", "") || "").trim();
     if (!reason) return alert("A reset reason is required.");
 
     const now = new Date();
@@ -9739,8 +9199,8 @@ if (targetItem) {
   setNewCategoryName("");
   setNewCategoryUnit("piece");
 };
-const resetAllPurchases = async () => {
-  const okAdmin = !!(await promptAdminAndPin());
+const resetAllPurchases = () => {
+  const okAdmin = !!promptAdminAndPin();
   if (!okAdmin) return;
   if (!window.confirm("Reset ALL purchases (cannot be undone)?")) return;
   setPurchases([]);
@@ -10051,10 +9511,10 @@ const endedStr   = m.endedAt   ? fmtDateTime(m.endedAt)   : "—";
     transition: "background 0.2s ease, color 0.2s ease",
   };
 
-const handleTabClick = async (key) => {
+const handleTabClick = (key) => {
   if (key === "admin") {
     if (!adminUnlocked) {
-      const ok = !!(await promptAdminAndPin()); // uses your existing Admin PINs (1..6)
+      const ok = !!promptAdminAndPin(); // uses your existing Admin PINs (1..6)
       if (!ok) return;                  // stay on current tab if PIN fails/cancelled
       setAdminUnlocked(true);
     }
@@ -12873,7 +12333,8 @@ const cogs = Number(
                             DONE (locked)
                           </button>
                         )}
-                        {/* Print receipt */}
+
+                        {/* Single Print button (removed all other print options) */}
                         <button
                           onClick={() =>
                             printReceiptHTML(o, Number(preferredPaperWidthMm) || 80, "Customer")
@@ -15036,8 +14497,8 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
       ))}
 {/* Add this reset button */}
       <button
-        onClick={async () => {
-          const okAdmin = !!(await promptAdminAndPin());
+        onClick={() => {
+          const okAdmin = !!promptAdminAndPin();
           if (!okAdmin) return;
           if (!window.confirm("Reset ALL bank transactions? This cannot be undone.")) return;
           skipLockedBankReinsertRef.current = true;
@@ -17227,13 +16688,10 @@ setExtraList((arr) => [
     Sync to Cloud
   </button>
   <button onClick={loadFromCloud} style={{ background: "#1976d2", color: "#fff", border: "none", borderRadius: 6, padding: "6px 10px" }}>
-    Refresh from Cloud
+    Load from Cloud
   </button>
   <small style={{ opacity: 0.8 }}>
     Last save: {cloudStatus.lastSaveAt ? cloudStatus.lastSaveAt.toLocaleString() : "—"} • Last load: {cloudStatus.lastLoadAt ? cloudStatus.lastLoadAt.toLocaleString() : "—"}
-  </small>
-  <small style={{ opacity: 0.8 }}>
-    Device: {DEVICE_ID} {isSupabaseConfigured ? "" : "Local mode"}
   </small>
   {cloudStatus.error && (
     <small style={{ color: "#c62828" }}>Error: {String(cloudStatus.error)}</small>
