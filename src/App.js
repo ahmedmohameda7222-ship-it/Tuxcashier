@@ -1318,7 +1318,6 @@ export function packStateForCloud(state) {
     beverageList,
     orders,
     inventory,
-    inventoryLedger,
     bulkInventoryItems,
     bulkInventoryHistory,
     nextOrderNo,
@@ -3190,23 +3189,6 @@ async function loadPosState() {
     .maybeSingle();
   if (error) throw error;
   return posStateFromRow(data);
-}
-
-async function savePosState(state) {
-  if (!supabase) throw new Error("Supabase is not configured.");
-  const safeState = sanitizeForSupabase(state || {});
-  const row = {
-    id: POS_STATE_ID,
-    shop_id: SHOP_ID,
-    state: safeState,
-    writer_id: safeState?.writerId || null,
-    last_modified_device_id: safeState?.lastModifiedDeviceId || safeState?.deviceId || DEVICE_ID,
-    write_seq: Number(safeState?.writeSeq || 0),
-    client_time: safeState?.clientTime != null ? Number(safeState.clientTime) : null,
-    updated_at: new Date().toISOString(),
-  };
-  const { error } = await supabase.from("pos_state").upsert(row, { onConflict: "id" });
-  if (error) throw error;
 }
 
 async function savePosStateOptimistic(state, expectedSeq) {
@@ -5122,6 +5104,7 @@ useEffect(() => {
     }
     return changed ? out : prev;
   });
+// eslint-disable-next-line react-hooks/exhaustive-deps
 }, [purchaseCategories, localHydrated, hydrated]);
 useEffect(() => {
   if (!newPurchase.categoryId || newPurchase.ingredientId) return;
@@ -5511,6 +5494,7 @@ const buildFullStateForCloud = useCallback(
       },
       options
     ),
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   [
     withPersistedAdminSettings,
     realtimeOrders,
@@ -5634,6 +5618,7 @@ const writeFullStateToCloud = useCallback(
     console.error("Failed to sync to cloud after maximum OCC retry attempts.");
     throw new Error("Failed to sync to cloud due to high concurrency. Please try again.");
   },
+  // eslint-disable-next-line no-use-before-define
   [stateDocRef, fbUser, buildFullStateForCloud, syncWithCloudNow]
 );
 const saveAdminSettings = useCallback(async () => {
@@ -5884,6 +5869,7 @@ const applyRemoteState = useCallback(
 
     return unpacked;
   },
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   [
     dayMeta,
     realtimeOrders,
@@ -7959,6 +7945,7 @@ const recordCustomerFromOrder = (order) => {
     return upsertCustomer(prev, updated);
   });
 };
+// eslint-disable-next-line no-unused-vars
 const buildCurrentReceiptOrder = () => {
   const total = currentOrderTotal;
   const itemsTotal = roundMoney(Math.max(0, cartItemsSubtotal - currentDiscountAmount));
