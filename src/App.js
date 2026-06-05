@@ -5618,8 +5618,8 @@ const writeFullStateToCloud = useCallback(
     console.error("Failed to sync to cloud after maximum OCC retry attempts.");
     throw new Error("Failed to sync to cloud due to high concurrency. Please try again.");
   },
-  // eslint-disable-next-line no-use-before-define
-  [stateDocRef, fbUser, buildFullStateForCloud, syncWithCloudNow]
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  [stateDocRef, fbUser, buildFullStateForCloud]
 );
 const saveAdminSettings = useCallback(async () => {
   const stamp = nowIso();
