@@ -3137,6 +3137,8 @@ async function loadPosState() {
 
 async function savePosState(state) {
   const safeState = sanitizeForSupabase(state || {});
+  const expectedSeq = Number(safeState?.writeSeq || 1) - 1;
+
   const row = {
     id: POS_STATE_ID,
     shop_id: SHOP_ID,
@@ -3146,8 +3148,27 @@ async function savePosState(state) {
     client_time: safeState?.clientTime != null ? Number(safeState.clientTime) : null,
     updated_at: new Date().toISOString(),
   };
-  const { error } = await supabase.from("pos_state").upsert(row, { onConflict: "id" });
-  if (error) throw error;
+
+  const { data: existing } = await supabase
+    .from("pos_state")
+    .select("write_seq")
+    .eq("id", POS_STATE_ID)
+    .maybeSingle();
+
+  if (!existing) {
+    const { error } = await supabase.from("pos_state").insert(row);
+    if (error) throw error;
+  } else {
+    if (Number(existing.write_seq) > expectedSeq) {
+      throw new Error(`Concurrency conflict: cloud seq ${existing.write_seq} > local seq ${expectedSeq}`);
+    }
+    const { error } = await supabase
+      .from("pos_state")
+      .update(row)
+      .eq("id", POS_STATE_ID)
+      .eq("write_seq", existing.write_seq);
+    if (error) throw error;
+  }
 }
 
 function subscribeToPosState(callback) {
@@ -3177,7 +3198,10 @@ async function loadOrders(startDate, endDate) {
     .eq("shop_id", SHOP_ID)
     .order("created_at", { ascending: false });
 
-  const startIso = toIso(startDate);
+  const twelveHoursAgo = new Date(Date.now() - 12 * 60 * 60 * 1000);
+  const effectiveStartDate = startDate && startDate > twelveHoursAgo ? startDate : twelveHoursAgo;
+
+  const startIso = toIso(effectiveStartDate);
   const endIso = toIso(endDate);
   if (startIso) request = request.gte("created_at", startIso);
   if (endIso) request = request.lte("created_at", endIso);
