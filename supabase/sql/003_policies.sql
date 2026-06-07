@@ -1,6 +1,7 @@
 alter table public.pos_state enable row level security;
 alter table public.orders enable row level security;
 alter table public.counters enable row level security;
+alter table public.devices enable row level security;
 
 drop policy if exists "anon can select pos_state" on public.pos_state;
 create policy "anon can select pos_state"
@@ -77,10 +78,30 @@ on public.counters for delete
 to anon
 using (true);
 
+drop policy if exists "anon can select devices" on public.devices;
+create policy "anon can select devices"
+on public.devices for select
+to anon
+using (true);
+
+drop policy if exists "anon can insert devices" on public.devices;
+create policy "anon can insert devices"
+on public.devices for insert
+to anon
+with check (true);
+
+drop policy if exists "anon can update devices" on public.devices;
+create policy "anon can update devices"
+on public.devices for update
+to anon
+using (true)
+with check (true);
+
 grant usage on schema public to anon;
 grant select, insert, update, delete on public.pos_state to anon;
 grant select, insert, update, delete on public.orders to anon;
 grant select, insert, update, delete on public.counters to anon;
+grant select, insert, update on public.devices to anon;
 grant execute on function public.allocate_order_no(text) to anon;
 grant execute on function public.reset_order_counter(text, integer) to anon;
 
@@ -102,6 +123,13 @@ begin
 
   begin
     alter publication supabase_realtime add table public.counters;
+  exception
+    when duplicate_object then null;
+    when undefined_object then null;
+  end;
+
+  begin
+    alter publication supabase_realtime add table public.devices;
   exception
     when duplicate_object then null;
     when undefined_object then null;

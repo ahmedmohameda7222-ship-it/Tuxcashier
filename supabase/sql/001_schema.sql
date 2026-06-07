@@ -15,6 +15,10 @@ create table if not exists public.orders (
   id uuid primary key default gen_random_uuid(),
   shop_id text not null,
   order_no integer,
+  day_id text,
+  shift_started_at timestamptz,
+  shift_ended_at timestamptz,
+  device_id text,
   worker text,
   payment text,
   payment_parts jsonb default '[]'::jsonb,
@@ -60,15 +64,39 @@ create table if not exists public.counters (
   updated_at timestamptz not null default now()
 );
 
+create table if not exists public.devices (
+  device_id text primary key,
+  shop_id text not null,
+  label text,
+  mode text not null default 'pending'
+    check (mode in ('pending', 'listen', 'write', 'read_write', 'admin', 'blocked')),
+  os text,
+  browser text,
+  platform text,
+  last_ip text,
+  user_agent text,
+  approved_by text,
+  blocked_at timestamptz,
+  first_seen_at timestamptz not null default now(),
+  last_seen_at timestamptz not null default now(),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
 create index if not exists idx_pos_state_shop_id on public.pos_state (shop_id);
 create index if not exists idx_orders_shop_id on public.orders (shop_id);
 create index if not exists idx_orders_order_no on public.orders (order_no);
+create index if not exists idx_orders_shop_day_id on public.orders (shop_id, day_id);
+create index if not exists idx_orders_shop_day_date on public.orders (shop_id, day_id, date desc);
+create index if not exists idx_orders_device_id on public.orders (device_id);
 create index if not exists idx_orders_created_at on public.orders (created_at);
 create index if not exists idx_orders_date on public.orders (date);
 create index if not exists idx_orders_done on public.orders (done);
 create index if not exists idx_orders_voided on public.orders (voided);
 create index if not exists idx_orders_online_order_id on public.orders (online_order_id);
 create index if not exists idx_orders_idem_key on public.orders (idem_key);
+create index if not exists idx_devices_shop_id on public.devices (shop_id);
+create index if not exists idx_devices_mode on public.devices (mode);
 
 create or replace function public.touch_updated_at()
 returns trigger
@@ -93,6 +121,11 @@ for each row execute function public.touch_updated_at();
 drop trigger if exists trg_counters_touch_updated_at on public.counters;
 create trigger trg_counters_touch_updated_at
 before update on public.counters
+for each row execute function public.touch_updated_at();
+
+drop trigger if exists trg_devices_touch_updated_at on public.devices;
+create trigger trg_devices_touch_updated_at
+before update on public.devices
 for each row execute function public.touch_updated_at();
 
 create or replace function public.allocate_order_no(p_shop_id text)
@@ -139,3 +172,4 @@ $$;
 alter table public.pos_state replica identity full;
 alter table public.orders replica identity full;
 alter table public.counters replica identity full;
+alter table public.devices replica identity full;

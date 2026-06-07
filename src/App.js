@@ -484,6 +484,114 @@ async function sendEmailJsEmail(templateParams = {}) {
 
 const SHOP_ID = "tux";
 const POS_STATE_ID = "pos";
+const DEVICE_ID_KEY = "tuxcashier_device_id";
+const DEVICE_IP_CACHE_KEY = "tuxcashier_device_ip";
+const MAX_ACTIVE_SHIFT_MS = 24 * 60 * 60 * 1000;
+
+const DEVICE_MODE_OPTIONS = [
+  { value: "pending", label: "Pending", canListen: false, canWrite: false, canAdmin: false },
+  { value: "listen", label: "Listen only", canListen: true, canWrite: false, canAdmin: false },
+  { value: "write", label: "Write only", canListen: false, canWrite: true, canAdmin: false },
+  { value: "read_write", label: "Listen + write", canListen: true, canWrite: true, canAdmin: false },
+  { value: "admin", label: "Admin device", canListen: true, canWrite: true, canAdmin: true },
+  { value: "blocked", label: "Blocked", canListen: false, canWrite: false, canAdmin: false },
+];
+
+function getDeviceModeMeta(mode) {
+  return DEVICE_MODE_OPTIONS.find((opt) => opt.value === mode) || DEVICE_MODE_OPTIONS[0];
+}
+
+function getOrCreateDeviceId() {
+  try {
+    const existing = localStorage.getItem(DEVICE_ID_KEY);
+    if (existing) return existing;
+    const randomPart =
+      typeof crypto !== "undefined" && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const id = `dev_${randomPart}`;
+    localStorage.setItem(DEVICE_ID_KEY, id);
+    return id;
+  } catch {
+    return `dev_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  }
+}
+
+function detectDeviceDetails() {
+  const nav = typeof navigator !== "undefined" ? navigator : {};
+  const ua = String(nav.userAgent || "");
+  const platform = nav.userAgentData?.platform || nav.platform || "";
+  const os =
+    /Windows/i.test(ua)
+      ? "Windows"
+      : /Android/i.test(ua)
+      ? "Android"
+      : /iPhone|iPad|iPod/i.test(ua)
+      ? "iOS"
+      : /Mac OS|Macintosh/i.test(ua)
+      ? "macOS"
+      : /Linux/i.test(ua)
+      ? "Linux"
+      : platform || "Unknown";
+  const browser =
+    /Edg\//i.test(ua)
+      ? "Edge"
+      : /Chrome\//i.test(ua) && !/Edg\//i.test(ua)
+      ? "Chrome"
+      : /Safari\//i.test(ua) && !/Chrome\//i.test(ua)
+      ? "Safari"
+      : /Firefox\//i.test(ua)
+      ? "Firefox"
+      : "Browser";
+
+  return {
+    deviceId: getOrCreateDeviceId(),
+    label: `${os} ${browser}`,
+    os,
+    browser,
+    platform,
+    userAgent: ua,
+  };
+}
+
+async function fetchDevicePublicIp() {
+  try {
+    const cachedRaw = localStorage.getItem(DEVICE_IP_CACHE_KEY);
+    if (cachedRaw) {
+      const cached = JSON.parse(cachedRaw);
+      if (cached?.ip && Date.now() - Number(cached.at || 0) < 10 * 60 * 1000) {
+        return cached.ip;
+      }
+    }
+  } catch {
+    // ignore cache failures
+  }
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2500);
+    const response = await fetch("https://api.ipify.org?format=json", {
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!response.ok) return "";
+    const data = await response.json();
+    const ip = String(data?.ip || "");
+    if (ip) {
+      try {
+        localStorage.setItem(
+          DEVICE_IP_CACHE_KEY,
+          JSON.stringify({ ip, at: Date.now() })
+        );
+      } catch {
+        // ignore cache failures
+      }
+    }
+    return ip;
+  } catch {
+    return "";
+  }
+}
 const ONLINE_ORDER_COLLECTIONS = [];
 
 const LS_KEY = "tux_pos_local_state_v1";
@@ -1780,6 +1888,10 @@ function normalizeOrderForSupabase(order) {
   return sanitizeForSupabase({
     shop_id: SHOP_ID,
     order_no: normalized.orderNo,
+    day_id: normalized.dayId || "",
+    shift_started_at: toIso(normalized.shiftStartedAt),
+    shift_ended_at: toIso(normalized.shiftEndedAt),
+    device_id: normalized.deviceId || "",
     worker: normalized.worker,
     payment: normalized.payment,
     payment_parts: Array.isArray(normalized.paymentParts)
@@ -1827,6 +1939,10 @@ function orderFromSupabaseRow(row = {}) {
     cloudId: row.id,
 
     orderNo: row.order_no,
+    dayId: row.day_id || "",
+    shiftStartedAt: row.shift_started_at ? asDate(row.shift_started_at) : null,
+    shiftEndedAt: row.shift_ended_at ? asDate(row.shift_ended_at) : null,
+    deviceId: row.device_id || "",
     worker: row.worker,
     payment: row.payment,
     paymentParts: Array.isArray(row.payment_parts)
@@ -1863,6 +1979,8 @@ function orderFromSupabaseRow(row = {}) {
     onlineSourceDocId: row.online_source_doc_id || "",
     channel: row.channel || "",
     channelOrderNo: row.channel_order_no || "",
+    createdAt: row.created_at ? asDate(row.created_at) : undefined,
+    updatedAt: row.updated_at ? asDate(row.updated_at) : undefined,
   };
   return enrichOrderWithChannel(order);
 }
@@ -2563,14 +2681,45 @@ function getOnlineOrderDedupeKey(order) {
       .join(":");
   return key;
 }
+function orderDayBucket(order = {}) {
+  const dt = order.date ? new Date(order.date) : null;
+  if (!dt || Number.isNaN(+dt)) return "unknown_day";
+  return dt.toISOString().slice(0, 10);
+}
+
+function orderDedupeKey(order = {}) {
+  const firstStrongKey = [
+    order.cloudId ? `cloud_${order.cloudId}` : "",
+    order.id ? `id_${order.id}` : "",
+    order.idemKey ? `idem_${order.idemKey}` : "",
+    order.onlineOrderId ? `online_id_${order.onlineOrderId}` : "",
+    order.onlineOrderKey ? `online_key_${order.onlineOrderKey}` : "",
+  ].find(Boolean);
+  if (firstStrongKey) return firstStrongKey;
+
+  const dayKey = order.dayId || orderDayBucket(order);
+  if (order.channelOrderNo) return `channel_${dayKey}_${order.channelOrderNo}`;
+  if (order.orderNo != null) return `order_${dayKey}_${order.orderNo}`;
+  return [
+    "fallback",
+    dayKey,
+    toMillis(order.date) || toMillis(order.createdAt) || "",
+    order.worker || "",
+    order.total || "",
+  ].join("_");
+}
+
 function dedupeOrders(list) {
-  const byNo = new Map();
+  const byKey = new Map();
   for (const o of list || []) {
-    const prev = byNo.get(o.orderNo);
-    if (!prev || +new Date(o.date) > +new Date(prev.date)) byNo.set(o.orderNo, o);
+    const key = orderDedupeKey(o);
+    const prev = byKey.get(key);
+    const currentUpdated = recordUpdatedMs(o) || toMillis(o.date) || 0;
+    const previousUpdated = recordUpdatedMs(prev) || toMillis(prev?.date) || 0;
+    if (!prev || currentUpdated >= previousUpdated) byKey.set(key, o);
   }
-  return Array.from(byNo.values()).sort(
-    (a, b) => +new Date(b.date) - +new Date(a.date)
+  return Array.from(byKey.values()).sort(
+    (a, b) => +(new Date(b.date || b.createdAt || 0)) - +(new Date(a.date || a.createdAt || 0))
   );
 }
 const BASE_MENU = [
@@ -3191,20 +3340,24 @@ function subscribeToPosState(callback) {
   };
 }
 
-async function loadOrders(startDate, endDate) {
+async function loadOrders(startDate, endDate, dayId = "") {
   let request = supabase
     .from("orders")
     .select("*")
     .eq("shop_id", SHOP_ID)
-    .order("created_at", { ascending: false });
+    .order("date", { ascending: false });
+
+  if (dayId) {
+    request = request.eq("day_id", dayId);
+  }
 
   const twelveHoursAgo = new Date(Date.now() - 12 * 60 * 60 * 1000);
-  const effectiveStartDate = startDate && startDate > twelveHoursAgo ? startDate : twelveHoursAgo;
+  const effectiveStartDate = startDate || twelveHoursAgo;
 
   const startIso = toIso(effectiveStartDate);
   const endIso = toIso(endDate);
-  if (startIso) request = request.gte("created_at", startIso);
-  if (endIso) request = request.lte("created_at", endIso);
+  if (startIso && !dayId) request = request.gte("date", startIso);
+  if (endIso) request = request.lte("date", endIso);
 
   const { data, error } = await request;
   if (error) throw error;
@@ -3244,6 +3397,10 @@ async function addOrder(order) {
 function normalizeOrderPatchForSupabase(patch = {}) {
   const map = {
     orderNo: "order_no",
+    dayId: "day_id",
+    shiftStartedAt: "shift_started_at",
+    shiftEndedAt: "shift_ended_at",
+    deviceId: "device_id",
     paymentParts: "payment_parts",
     orderType: "order_type",
     deliveryFee: "delivery_fee",
@@ -3282,6 +3439,8 @@ function normalizeOrderPatchForSupabase(patch = {}) {
         "updated_at",
         "restocked_at",
         "whatsapp_sent_at",
+        "shift_started_at",
+        "shift_ended_at",
       ].includes(column)
     ) {
       row[column] = toIso(value);
@@ -3306,13 +3465,15 @@ async function updateOrderById(id, patch) {
   return data ? orderFromSupabaseRow(data) : null;
 }
 
-async function updateOrderByOrderNo(orderNo, patch) {
-  const { data, error } = await supabase
+async function updateOrderByOrderNo(orderNo, patch, dayId = "") {
+  let request = supabase
     .from("orders")
     .update(normalizeOrderPatchForSupabase(patch))
     .eq("shop_id", SHOP_ID)
     .eq("order_no", Number(orderNo))
     .select("*");
+  if (dayId) request = request.eq("day_id", dayId);
+  const { data, error } = await request;
   if (error) throw error;
   return (data || []).map(orderFromSupabaseRow);
 }
@@ -3327,12 +3488,12 @@ async function purgeOrdersInRange(startDate, endDate) {
     const startIso = toIso(startDate);
     const endIso = toIso(endDate);
     if (startIso) {
-      selectReq = selectReq.gte("created_at", startIso);
-      deleteReq = deleteReq.gte("created_at", startIso);
+      selectReq = selectReq.gte("date", startIso);
+      deleteReq = deleteReq.gte("date", startIso);
     }
     if (endIso) {
-      selectReq = selectReq.lte("created_at", endIso);
-      deleteReq = deleteReq.lte("created_at", endIso);
+      selectReq = selectReq.lte("date", endIso);
+      deleteReq = deleteReq.lte("date", endIso);
     }
     const { count, error: countError } = await selectReq;
     if (countError) throw countError;
@@ -3384,6 +3545,130 @@ function subscribeToCounter(callback) {
         filter: `shop_id=eq.${SHOP_ID}`,
       },
       (payload) => callback(Number(payload.new?.last_order_no || 0), payload)
+    )
+    .subscribe();
+
+  return () => {
+    supabase.removeChannel(channel);
+  };
+}
+
+function deviceFromSupabaseRow(row = {}) {
+  return {
+    deviceId: row.device_id || "",
+    shopId: row.shop_id || SHOP_ID,
+    label: row.label || "",
+    mode: row.mode || "pending",
+    os: row.os || "",
+    browser: row.browser || "",
+    platform: row.platform || "",
+    lastIp: row.last_ip || "",
+    userAgent: row.user_agent || "",
+    firstSeenAt: row.first_seen_at ? new Date(row.first_seen_at) : null,
+    lastSeenAt: row.last_seen_at ? new Date(row.last_seen_at) : null,
+    approvedBy: row.approved_by || "",
+    updatedAt: row.updated_at ? new Date(row.updated_at) : null,
+  };
+}
+
+async function loadDevices() {
+  const { data, error } = await supabase
+    .from("devices")
+    .select("*")
+    .eq("shop_id", SHOP_ID)
+    .order("last_seen_at", { ascending: false });
+  if (error) throw error;
+  return (data || []).map(deviceFromSupabaseRow);
+}
+
+async function registerOrTouchDevice(deviceInfo, lastIp = "") {
+  const deviceId = deviceInfo?.deviceId;
+  if (!deviceId) throw new Error("Missing device id.");
+  const now = new Date().toISOString();
+
+  const { data: existing, error: existingError } = await supabase
+    .from("devices")
+    .select("*")
+    .eq("shop_id", SHOP_ID)
+    .eq("device_id", deviceId)
+    .maybeSingle();
+  if (existingError) throw existingError;
+
+  const heartbeat = sanitizeForSupabase({
+    label: existing?.label || deviceInfo.label || deviceId,
+    os: deviceInfo.os || "",
+    browser: deviceInfo.browser || "",
+    platform: deviceInfo.platform || "",
+    user_agent: deviceInfo.userAgent || "",
+    last_ip: lastIp || existing?.last_ip || "",
+    last_seen_at: now,
+  });
+
+  if (existing) {
+    const { data, error } = await supabase
+      .from("devices")
+      .update(heartbeat)
+      .eq("shop_id", SHOP_ID)
+      .eq("device_id", deviceId)
+      .select("*")
+      .maybeSingle();
+    if (error) throw error;
+    return deviceFromSupabaseRow(data || existing);
+  }
+
+  const { count, error: countError } = await supabase
+    .from("devices")
+    .select("device_id", { count: "exact", head: true })
+    .eq("shop_id", SHOP_ID);
+  if (countError) throw countError;
+
+  const row = {
+    shop_id: SHOP_ID,
+    device_id: deviceId,
+    ...heartbeat,
+    mode: Number(count || 0) === 0 ? "admin" : "pending",
+    first_seen_at: now,
+  };
+  const { data, error } = await supabase
+    .from("devices")
+    .insert(row)
+    .select("*")
+    .single();
+  if (error) throw error;
+  return deviceFromSupabaseRow(data);
+}
+
+async function updateDeviceRecord(deviceId, patch = {}) {
+  const row = {};
+  if (patch.label != null) row.label = String(patch.label || "");
+  if (patch.mode != null) row.mode = String(patch.mode || "pending");
+  if (patch.approvedBy != null) row.approved_by = String(patch.approvedBy || "");
+  if (patch.mode === "blocked") row.blocked_at = new Date().toISOString();
+  if (patch.mode && patch.mode !== "blocked") row.blocked_at = null;
+
+  const { data, error } = await supabase
+    .from("devices")
+    .update(sanitizeForSupabase(row))
+    .eq("shop_id", SHOP_ID)
+    .eq("device_id", deviceId)
+    .select("*")
+    .maybeSingle();
+  if (error) throw error;
+  return data ? deviceFromSupabaseRow(data) : null;
+}
+
+function subscribeToDevices(callback) {
+  const channel = supabase
+    .channel(`devices-${SHOP_ID}`)
+    .on(
+      "postgres_changes",
+      {
+        event: "*",
+        schema: "public",
+        table: "devices",
+        filter: `shop_id=eq.${SHOP_ID}`,
+      },
+      callback
     )
     .subscribe();
 
@@ -4812,11 +5097,17 @@ const [lastLocalEditAt, setLastLocalEditAt] = useState(0);
   const [fbUser, setFbUser] = useState(null);
   const [cloudEnabled, setCloudEnabled] = useState(true);
   const [realtimeOrders, setRealtimeOrders] = useState(true);
-  const [cloudStatus, setCloudStatus] = useState({
-    lastSaveAt: null,
-    lastLoadAt: null,
-    error: null,
-  });
+const [cloudStatus, setCloudStatus] = useState({
+  lastSaveAt: null,
+  lastLoadAt: null,
+  error: null,
+});
+const [currentDeviceInfo] = useState(() => detectDeviceDetails());
+const [devices, setDevices] = useState([]);
+const [deviceStatus, setDeviceStatus] = useState({
+  lastSeenAt: null,
+  error: null,
+});
   const [hydrated, setHydrated] = useState(false);
   const [lastAppliedCloudAt, setLastAppliedCloudAt] = useState(0);
   // Prevent our own cloud writes from boomeranging back
@@ -4842,6 +5133,113 @@ const writeSeqRef = useRef(0);
       setCloudStatus((s) => ({ ...s, error: String(e) }));
     }
   }, []);
+const reloadDevices = useCallback(async () => {
+  try {
+    const all = await loadDevices();
+    setDevices(all);
+  } catch (err) {
+    console.warn("Device registry load failed:", err);
+    setDeviceStatus((s) => ({ ...s, error: String(err?.message || err) }));
+  }
+}, []);
+
+const refreshDevices = useCallback(async () => {
+  if (!fbUser) return;
+  try {
+    const ip = await fetchDevicePublicIp();
+    const current = await registerOrTouchDevice(currentDeviceInfo, ip);
+    await reloadDevices();
+    setDeviceStatus({ lastSeenAt: current.lastSeenAt || new Date(), error: null });
+  } catch (err) {
+    console.warn("Device registry sync failed:", err);
+    setDeviceStatus((s) => ({ ...s, error: String(err?.message || err) }));
+  }
+}, [fbUser, currentDeviceInfo, reloadDevices]);
+
+useEffect(() => {
+  if (!fbUser) return undefined;
+  let cancelled = false;
+  const sync = async () => {
+    if (cancelled) return;
+    await refreshDevices();
+  };
+  sync();
+  const heartbeat = setInterval(sync, 60 * 1000);
+  const unsub = subscribeToDevices(reloadDevices);
+  return () => {
+    cancelled = true;
+    clearInterval(heartbeat);
+    unsub();
+  };
+}, [fbUser, refreshDevices, reloadDevices]);
+
+const currentDevice = useMemo(
+  () => devices.find((d) => d.deviceId === currentDeviceInfo.deviceId) || null,
+  [devices, currentDeviceInfo.deviceId]
+);
+const currentDeviceMode = currentDevice?.mode || (deviceStatus.error ? "admin" : "pending");
+const currentDeviceModeMeta = getDeviceModeMeta(currentDeviceMode);
+const currentDeviceCanListen =
+  currentDeviceModeMeta.canListen || currentDeviceModeMeta.canAdmin || !!deviceStatus.error;
+const currentDeviceCanWrite =
+  currentDeviceModeMeta.canWrite || currentDeviceModeMeta.canAdmin || !!deviceStatus.error;
+const currentDeviceCanAdmin = currentDeviceModeMeta.canAdmin || !!deviceStatus.error;
+const assertDeviceCanWrite = useCallback(
+  (actionLabel = "write to the system") => {
+    if (currentDeviceCanWrite) return true;
+    alert(
+      `This device is set to "${currentDeviceModeMeta.label}" and cannot ${actionLabel}. Ask an admin to approve it in Admin -> Connected Devices.`
+    );
+    return false;
+  },
+  [currentDeviceCanWrite, currentDeviceModeMeta.label]
+);
+
+const updateDeviceMode = useCallback(
+  async (deviceId, mode) => {
+    if (!currentDeviceCanAdmin) {
+      alert("This device is not allowed to manage connected devices.");
+      return;
+    }
+    try {
+      const updated = await updateDeviceRecord(deviceId, {
+        mode,
+        approvedBy: dayMeta.currentWorker || "Admin",
+      });
+      if (updated) {
+        setDevices((list) =>
+          list.map((device) => (device.deviceId === updated.deviceId ? updated : device))
+        );
+      }
+      await refreshDevices();
+    } catch (err) {
+      console.warn("Device mode update failed:", err);
+      alert(`Device update failed: ${String(err?.message || err)}`);
+    }
+  },
+  [currentDeviceCanAdmin, dayMeta.currentWorker, refreshDevices]
+);
+
+const renameDevice = useCallback(
+  async (deviceId, label) => {
+    if (!currentDeviceCanAdmin) {
+      alert("This device is not allowed to manage connected devices.");
+      return;
+    }
+    try {
+      const updated = await updateDeviceRecord(deviceId, { label });
+      if (updated) {
+        setDevices((list) =>
+          list.map((device) => (device.deviceId === updated.deviceId ? updated : device))
+        );
+      }
+    } catch (err) {
+      console.warn("Device rename failed:", err);
+      alert(`Device rename failed: ${String(err?.message || err)}`);
+    }
+  },
+  [currentDeviceCanAdmin]
+);
   useEffect(() => {
   if (purchaseFilter === "day") {
     setNewPurchase(p => ({ ...p, date: purchaseDay }));
@@ -5329,6 +5727,7 @@ const writeFullStateToCloud = useCallback(
   [stateDocRef, fbUser, buildFullStateForCloud]
 );
 const saveAdminSettings = useCallback(async () => {
+  if (!assertDeviceCanWrite("save admin settings")) return;
   const stamp = nowIso();
   const localState = loadLocal();
   const sectionUpdatedAt = addSectionUpdatedAt(
@@ -5379,6 +5778,7 @@ const saveAdminSettings = useCallback(async () => {
   stateDocRef,
   fbUser,
   writeFullStateToCloud,
+  assertDeviceCanWrite,
 ]);
 const applyRemoteState = useCallback(
   (rawData, options = {}) => {
@@ -5594,6 +5994,7 @@ if (ts && lastLocalEditAt && ts < lastLocalEditAt) return;
  };
  const saveToCloudNow = async () => {
   if (!stateDocRef || !fbUser) return alert("Supabase not ready.");
+  if (!assertDeviceCanWrite("sync to cloud")) return;
   try {
     await writeFullStateToCloud();
     /*
@@ -5748,16 +6149,36 @@ useEffect(() => {
   const endedAtMs = dayMeta?.endedAt
     ? new Date(dayMeta.endedAt).getTime()
     : null;
+  const activeShiftIsStale =
+    !!startedAtMs && !endedAtMs && Date.now() - startedAtMs > MAX_ACTIVE_SHIFT_MS;
   useEffect(() => {
     if (!realtimeOrders || !ordersColRef || !fbUser) return;
-    if (!startedAtMs) {
+    if (!currentDeviceCanListen) {
       setOrders([]);
+      return;
+    }
+    if (!startedAtMs || endedAtMs) {
+      setOrders([]);
+      return;
+    }
+    if (activeShiftIsStale) {
+      setOrders([]);
+      setCloudStatus((s) => ({
+        ...s,
+        error: `Active shift is older than ${Math.floor(
+          MAX_ACTIVE_SHIFT_MS / 3600000
+        )} hours. End the stale shift or start a fresh one before loading live orders.`,
+      }));
       return;
     }
     let active = true;
     const refreshOrders = async () => {
       try {
-        const arr = await loadOrders(new Date(startedAtMs), endedAtMs ? new Date(endedAtMs) : null);
+        const arr = await loadOrders(
+          new Date(startedAtMs),
+          endedAtMs ? new Date(endedAtMs) : null,
+          currentDayId
+        );
         if (active) setOrders(dedupeOrders(arr).map(enrichOrderWithChannel));
       } catch (err) {
         console.warn("Realtime orders load failed:", err);
@@ -5770,7 +6191,16 @@ useEffect(() => {
       active = false;
       unsub();
     };
-  }, [realtimeOrders, ordersColRef, fbUser, startedAtMs, endedAtMs]);
+  }, [
+    realtimeOrders,
+    ordersColRef,
+    fbUser,
+    startedAtMs,
+    endedAtMs,
+    currentDayId,
+    currentDeviceCanListen,
+    activeShiftIsStale,
+  ]);
 const recomputeOnlineOrders = useCallback(() => {
     const sources = onlineOrderSourcesRef.current || {};
     const merged = Object.values(sources).flat();
@@ -7082,6 +7512,7 @@ const workerMonthlyTotalPay = useMemo(
 
 const endDay = async () => {
     if (!dayMeta.startedAt || dayMeta.endedAt) return alert("Start an active shift first.");
+    if (!assertDeviceCanWrite("end the day")) return;
 
     const who = window.prompt("Enter your name to END THE DAY:", "");
     const endBy = norm(who);
@@ -7569,6 +8000,7 @@ const checkout = async () => {
   try {
     if (!dayMeta.startedAt || dayMeta.endedAt)
       return alert("Start a shift first (Shift → Start Shift).");
+    if (!assertDeviceCanWrite("create orders")) return;
     if (cart.length === 0) return alert("Cart is empty.");
     if (!worker) return alert("Select worker.");
     if (!orderType) return alert("Select order type.");
@@ -7688,6 +8120,9 @@ const checkout = async () => {
     const shouldWhatsapp = false;
     let order = enrichOrderWithChannel({
       orderNo: optimisticNo,
+      dayId: currentDayId,
+      shiftStartedAt: dayMeta.startedAt,
+      deviceId: currentDeviceInfo.deviceId,
       date: new Date(),
       worker,
       payment: paymentLabel,
@@ -7781,6 +8216,7 @@ const integrateOnlineOrder = async (onlineOrder) => {
     alert("Start a shift first (Shift → Start Shift) before processing online orders.");
     return null;
   }
+  if (!assertDeviceCanWrite("process online orders")) return null;
   const existing = findPosOrderForOnline(onlineOrder);
   if (existing) return existing;
 
@@ -7969,6 +8405,9 @@ const onlineFallbackId =
 
   let posOrder = enrichOrderWithChannel({
     orderNo,
+    dayId: currentDayId,
+    shiftStartedAt: dayMeta.startedAt,
+    deviceId: currentDeviceInfo.deviceId,
     date: new Date(),
     worker: dayMeta.currentWorker || "Online",
     payment: paymentLabel,
@@ -8258,6 +8697,7 @@ const onlineFallbackId =
   return posOrder;
 };
 const markOrderDone = async (orderNo) => {
+  if (!assertDeviceCanWrite("mark orders done")) return;
   // If not live, update locally
   if (!realtimeOrders) {
     setOrders((o) =>
@@ -8277,7 +8717,7 @@ const markOrderDone = async (orderNo) => {
       updatedAt: new Date().toISOString(),
     };
     if (targetId) await updateOrderById(targetId, payload);
-    else await updateOrderByOrderNo(orderNo, payload);
+    else await updateOrderByOrderNo(orderNo, payload, currentDayId);
   } catch (e) {
     console.warn("Cloud update (done) failed:", e);
    }
@@ -8336,6 +8776,7 @@ const voidOnlineOrderToExpense = async (onlineOrder) => {
   }
 };
 const voidOrderAndRestock = async (orderNo) => {
+  if (!assertDeviceCanWrite("cancel orders")) return;
   const ord = orders.find((o) => o.orderNo === orderNo);
   if (!ord) return;
   if (ord.done) return alert("This order is DONE and cannot be cancelled.");
@@ -8383,12 +8824,13 @@ const voidOrderAndRestock = async (orderNo) => {
       updatedAt: new Date().toISOString(),
     };
     if (targetId) await updateOrderById(targetId, payload);
-    else await updateOrderByOrderNo(orderNo, payload);
+    else await updateOrderByOrderNo(orderNo, payload, currentDayId);
   } catch (e) {
     console.warn("Cloud update (cancel/restock) failed:", e);
   }
 };
 const voidOrderToExpense = async (orderNo) => {
+  if (!assertDeviceCanWrite("return orders")) return;
   const ord = orders.find((o) => o.orderNo === orderNo);
   if (!ord) return;
   if (ord.done) return alert("This order is DONE and cannot be voided.");
@@ -8443,7 +8885,7 @@ const voidOrderToExpense = async (orderNo) => {
         updatedAt: new Date().toISOString(),
       };
       if (targetId) await updateOrderById(targetId, payload);
-      else await updateOrderByOrderNo(orderNo, payload);
+      else await updateOrderByOrderNo(orderNo, payload, currentDayId);
     }
   } catch (e) {
     console.warn("Cloud update (void→expense) failed:", e);
@@ -9961,6 +10403,7 @@ const generatePurchasesPDF = () => {
       ["workerlog", "Worker Log"],
       ["contacts", "Customer Contacts"],
       ["reports", "Reports"],
+      ["devices", "Connected Devices"],
       ["edit", "Edit"],
       ["settings", "Settings"],
     ].map(([key, label]) => (
@@ -11796,18 +12239,22 @@ const cogs = Number(
               <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                 <button
                   onClick={checkout}
-                  disabled={isCheckingOut}
+                  disabled={isCheckingOut || !currentDeviceCanWrite}
                   style={{
-                    background: isCheckingOut ? "#9e9e9e" : "#43a047",
+                    background: isCheckingOut || !currentDeviceCanWrite ? "#9e9e9e" : "#43a047",
                     color: "white",
                     border: "none",
                     borderRadius: 8,
                     padding: "10px 14px",
-                    cursor: isCheckingOut ? "not-allowed" : "pointer",
+                    cursor: isCheckingOut || !currentDeviceCanWrite ? "not-allowed" : "pointer",
                     minWidth: 140,
                   }}
                 >
-                  {isCheckingOut ? "Processing..." : "Checkout"}
+                  {!currentDeviceCanWrite
+                    ? "Device cannot write"
+                    : isCheckingOut
+                    ? "Processing..."
+                    : "Checkout"}
                 </button>
                 <small>
                   Next order #: <b>{nextOrderNo}</b>
@@ -12159,6 +12606,19 @@ const cogs = Number(
                 </ul>
               )}
             </>
+          ) : !currentDeviceCanListen ? (
+            <div style={{ padding: 12, borderRadius: 6, background: dark ? "#2c1d1d" : "#ffebee" }}>
+              This device is set to "{currentDeviceModeMeta.label}" and cannot listen to live orders.
+            </div>
+          ) : !dayMeta.startedAt || dayMeta.endedAt ? (
+            <div style={{ padding: 12, borderRadius: 6, background: dark ? "#222" : "#f5f5f5" }}>
+              Start a shift to load the live Orders Board.
+            </div>
+          ) : activeShiftIsStale ? (
+            <div style={{ padding: 12, borderRadius: 6, background: dark ? "#332d1e" : "#fff8e1" }}>
+              This shift started at {fmtDateTime(dayMeta.startedAt)} and is older than{" "}
+              {Math.floor(MAX_ACTIVE_SHIFT_MS / 3600000)} hours. End the stale shift or start a fresh one.
+            </div>
           ) : (
             <>
               {orders.length === 0 && <p>No orders yet.</p>}
@@ -16654,6 +17114,141 @@ setExtraList((arr) => [
     );
   })}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* CONNECTED DEVICES */}
+      {activeTab === "admin" && adminSubTab === "devices" && (
+        <div>
+          <h2>Connected Devices</h2>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))",
+              gap: 12,
+              marginBottom: 12,
+            }}
+          >
+            <div style={{ padding: 10, borderRadius: 6, border: `1px solid ${cardBorder}` }}>
+              <h4 style={{ marginTop: 0 }}>This Device</h4>
+              <div style={{ display: "grid", gap: 4, fontSize: 13 }}>
+                <div><b>Mode:</b> {currentDeviceModeMeta.label}</div>
+                <div><b>Device ID:</b> {currentDeviceInfo.deviceId}</div>
+                <div><b>OS:</b> {currentDeviceInfo.os}</div>
+                <div><b>Browser:</b> {currentDeviceInfo.browser}</div>
+                <div><b>IP:</b> {currentDevice?.lastIp || "Detecting..."}</div>
+                <div>
+                  <b>Last seen:</b>{" "}
+                  {deviceStatus.lastSeenAt ? deviceStatus.lastSeenAt.toLocaleString() : "Not synced yet"}
+                </div>
+              </div>
+              {deviceStatus.error && (
+                <div style={{ marginTop: 8, color: "#c62828", fontSize: 12 }}>
+                  Device registry error: {deviceStatus.error}
+                </div>
+              )}
+            </div>
+            <div style={{ padding: 10, borderRadius: 6, border: `1px solid ${cardBorder}` }}>
+              <h4 style={{ marginTop: 0 }}>Permissions</h4>
+              <div style={{ display: "grid", gap: 6, fontSize: 13 }}>
+                <div>Listen: <b>{currentDeviceCanListen ? "Allowed" : "Blocked"}</b></div>
+                <div>Write: <b>{currentDeviceCanWrite ? "Allowed" : "Blocked"}</b></div>
+                <div>Manage devices: <b>{currentDeviceCanAdmin ? "Allowed" : "Blocked"}</b></div>
+              </div>
+              <button
+                onClick={refreshDevices}
+                style={{
+                  marginTop: 10,
+                  padding: "6px 10px",
+                  borderRadius: 6,
+                  border: `1px solid ${btnBorder}`,
+                  background: dark ? "#2c2c2c" : "#f1f1f1",
+                  color: dark ? "#fff" : "#000",
+                  cursor: "pointer",
+                }}
+              >
+                Refresh
+              </button>
+            </div>
+          </div>
+
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead>
+                <tr>
+                  <th style={{ textAlign: "left", padding: 8, borderBottom: `1px solid ${cardBorder}` }}>Device</th>
+                  <th style={{ textAlign: "left", padding: 8, borderBottom: `1px solid ${cardBorder}` }}>Mode</th>
+                  <th style={{ textAlign: "left", padding: 8, borderBottom: `1px solid ${cardBorder}` }}>OS / Browser</th>
+                  <th style={{ textAlign: "left", padding: 8, borderBottom: `1px solid ${cardBorder}` }}>IP</th>
+                  <th style={{ textAlign: "left", padding: 8, borderBottom: `1px solid ${cardBorder}` }}>Last Seen</th>
+                  <th style={{ textAlign: "left", padding: 8, borderBottom: `1px solid ${cardBorder}` }}>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {devices.map((device) => {
+                  const isCurrent = device.deviceId === currentDeviceInfo.deviceId;
+                  return (
+                    <tr key={device.deviceId}>
+                      <td style={{ padding: 8, borderBottom: `1px solid ${cardBorder}` }}>
+                        <div style={{ fontWeight: 700 }}>
+                          {device.label || device.deviceId} {isCurrent ? "(this device)" : ""}
+                        </div>
+                        <div style={{ fontSize: 11, opacity: 0.7 }}>{device.deviceId}</div>
+                      </td>
+                      <td style={{ padding: 8, borderBottom: `1px solid ${cardBorder}` }}>
+                        <select
+                          value={device.mode || "pending"}
+                          disabled={!currentDeviceCanAdmin || isCurrent}
+                          onChange={(e) => updateDeviceMode(device.deviceId, e.target.value)}
+                          style={{ padding: 6, borderRadius: 6, border: `1px solid ${btnBorder}` }}
+                        >
+                          {DEVICE_MODE_OPTIONS.map((mode) => (
+                            <option key={mode.value} value={mode.value}>
+                              {mode.label}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                      <td style={{ padding: 8, borderBottom: `1px solid ${cardBorder}` }}>
+                        {(device.os || "Unknown") + " / " + (device.browser || "Browser")}
+                      </td>
+                      <td style={{ padding: 8, borderBottom: `1px solid ${cardBorder}` }}>
+                        {device.lastIp || "-"}
+                      </td>
+                      <td style={{ padding: 8, borderBottom: `1px solid ${cardBorder}` }}>
+                        {device.lastSeenAt ? device.lastSeenAt.toLocaleString() : "-"}
+                      </td>
+                      <td style={{ padding: 8, borderBottom: `1px solid ${cardBorder}` }}>
+                        <button
+                          disabled={!currentDeviceCanAdmin}
+                          onClick={() => {
+                            const label = window.prompt("Device label:", device.label || "");
+                            if (label == null) return;
+                            renameDevice(device.deviceId, label.trim());
+                          }}
+                          style={{
+                            padding: "5px 8px",
+                            borderRadius: 6,
+                            border: `1px solid ${btnBorder}`,
+                            cursor: currentDeviceCanAdmin ? "pointer" : "not-allowed",
+                          }}
+                        >
+                          Rename
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+                {devices.length === 0 && (
+                  <tr>
+                    <td colSpan={6} style={{ padding: 12, opacity: 0.75 }}>
+                      No devices synced yet. Install and run the devices SQL migration, then refresh this tab.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
           </div>
         </div>
       )}
