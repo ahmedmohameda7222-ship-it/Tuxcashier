@@ -1,3 +1,3 @@
-const { handleMcp } = require("./_lib/mcpPurchaseWrapper");
+const { handleMcp } = require("./_lib/mcpCore");
 
 module.exports = handleMcp;
