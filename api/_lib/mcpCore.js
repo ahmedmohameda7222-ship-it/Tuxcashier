@@ -12,7 +12,7 @@ const ADMIN_DEFINITIONS = { admin_1: { id: "admin_1", name: "Admin 1", hashEnv: 
 
 const READ_TOOL_NAMES = new Set([
   "get_connection_info","get_recent_orders","get_order_board","get_order_by_number",
-  "get_expenses_report","get_expenses","get_expense_by_id","get_purchases_report","get_month_expenses_report","get_year_expenses_report",
+  "get_expenses_report","get_expenses","get_expense_by_id","get_purchases_report","get_purchases","get_purchase_by_id","get_purchase_history","get_purchase_breakdown","get_suppliers","get_month_expenses_report","get_year_expenses_report",
   "get_bank_summary","get_bank_transactions","get_bank_report",
   "get_today_sales_report","get_worker_sales_report","get_month_sales_report","get_year_sales_report","get_date_range_sales_report","get_profit_report","get_worker_report_for_period","generate_daily_pdf_report","generate_monthly_pdf_report","export_report_json","export_report_csv",
   "get_inventory_status","get_inventory_lock_status","get_inventory_usage","get_inventory_movements",
@@ -20,7 +20,7 @@ const READ_TOOL_NAMES = new Set([
 ]);
 const WRITE_TOOL_NAMES = new Set([
   "create_order","update_order","add_item_to_order","remove_item_from_order","mark_order_done","void_order","print_customer_receipt","print_kitchen_ticket",
-  "add_expense","update_expense","void_expense","delete_expense",
+  "add_expense","update_expense","void_expense","delete_expense","add_purchase","update_purchase","void_purchase","add_purchase_category","update_purchase_category","disable_purchase_category","add_supplier","update_supplier","disable_supplier",
   "add_bank_transaction","withdraw_from_bank","deposit_to_bank","adjust_bank_total",
   "add_inventory_restock","adjust_inventory_quantity","lock_inventory","unlock_inventory","update_inventory_usage","add_inventory_item","update_inventory_item","delete_inventory_item","disable_inventory_item","set_low_stock_threshold",
   "update_item_price","update_extra_price","add_menu_item","update_menu_item","delete_menu_item","disable_menu_item","add_extra","update_extra","delete_extra","disable_extra","add_beverage","update_beverage","delete_beverage","disable_beverage","update_item_category","update_item_name","update_item_description","update_item_image","update_item_consumption_usage",
@@ -32,7 +32,7 @@ for (const t of ["create_order","update_order","add_item_to_order","remove_item_
 for (const t of ["get_inventory_status","get_inventory_lock_status","get_inventory_usage","get_inventory_movements","get_menu_items"]) TOOL_SCOPES[t] = "read:inventory";
 for (const t of ["add_inventory_restock","adjust_inventory_quantity","lock_inventory","unlock_inventory","update_inventory_usage","add_inventory_item","update_inventory_item","delete_inventory_item","disable_inventory_item","set_low_stock_threshold"]) TOOL_SCOPES[t] = "write:inventory";
 for (const t of ["update_item_price","update_extra_price","add_menu_item","update_menu_item","delete_menu_item","disable_menu_item","add_extra","update_extra","delete_extra","disable_extra","add_beverage","update_beverage","delete_beverage","disable_beverage","update_item_category","update_item_name","update_item_description","update_item_image","update_item_consumption_usage"]) TOOL_SCOPES[t] = "write:prices";
-for (const t of ["add_expense","update_expense","void_expense","delete_expense","add_bank_transaction","withdraw_from_bank","deposit_to_bank","adjust_bank_total"]) TOOL_SCOPES[t] = "write:expenses";
+for (const t of ["add_expense","update_expense","void_expense","delete_expense","add_purchase","update_purchase","void_purchase","add_purchase_category","update_purchase_category","disable_purchase_category","add_supplier","update_supplier","disable_supplier","add_bank_transaction","withdraw_from_bank","deposit_to_bank","adjust_bank_total"]) TOOL_SCOPES[t] = "write:expenses";
 for (const t of ["update_worker_list","add_worker","update_worker","disable_worker","update_payment_methods","update_order_types","update_default_delivery_fee","update_shop_settings","revoke_mcp_token","change_shift","start_day","end_day","start_shift","end_shift"]) TOOL_SCOPES[t] = "write:shift";
 TOOL_SCOPES.get_connection_info = "read:reports";
 
@@ -127,6 +127,274 @@ function adminSettings(state){ return {workers:state.workers||[],payment_methods
 function dayStatus(state){ const d=state.dayMeta||{}; return {business_day_id:d.dayId||"",current_worker:d.currentWorker||"",started_at:d.startedAt||null,ended_at:d.endedAt||null,active:d.active===false?false:Boolean(d.startedAt&&!d.endedAt),status:d.endedAt?"ended":d.startedAt?"active":"not_started"}; }
 async function listTokens(supabase,auth){ const {data,error}=await supabase.from("mcp_connection_tokens").select("id, name, token_prefix, admin_id, admin_name, scopes, active, created_at, last_used_at, revoked_at, note").eq("shop_id",SHOP_ID).eq("admin_id",auth.mcpContext?.adminId).order("created_at",{ascending:false}); if(error) throw error; return {tokens:data||[]}; }
 
+
+const PURCHASE_READ_TOOLS = new Set(["get_purchases_report","get_purchases","get_purchase_by_id","get_purchase_history","get_purchase_breakdown","get_suppliers"]);
+const PURCHASE_WRITE_TOOLS = new Set(["add_purchase","update_purchase","void_purchase","add_purchase_category","update_purchase_category","disable_purchase_category","add_supplier","update_supplier","disable_supplier"]);
+
+function rawArray(value){
+  return Array.isArray(value) ? value : [];
+}
+function compactSlug(value,prefix="id"){
+  const slug = asId(value).replace(/[^a-z0-9]+/g,"_").replace(/^_+|_+$/g,"");
+  return slug || `${prefix}_${Date.now()}`;
+}
+function purchaseRows(state={}){
+  return rawArray(state.purchases).filter(p=>p&&typeof p==="object"&&!p.deleted);
+}
+function activePurchaseRows(state={}){
+  return purchaseRows(state).filter(p=>!p.voided&&!p.archived&&!p.disabled);
+}
+function purchaseCategoryRows(state={}){
+  return rawArray(state.purchaseCategories).map(c=>{
+    if(!c) return null;
+    if(typeof c==="string") return {id:compactSlug(c,"purchase_category"),name:c,active:true};
+    if(typeof c==="object") return c;
+    return null;
+  }).filter(Boolean);
+}
+function purchaseSupplierRows(state={}){
+  const source = rawArray(state.purchaseSuppliers).length ? state.purchaseSuppliers : state.suppliers;
+  return rawArray(source).map(s=>{
+    if(!s) return null;
+    if(typeof s==="string") return {id:compactSlug(s,"supplier"),name:s,active:true};
+    if(typeof s==="object") return s;
+    return null;
+  }).filter(Boolean);
+}
+function purchaseAmount(p={}){
+  if(p.voided||p.deleted||p.archived||p.disabled) return 0;
+  if(p.total!=null) return money(p.total);
+  if(p.amount!=null) return money(p.amount);
+  return money(num(p.qty??p.quantity,0)*num(p.unitPrice??p.unit_price,0));
+}
+function purchaseWindow(input={}){
+  if(input.month){
+    const raw=String(input.month);
+    if(!/^\d{4}-\d{2}$/.test(raw)) throw new Error("month must be YYYY-MM.");
+    const [y,m]=raw.split("-").map(Number);
+    return {from:+new Date(Date.UTC(y,m-1,1)),to:+new Date(Date.UTC(y,m,1)-1),period:raw};
+  }
+  if(input.year){
+    const y=Number(input.year);
+    if(!Number.isInteger(y)||y<2000||y>2200) throw new Error("year must be valid.");
+    return {from:+new Date(Date.UTC(y,0,1)),to:+new Date(Date.UTC(y+1,0,1)-1),period:String(y)};
+  }
+  if(input.start_date||input.end_date){
+    if(!input.start_date||!input.end_date) throw new Error("start_date and end_date are required.");
+    const start=+new Date(`${input.start_date}T00:00:00.000Z`);
+    const end=+new Date(`${input.end_date}T23:59:59.999Z`);
+    if(!Number.isFinite(start)||!Number.isFinite(end)||start>end) throw new Error("Invalid purchase date range.");
+    return {from:start,to:end,period:`${input.start_date}_${input.end_date}`};
+  }
+  if(input.date){
+    const start=+new Date(`${input.date}T00:00:00.000Z`);
+    const end=+new Date(`${input.date}T23:59:59.999Z`);
+    if(!Number.isFinite(start)||!Number.isFinite(end)) throw new Error("Invalid date. Use YYYY-MM-DD.");
+    return {from:start,to:end,period:input.date};
+  }
+  return null;
+}
+function filterPurchases(state={},input={}){
+  let rows=activePurchaseRows(state);
+  const w=purchaseWindow(input);
+  if(w) rows=rows.filter(p=>{
+    const ms=+new Date(p.date||p.createdAt||p.created_at||0);
+    return Number.isFinite(ms)&&ms>=w.from&&ms<=w.to;
+  });
+  if(input.category) rows=rows.filter(p=>asId(p.category||p.categoryName||p.category_id||p.categoryId)===asId(input.category));
+  if(input.supplier) rows=rows.filter(p=>asId(p.supplier||p.supplierName||p.supplier_id||p.supplierId)===asId(input.supplier));
+  return rows.sort((a,b)=>+new Date(b.date||b.createdAt||b.created_at||0)-+new Date(a.date||a.createdAt||a.created_at||0));
+}
+function purchaseBreakdown(rows=[]){
+  const categoryMap={};
+  const supplierMap={};
+  for(const p of rows){
+    const total=purchaseAmount(p);
+    const qty=num(p.qty??p.quantity,0);
+    const category=p.category||p.categoryName||p.category_id||p.categoryId||"Uncategorized";
+    const supplier=p.supplier||p.supplierName||p.supplier_id||p.supplierId||"Unknown";
+    if(!categoryMap[category]) categoryMap[category]={category,count:0,qty:0,total:0};
+    if(!supplierMap[supplier]) supplierMap[supplier]={supplier,count:0,qty:0,total:0};
+    categoryMap[category].count++;
+    categoryMap[category].qty=money(categoryMap[category].qty+qty);
+    categoryMap[category].total=money(categoryMap[category].total+total);
+    supplierMap[supplier].count++;
+    supplierMap[supplier].qty=money(supplierMap[supplier].qty+qty);
+    supplierMap[supplier].total=money(supplierMap[supplier].total+total);
+  }
+  return {
+    category_breakdown:Object.values(categoryMap).sort((a,b)=>b.total-a.total),
+    supplier_breakdown:Object.values(supplierMap).sort((a,b)=>b.total-a.total)
+  };
+}
+function purchaseReport(state={},input={}){
+  const rows=filterPurchases(state,input);
+  return {
+    period:purchaseWindow(input)?.period||"all",
+    purchases:rows,
+    total_purchases:rows.length,
+    total_amount:money(rows.reduce((sum,p)=>sum+purchaseAmount(p),0)),
+    ...purchaseBreakdown(rows)
+  };
+}
+function buildPurchase(input={},auth={}){
+  const itemName=compactText(input.item_name||input.itemName||input.name||input.item);
+  if(!itemName) throw new Error("item_name is required.");
+  const qty=pos(input.qty??input.quantity??1,"qty");
+  const unitPrice=nonNeg(input.unit_price??input.unitPrice??0,"unit_price");
+  const total=money(input.total??input.amount??qty*unitPrice);
+  const at=nowIso();
+  return {
+    id:input.id||`mcp_purchase_${Date.now()}`,
+    itemName,
+    name:itemName,
+    category:input.category||input.category_name||input.categoryName||"",
+    supplier:input.supplier||input.supplier_name||input.supplierName||"",
+    qty,
+    quantity:qty,
+    unit:input.unit||"unit",
+    unitPrice,
+    unit_price:unitPrice,
+    total,
+    amount:total,
+    invoiceNumber:input.invoice_number||input.invoiceNumber||"",
+    invoice_number:input.invoice_number||input.invoiceNumber||"",
+    note:input.note||"",
+    date:input.date?new Date(input.date).toISOString():at,
+    createdAt:at,
+    updatedAt:at,
+    voided:false,
+    archived:false,
+    source:"mcp",
+    adminId:auth.mcpContext?.adminId||"",
+    adminName:auth.mcpContext?.adminName||"",
+    syncStatus:"pending",
+    lastModifiedDeviceId:"mcp"
+  };
+}
+function ensurePurchaseCategory(list=[],name){
+  const nm=compactText(name);
+  if(!nm||list.some(c=>asId(c.id)===asId(nm)||asId(c.name)===asId(nm))) return list;
+  return [{id:compactSlug(nm,"purchase_category"),name:nm,active:true,createdAt:nowIso(),source:"mcp"},...list];
+}
+function ensurePurchaseSupplier(list=[],name){
+  const nm=compactText(name);
+  if(!nm||list.some(s=>asId(s.id)===asId(nm)||asId(s.name)===asId(nm))) return list;
+  return [{id:compactSlug(nm,"supplier"),name:nm,active:true,createdAt:nowIso(),source:"mcp"},...list];
+}
+async function executePurchaseTool(supabase,state,writeSeq,toolName,input={},auth={}){
+  if(toolName==="get_purchases_report"||toolName==="get_purchases"||toolName==="get_purchase_history") return purchaseReport(state,input);
+  if(toolName==="get_purchase_breakdown"){
+    const rows=filterPurchases(state,input);
+    return {period:purchaseWindow(input)?.period||"all",total_amount:money(rows.reduce((sum,p)=>sum+purchaseAmount(p),0)),total_purchases:rows.length,...purchaseBreakdown(rows)};
+  }
+  if(toolName==="get_purchase_by_id"){
+    const pid=input.purchase_id||input.id;
+    const row=purchaseRows(state).find(p=>String(p.id)===String(pid));
+    if(!row) throw new Error("Purchase was not found.");
+    return row;
+  }
+  if(toolName==="get_suppliers") return {suppliers:purchaseSupplierRows(state)};
+  if(toolName==="add_purchase"){
+    const row=buildPurchase(input,auth);
+    const next={
+      ...state,
+      purchases:[row,...purchaseRows(state)],
+      purchaseCategories:ensurePurchaseCategory(purchaseCategoryRows(state),row.category),
+      purchaseSuppliers:ensurePurchaseSupplier(purchaseSupplierRows(state),row.supplier)
+    };
+    const saved=await saveShopState(supabase,next,writeSeq);
+    return {purchase:row,total_purchase_amount:row.total,purchase_history:purchaseReport(saved,{}).purchases,purchase_breakdown:purchaseBreakdown(activePurchaseRows(saved)),__audit:{beforeState:null,afterState:row}};
+  }
+  if(toolName==="update_purchase"){
+    const pid=input.purchase_id||input.id;
+    const before=purchaseRows(state).find(p=>String(p.id)===String(pid));
+    if(!before) throw new Error("Purchase was not found.");
+    const rows=purchaseRows(state).map(p=>{
+      if(String(p.id)!==String(pid)) return p;
+      const qty=input.qty!=null?nonNeg(input.qty,"qty"):num(p.qty??p.quantity,0);
+      const unitPrice=input.unit_price!=null?nonNeg(input.unit_price,"unit_price"):num(p.unitPrice??p.unit_price,0);
+      const itemName=input.item_name??input.itemName??p.itemName??p.name;
+      const total=money(input.total??input.amount??qty*unitPrice);
+      return {
+        ...p,
+        itemName,
+        name:itemName,
+        category:input.category??p.category,
+        supplier:input.supplier??p.supplier,
+        qty,
+        quantity:qty,
+        unit:input.unit??p.unit,
+        unitPrice,
+        unit_price:unitPrice,
+        total,
+        amount:total,
+        invoiceNumber:input.invoice_number??input.invoiceNumber??p.invoiceNumber,
+        invoice_number:input.invoice_number??input.invoiceNumber??p.invoice_number,
+        note:input.note??p.note,
+        updatedAt:nowIso(),
+        syncStatus:"pending",
+        lastModifiedDeviceId:"mcp"
+      };
+    });
+    const saved=await saveShopState(supabase,{...state,purchases:rows},writeSeq);
+    const after=purchaseRows(saved).find(p=>String(p.id)===String(pid));
+    return {purchase:after,__audit:{beforeState:before,afterState:after}};
+  }
+  if(toolName==="void_purchase"){
+    const pid=input.purchase_id||input.id;
+    const before=purchaseRows(state).find(p=>String(p.id)===String(pid));
+    if(!before) throw new Error("Purchase was not found.");
+    const rows=purchaseRows(state).map(p=>String(p.id)===String(pid)?{...p,voided:true,voidReason:input.reason||"MCP void",updatedAt:nowIso(),syncStatus:"pending",lastModifiedDeviceId:"mcp"}:p);
+    const saved=await saveShopState(supabase,{...state,purchases:rows},writeSeq);
+    const after=purchaseRows(saved).find(p=>String(p.id)===String(pid));
+    return {purchase:after,safe_delete:true,__audit:{beforeState:before,afterState:after}};
+  }
+  if(toolName==="add_purchase_category"||toolName==="update_purchase_category"||toolName==="disable_purchase_category"){
+    const before=purchaseCategoryRows(state);
+    let rows=before;
+    const name=compactText(input.name||input.category);
+    const target=asId(input.category_id||input.id||name);
+    if(toolName==="add_purchase_category"){
+      rows=ensurePurchaseCategory(rows,name);
+    } else {
+      let found=false;
+      rows=rows.map(c=>{
+        if(asId(c.id)===target||asId(c.name)===target){
+          found=true;
+          return {...c,name:input.new_name||name||c.name,active:toolName!=="disable_purchase_category",disabled:toolName==="disable_purchase_category",archived:toolName==="disable_purchase_category",updatedAt:nowIso()};
+        }
+        return c;
+      });
+      if(!found) throw new Error("Purchase category was not found.");
+    }
+    const saved=await saveShopState(supabase,{...state,purchaseCategories:rows},writeSeq);
+    return {purchase_categories:saved.purchaseCategories,__audit:{beforeState:before,afterState:saved.purchaseCategories}};
+  }
+  if(toolName==="add_supplier"||toolName==="update_supplier"||toolName==="disable_supplier"){
+    const before=purchaseSupplierRows(state);
+    let rows=before;
+    const name=compactText(input.name||input.supplier);
+    const target=asId(input.supplier_id||input.id||name);
+    if(toolName==="add_supplier"){
+      rows=ensurePurchaseSupplier(rows,name);
+    } else {
+      let found=false;
+      rows=rows.map(s=>{
+        if(asId(s.id)===target||asId(s.name)===target){
+          found=true;
+          return {...s,name:input.new_name||name||s.name,phone:input.phone??s.phone,email:input.email??s.email,address:input.address??s.address,note:input.note??s.note,active:toolName!=="disable_supplier",disabled:toolName==="disable_supplier",archived:toolName==="disable_supplier",updatedAt:nowIso()};
+        }
+        return s;
+      });
+      if(!found) throw new Error("Supplier was not found.");
+    }
+    const saved=await saveShopState(supabase,{...state,purchaseSuppliers:rows},writeSeq);
+    return {suppliers:saved.purchaseSuppliers,__audit:{beforeState:before,afterState:saved.purchaseSuppliers}};
+  }
+  throw new Error(`Unsupported purchase tool: ${toolName}`);
+}
+
 function tool(name,description,properties={},required=[]){ return {name,description,inputSchema:{type:"object",properties,required}}; }
 function getToolDefinitions(){ const read="Requires a valid MCP connection token with matching read scope."; const write="Requires a valid MCP connection token with matching write scope. Admin identity is resolved from the token."; const defs=[];
   defs.push(tool("get_connection_info",`${read} Returns connected admin identity and scopes.`));
@@ -134,7 +402,10 @@ function getToolDefinitions(){ const read="Requires a valid MCP connection token
   defs.push(tool("get_order_by_number",`${read} Returns one order.`,{order_no:{type:"number"}},["order_no"]));
   defs.push(tool("create_order",`${write} Creates an order with items, extras, worker, order type, payment, note and delivery fee.`,{worker_name:{type:"string"},order_type:{type:"string"},payment_method:{type:"string"},items:{type:"array"},note:{type:"string"},delivery_fee:{type:"number"}},["items"]));
   for(const n of ["update_order","add_item_to_order","remove_item_from_order","mark_order_done","void_order","print_customer_receipt","print_kitchen_ticket"]) defs.push(tool(n,`${write} Order board action.`,{order_no:{type:"number"},reason:{type:"string"}},["order_no"]));
-  for(const n of ["get_expenses_report","get_expenses","get_purchases_report"]) defs.push(tool(n,`${read} Returns expenses/purchases.`,{date:{type:"string"}}));
+  for(const n of ["get_expenses_report","get_expenses"]) defs.push(tool(n,`${read} Returns expenses.`,{date:{type:"string"}}));
+  for(const n of ["get_purchases_report","get_purchases","get_purchase_history","get_purchase_breakdown","get_suppliers"]) defs.push(tool(n,`${read} Purchase MCP read tool.`,{date:{type:"string"},month:{type:"string"},year:{type:"number"},start_date:{type:"string"},end_date:{type:"string"},supplier:{type:"string"},category:{type:"string"}}));
+  defs.push(tool("get_purchase_by_id",`${read} Returns one purchase.`,{purchase_id:{type:"string"}},["purchase_id"]));
+  for(const n of ["add_purchase","update_purchase","void_purchase","add_purchase_category","update_purchase_category","disable_purchase_category","add_supplier","update_supplier","disable_supplier"]) defs.push(tool(n,`${write} Purchase MCP write tool. Stores qty, unit, unit_price, invoice_number, supplier and category. Delete actions are safe void/disable.`,{purchase_id:{type:"string"},item_name:{type:"string"},name:{type:"string"},category:{type:"string"},supplier:{type:"string"},qty:{type:"number"},unit:{type:"string"},unit_price:{type:"number"},invoice_number:{type:"string"},reason:{type:"string"},note:{type:"string"}}));
   defs.push(tool("get_expense_by_id",`${read} Returns one expense.`,{expense_id:{type:"string"}},["expense_id"]));
   for(const n of ["add_expense","update_expense","void_expense","delete_expense"]) defs.push(tool(n,`${write} Expense action; delete is implemented as safe void/archive.`,{expense_id:{type:"string"},name:{type:"string"},qty:{type:"number"},unit_price:{type:"number"},reason:{type:"string"}}));
   for(const n of ["get_bank_summary","get_bank_transactions","get_bank_report"]) defs.push(tool(n,`${read} Returns bank totals and transactions.`));
@@ -160,8 +431,8 @@ async function executeTool(supabase,toolName,input={},auth={}){ const {state,wri
   if(toolName==="mark_order_done") return setOrderDone(supabase,state,writeSeq,input,auth,false);
   if(toolName==="void_order") return setOrderDone(supabase,state,writeSeq,input,auth,true);
   if(toolName==="print_customer_receipt"||toolName==="print_kitchen_ticket"){ const [o]=await fetchOrders(supabase,{orderNo:posInt(input.order_no??input.orderNo,"order_no"),limit:1}); if(!o) throw new Error("Order was not found."); return printablePayload(o,toolName==="print_customer_receipt"?"customer_receipt":"kitchen_ticket"); }
+  if(PURCHASE_READ_TOOLS.has(toolName)||PURCHASE_WRITE_TOOLS.has(toolName)) return executePurchaseTool(supabase,state,writeSeq,toolName,input,auth);
   if(toolName==="get_expenses_report"||toolName==="get_expenses") return expensesReport(state,dateWindowFor(state,input.date));
-  if(toolName==="get_purchases_report") return {purchases:safeArray(state.purchases),expenses_report:expensesReport(state,dateWindowFor(state,input.date))};
   if(toolName==="get_month_expenses_report") return expensesReport(state,monthWindow(input.month));
   if(toolName==="get_year_expenses_report") return expensesReport(state,yearWindow(input.year));
   if(toolName==="get_expense_by_id"){ const e=safeArray(state.expenses).find(x=>String(x.id)===String(input.expense_id)); if(!e) throw new Error("Expense was not found."); return e; }
