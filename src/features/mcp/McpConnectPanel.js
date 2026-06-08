@@ -12,7 +12,7 @@ const DEFAULT_SCOPES = [
   "write:shift",
 ];
 const TOKEN_WARNING =
-  "Anyone with this link can access the allowed TUC tools. Keep it private.";
+  "Anyone with this link can access the allowed TUX tools. Keep it private.";
 
 function CopyButton({ value, children, btnBorder }) {
   const [copied, setCopied] = useState(false);
