@@ -662,21 +662,42 @@ function toMs(value) {
 
 function getStableRecordKey(record, fallbackPrefix = "row", index = 0) {
   if (!record || typeof record !== "object") return `${fallbackPrefix}_${index}`;
-  const candidates = [
-    record.id,
-    record.sessionId,
-    record.dayId,
-    record.orderNo != null
-      ? `order_${record.dayId || orderDayBucket(record)}_${record.orderNo}`
-      : "",
-    record.channelOrderNo
-      ? `channel_${record.dayId || orderDayBucket(record)}_${record.channelOrderNo}`
-      : "",
-    record.name && (record.signInAt || record.date || record.at)
-      ? `${record.name}_${record.signInAt || record.date || record.at}`
-      : "",
-  ];
-  return String(candidates.find((v) => v !== undefined && v !== null && String(v) !== "") || `${fallbackPrefix}_${index}`);
+
+  const isOrderLike =
+    fallbackPrefix === "order" ||
+    record.orderNo != null ||
+    record.cloudId ||
+    record.idemKey ||
+    record.onlineOrderId ||
+    record.onlineOrderKey;
+
+  const candidates = isOrderLike
+    ? [
+        record.cloudId ? `cloud_${record.cloudId}` : "",
+        record.idemKey ? `idem_${record.idemKey}` : "",
+        record.onlineOrderKey ? `online_key_${record.onlineOrderKey}` : "",
+        record.onlineOrderId ? `online_id_${record.onlineOrderId}` : "",
+        record.id,
+        record.orderNo != null
+          ? `order_${record.dayId || orderDayBucket(record)}_${record.orderNo}`
+          : "",
+        record.channelOrderNo
+          ? `channel_${record.dayId || orderDayBucket(record)}_${record.channelOrderNo}`
+          : "",
+      ]
+    : [
+        record.id,
+        record.sessionId,
+        record.dayId,
+        record.name && (record.signInAt || record.date || record.at)
+          ? `${record.name}_${record.signInAt || record.date || record.at}`
+          : "",
+      ];
+
+  return String(
+    candidates.find((v) => v !== undefined && v !== null && String(v) !== "") ||
+      `${fallbackPrefix}_${index}`
+  );
 }
 
 function recordUpdatedMs(record) {
@@ -9166,7 +9187,9 @@ const checkout = async () => {
         const ref = await addOrder(order);
         setOrders((prev) =>
           prev.map((oo) =>
-            oo.orderNo === order.orderNo ? { ...oo, cloudId: ref.id, syncStatus: SYNC_STATUS.synced } : oo
+            oo.idemKey === order.idemKey
+              ? { ...oo, cloudId: ref.id, syncStatus: SYNC_STATUS.synced }
+              : oo
           )
         );
         await markLocalOrderSynced(order, ref.id);
