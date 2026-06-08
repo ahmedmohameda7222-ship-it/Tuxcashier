@@ -5,6 +5,7 @@ create table if not exists public.pos_state (
   shop_id text not null,
   state jsonb not null default '{}'::jsonb,
   writer_id text,
+  last_modified_device_id text,
   write_seq bigint not null default 0,
   client_time bigint,
   created_at timestamptz not null default now(),
@@ -53,6 +54,8 @@ create table if not exists public.orders (
   online_source_doc_id text,
   channel text,
   channel_order_no text,
+  last_modified_device_id text,
+  sync_status text default 'pending',
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -65,9 +68,11 @@ create table if not exists public.counters (
 );
 
 create table if not exists public.devices (
-  device_id text primary key,
+  id text primary key,
+  device_id text,
   shop_id text not null,
   label text,
+  app_surface text,
   mode text not null default 'pending'
     check (mode in ('pending', 'listen', 'write', 'read_write', 'admin', 'blocked')),
   os text,
@@ -79,6 +84,8 @@ create table if not exists public.devices (
   blocked_at timestamptz,
   first_seen_at timestamptz not null default now(),
   last_seen_at timestamptz not null default now(),
+  last_sync_at timestamptz,
+  pending_count integer not null default 0,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -86,6 +93,9 @@ create table if not exists public.devices (
 create index if not exists idx_pos_state_shop_id on public.pos_state (shop_id);
 create index if not exists idx_orders_shop_id on public.orders (shop_id);
 create index if not exists idx_orders_order_no on public.orders (order_no);
+create index if not exists idx_orders_shop_order_no on public.orders (shop_id, order_no);
+create index if not exists idx_orders_shop_created_at on public.orders (shop_id, created_at desc);
+create index if not exists idx_orders_shop_date on public.orders (shop_id, date);
 create index if not exists idx_orders_shop_day_id on public.orders (shop_id, day_id);
 create index if not exists idx_orders_shop_day_date on public.orders (shop_id, day_id, date desc);
 create index if not exists idx_orders_device_id on public.orders (device_id);
@@ -95,8 +105,39 @@ create index if not exists idx_orders_done on public.orders (done);
 create index if not exists idx_orders_voided on public.orders (voided);
 create index if not exists idx_orders_online_order_id on public.orders (online_order_id);
 create index if not exists idx_orders_idem_key on public.orders (idem_key);
+create index if not exists idx_orders_shop_idem_key on public.orders (shop_id, idem_key);
 create index if not exists idx_devices_shop_id on public.devices (shop_id);
+create unique index if not exists idx_devices_device_id_unique on public.devices (device_id);
 create index if not exists idx_devices_mode on public.devices (mode);
+
+alter table public.pos_state add column if not exists last_modified_device_id text;
+alter table public.orders add column if not exists last_modified_device_id text;
+alter table public.orders add column if not exists sync_status text default 'pending';
+alter table public.orders add column if not exists day_id text;
+alter table public.orders add column if not exists shift_started_at timestamptz;
+alter table public.orders add column if not exists shift_ended_at timestamptz;
+alter table public.orders add column if not exists device_id text;
+alter table public.devices add column if not exists id text;
+alter table public.devices add column if not exists device_id text;
+alter table public.devices add column if not exists mode text default 'pending';
+alter table public.devices add column if not exists os text;
+alter table public.devices add column if not exists browser text;
+alter table public.devices add column if not exists platform text;
+alter table public.devices add column if not exists last_ip text;
+alter table public.devices add column if not exists user_agent text;
+alter table public.devices add column if not exists approved_by text;
+alter table public.devices add column if not exists blocked_at timestamptz;
+alter table public.devices add column if not exists first_seen_at timestamptz default now();
+alter table public.devices add column if not exists last_sync_at timestamptz;
+alter table public.devices add column if not exists pending_count integer default 0;
+
+update public.devices
+set device_id = coalesce(nullif(device_id, ''), id)
+where nullif(device_id, '') is null;
+
+update public.devices
+set id = coalesce(nullif(id, ''), device_id)
+where nullif(id, '') is null;
 
 create or replace function public.touch_updated_at()
 returns trigger

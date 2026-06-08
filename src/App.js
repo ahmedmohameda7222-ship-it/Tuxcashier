@@ -1,7 +1,16 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
-import { supabase } from "./supabaseClient";
+import { isSupabaseConfigured, supabase } from "./supabaseClient";
+import { getDeviceId } from "./services/deviceId";
+import {
+  getLocalDbStatus,
+  loadLocalOrdersFromDb,
+  markLocalOrderSynced,
+  saveLocalOrdersToDb,
+} from "./services/localDatabase";
+import { loadLocalState, saveLocalState } from "./services/localStore";
+import { shouldAttemptOnlineSync, SYNC_STATUS } from "./services/syncManager";
 
 export const toIso = (v) => {
   if (!v) return null;
@@ -484,9 +493,12 @@ async function sendEmailJsEmail(templateParams = {}) {
 
 const SHOP_ID = "tux";
 const POS_STATE_ID = "pos";
-const DEVICE_ID_KEY = "tuxcashier_device_id";
-const DEVICE_IP_CACHE_KEY = "tuxcashier_device_ip";
+const ONLINE_ORDER_COLLECTIONS = [];
 const MAX_ACTIVE_SHIFT_MS = 24 * 60 * 60 * 1000;
+
+const LS_KEY = "tux_pos_local_state_v1";
+const DEVICE_ID = getDeviceId();
+const DEVICE_IP_CACHE_KEY = "tux_cashier_device_ip_v1";
 
 const DEVICE_MODE_OPTIONS = [
   { value: "pending", label: "Pending", canListen: false, canWrite: false, canAdmin: false },
@@ -499,22 +511,6 @@ const DEVICE_MODE_OPTIONS = [
 
 function getDeviceModeMeta(mode) {
   return DEVICE_MODE_OPTIONS.find((opt) => opt.value === mode) || DEVICE_MODE_OPTIONS[0];
-}
-
-function getOrCreateDeviceId() {
-  try {
-    const existing = localStorage.getItem(DEVICE_ID_KEY);
-    if (existing) return existing;
-    const randomPart =
-      typeof crypto !== "undefined" && crypto.randomUUID
-        ? crypto.randomUUID()
-        : `${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    const id = `dev_${randomPart}`;
-    localStorage.setItem(DEVICE_ID_KEY, id);
-    return id;
-  } catch {
-    return `dev_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-  }
 }
 
 function detectDeviceDetails() {
@@ -543,14 +539,19 @@ function detectDeviceDetails() {
       : /Firefox\//i.test(ua)
       ? "Firefox"
       : "Browser";
+  const appSurface =
+    typeof window !== "undefined" && window.tuxCashierPrinter?.isElectron
+      ? "local-electron"
+      : "online-web";
 
   return {
-    deviceId: getOrCreateDeviceId(),
+    deviceId: DEVICE_ID,
     label: `${os} ${browser}`,
     os,
     browser,
     platform,
     userAgent: ua,
+    appSurface,
   };
 }
 
@@ -579,10 +580,7 @@ async function fetchDevicePublicIp() {
     const ip = String(data?.ip || "");
     if (ip) {
       try {
-        localStorage.setItem(
-          DEVICE_IP_CACHE_KEY,
-          JSON.stringify({ ip, at: Date.now() })
-        );
+        localStorage.setItem(DEVICE_IP_CACHE_KEY, JSON.stringify({ ip, at: Date.now() }));
       } catch {
         // ignore cache failures
       }
@@ -592,9 +590,6 @@ async function fetchDevicePublicIp() {
     return "";
   }
 }
-const ONLINE_ORDER_COLLECTIONS = [];
-
-const LS_KEY = "tux_pos_local_state_v1";
 export function nowIso() {
   return new Date().toISOString();
 }
@@ -670,8 +665,12 @@ function getStableRecordKey(record, fallbackPrefix = "row", index = 0) {
     record.id,
     record.sessionId,
     record.dayId,
-    record.orderNo != null ? `order_${record.orderNo}` : "",
-    record.channelOrderNo ? `channel_${record.channelOrderNo}` : "",
+    record.orderNo != null
+      ? `order_${record.dayId || orderDayBucket(record)}_${record.orderNo}`
+      : "",
+    record.channelOrderNo
+      ? `channel_${record.dayId || orderDayBucket(record)}_${record.channelOrderNo}`
+      : "",
     record.name && (record.signInAt || record.date || record.at)
       ? `${record.name}_${record.signInAt || record.date || record.at}`
       : "",
@@ -713,6 +712,8 @@ function stampRecord(record, stamp = nowIso(), fallbackPrefix = "row", index = 0
     id: record.id || getStableRecordKey(record, fallbackPrefix, index),
     createdAt,
     updatedAt: record.updatedAt || stamp,
+    lastModifiedDeviceId: record.lastModifiedDeviceId || DEVICE_ID,
+    syncStatus: record.syncStatus || SYNC_STATUS.pending,
   };
 }
 
@@ -761,6 +762,16 @@ function shouldApplyRemoteSection(localState = {}, remoteState = {}, section, op
   return allowLegacyWhenLocalEmpty && !hasAnyValueForKeys(localState, keys);
 }
 
+function shouldApplyRemoteKey(localState = {}, remoteState = {}, key, options = {}) {
+  return shouldApplyRemoteSection(localState, remoteState, options.section || sectionForKey(key), {
+    keys: options.keys || [key],
+    allowLegacyWhenLocalEmpty:
+      options.allowLegacyWhenLocalEmpty === undefined
+        ? true
+        : options.allowLegacyWhenLocalEmpty,
+  });
+}
+
 function addSectionUpdatedAt(base = {}, sections = [], stamp = nowIso()) {
   const next = { ...(base || {}) };
   for (const section of sections) {
@@ -771,10 +782,7 @@ function addSectionUpdatedAt(base = {}, sections = [], stamp = nowIso()) {
 
 function loadLocal() {
 
-  try { 
-    return JSON.parse(localStorage.getItem(LS_KEY) || "{}"); 
-  }
-  catch { return {}; }
+  return loadLocalState(LS_KEY);
 }
 function saveLocalPartial(patch, options = {}) {
   try {
@@ -808,8 +816,11 @@ function saveLocalPartial(patch, options = {}) {
     if (options.resetMarker) {
       next.resetMarkers = [...(Array.isArray(cur.resetMarkers) ? cur.resetMarkers : []), options.resetMarker];
     }
-    localStorage.setItem(LS_KEY, JSON.stringify(next));
-    return true;
+    next.updatedAt = stamp;
+    next.lastModifiedDeviceId = DEVICE_ID;
+    next.syncStatus = options.syncedFromCloud ? SYNC_STATUS.synced : options.syncStatus || SYNC_STATUS.pending;
+    next.pendingSync = !options.syncedFromCloud;
+    return saveLocalState(LS_KEY, next);
   } catch (err) {
     console.warn("Local save failed:", err);
     return false;
@@ -1448,11 +1459,13 @@ export function packStateForCloud(state) {
   const localSectionUpdatedAt = loadLocal()?.[SECTION_UPDATED_AT_KEY] || {};
   const purchases = Array.isArray(state.purchases)
     ? state.purchases.map((p) => ({
-        ...p,
-        id: p.id || getStableRecordKey(p, "purchase"),
-        createdAt: toIso(p.createdAt || p.date || stamp),
-        updatedAt: toIso(p.updatedAt || stamp),
-        date: toIso(p.date),
+      ...p,
+      id: p.id || getStableRecordKey(p, "purchase"),
+      createdAt: toIso(p.createdAt || p.date || stamp),
+      updatedAt: toIso(p.updatedAt || stamp),
+      lastModifiedDeviceId: p.lastModifiedDeviceId || DEVICE_ID,
+      syncStatus: p.syncStatus || SYNC_STATUS.pending,
+      date: toIso(p.date),
       }))
     : [];
   const purchaseCategories = Array.isArray(state.purchaseCategories)
@@ -1464,18 +1477,27 @@ export function packStateForCloud(state) {
         lastOrderAt: toIso(c.lastOrderAt),
         firstOrderAt: toIso(c.firstOrderAt),
         updatedAt: toIso(c.updatedAt),
+        lastModifiedDeviceId: c.lastModifiedDeviceId || DEVICE_ID,
+        syncStatus: c.syncStatus || SYNC_STATUS.pending,
       }))
     : [];
   const deliveryZones = Array.isArray(state.deliveryZones)
     ? state.deliveryZones
     : [];
   const payload = {
+    id: POS_STATE_ID,
+    deviceId: state.deviceId || DEVICE_ID,
+    lastModifiedDeviceId: state.lastModifiedDeviceId || DEVICE_ID,
+    syncStatus: state.syncStatus || SYNC_STATUS.pending,
+    pendingSync: Boolean(state.pendingSync),
  workerProfiles,
     workerSessions: (workerSessions || []).map((session) => ({
       ...session,
       id: session.id || getStableRecordKey(session, "worker_session"),
       createdAt: toIso(session.createdAt || session.signInAt || stamp),
       updatedAt: toIso(session.updatedAt || session.signOutAt || session.endedAt || stamp),
+      lastModifiedDeviceId: session.lastModifiedDeviceId || DEVICE_ID,
+      syncStatus: session.syncStatus || SYNC_STATUS.pending,
       signInAt: toIso(session.signInAt),
       signOutAt: toIso(session.signOutAt),
       endAt: toIso(session.endAt),
@@ -1498,10 +1520,16 @@ export function packStateForCloud(state) {
       id: o.id || getStableRecordKey(o, "order"),
       createdAt: toIso(o.createdAt || o.date || stamp),
       updatedAt: toIso(o.updatedAt || o.restockedAt || stamp),
+      lastModifiedDeviceId: o.lastModifiedDeviceId || DEVICE_ID,
+      syncStatus: o.syncStatus || SYNC_STATUS.pending,
       date: toIso(o.date),
       restockedAt: toIso(o.restockedAt),
     })),
     inventory,
+    inventoryLedger: Array.isArray(state.inventoryLedger) ? state.inventoryLedger.map(il => ({
+      ...il,
+      id: il.id || getStableRecordKey(il, "inv_ledger")
+    })) : [],
     bulkInventoryItems: Array.isArray(bulkInventoryItems) ? bulkInventoryItems : [],
     bulkInventoryHistory: Array.isArray(bulkInventoryHistory) ? bulkInventoryHistory : [],
     nextOrderNo,
@@ -1519,6 +1547,8 @@ export function packStateForCloud(state) {
       id: e.id || getStableRecordKey(e, "expense"),
       createdAt: toIso(e.createdAt || e.date || stamp),
       updatedAt: toIso(e.updatedAt || stamp),
+      lastModifiedDeviceId: e.lastModifiedDeviceId || DEVICE_ID,
+      syncStatus: e.syncStatus || SYNC_STATUS.pending,
       date: toIso(e.date),
     })),
     purchases,
@@ -1534,6 +1564,8 @@ export function packStateForCloud(state) {
           resetAt: toIso(dayMeta.resetAt),
           reconciledAt: toIso(dayMeta.reconciledAt),
           updatedAt: toIso(dayMeta.updatedAt || stamp),
+          lastModifiedDeviceId: dayMeta.lastModifiedDeviceId || DEVICE_ID,
+          syncStatus: dayMeta.syncStatus || SYNC_STATUS.pending,
           shiftChanges: Array.isArray(dayMeta.shiftChanges)
             ? dayMeta.shiftChanges.map((c) => ({
                 ...c,
@@ -1547,6 +1579,8 @@ export function packStateForCloud(state) {
       id: t.id || getStableRecordKey(t, "bank_tx"),
       createdAt: toIso(t.createdAt || t.date || stamp),
       updatedAt: toIso(t.updatedAt || stamp),
+      lastModifiedDeviceId: t.lastModifiedDeviceId || DEVICE_ID,
+      syncStatus: t.syncStatus || SYNC_STATUS.pending,
       date: toIso(t.date),
     })),
    reconHistory: (reconHistory || []).map((r) => ({
@@ -1554,6 +1588,8 @@ export function packStateForCloud(state) {
       id: r.id || getStableRecordKey(r, "reconciliation"),
       createdAt: toIso(r.createdAt || r.savedAt || r.reconciledAt || r.at || stamp),
       updatedAt: toIso(r.updatedAt || r.savedAt || r.reconciledAt || stamp),
+      lastModifiedDeviceId: r.lastModifiedDeviceId || DEVICE_ID,
+      syncStatus: r.syncStatus || SYNC_STATUS.pending,
       at: toIso(r.at),
       savedAt: toIso(r.savedAt),
       reconciledAt: toIso(r.reconciledAt),
@@ -1598,27 +1634,33 @@ export function packStateForCloud(state) {
       : undefined,
     historicalOrders: Array.isArray(historicalOrders)
       ? stampRecords(historicalOrders, stamp, "historical_order").map((o) => ({
-          ...o,
-          createdAt: toIso(o?.createdAt || o?.date || stamp),
-          updatedAt: toIso(o?.updatedAt || stamp),
-          date: toIso(o?.date),
-          restockedAt: toIso(o?.restockedAt),
+        ...o,
+        createdAt: toIso(o?.createdAt || o?.date || stamp),
+        updatedAt: toIso(o?.updatedAt || stamp),
+        lastModifiedDeviceId: o?.lastModifiedDeviceId || DEVICE_ID,
+        syncStatus: o?.syncStatus || SYNC_STATUS.pending,
+        date: toIso(o?.date),
+        restockedAt: toIso(o?.restockedAt),
         }))
       : [],
     historicalExpenses: Array.isArray(historicalExpenses)
       ? stampRecords(historicalExpenses, stamp, "historical_expense").map((e) => ({
-          ...e,
-          createdAt: toIso(e?.createdAt || e?.date || stamp),
-          updatedAt: toIso(e?.updatedAt || stamp),
-          date: toIso(e?.date),
+        ...e,
+        createdAt: toIso(e?.createdAt || e?.date || stamp),
+        updatedAt: toIso(e?.updatedAt || stamp),
+        lastModifiedDeviceId: e?.lastModifiedDeviceId || DEVICE_ID,
+        syncStatus: e?.syncStatus || SYNC_STATUS.pending,
+        date: toIso(e?.date),
         }))
       : [],
     historicalPurchases: Array.isArray(historicalPurchases)
       ? stampRecords(historicalPurchases, stamp, "historical_purchase").map((p) => ({
-          ...p,
-          createdAt: toIso(p?.createdAt || p?.date || stamp),
-          updatedAt: toIso(p?.updatedAt || stamp),
-          date: toIso(p?.date),
+        ...p,
+        createdAt: toIso(p?.createdAt || p?.date || stamp),
+        updatedAt: toIso(p?.updatedAt || stamp),
+        lastModifiedDeviceId: p?.lastModifiedDeviceId || DEVICE_ID,
+        syncStatus: p?.syncStatus || SYNC_STATUS.pending,
+        date: toIso(p?.date),
         }))
       : [],
     reportFilter: typeof reportFilter === "string" ? reportFilter : undefined,
@@ -1718,7 +1760,9 @@ if (Array.isArray(data.orders)) {
       date: t.date ? new Date(t.date) : new Date(),
     }));
   }
-  if (data.inventoryLockedAt) out.inventoryLockedAt = new Date(data.inventoryLockedAt);
+  if (Object.prototype.hasOwnProperty.call(data, "inventoryLockedAt")) {
+    out.inventoryLockedAt = data.inventoryLockedAt ? new Date(data.inventoryLockedAt) : null;
+  }
   if (data.dayMeta) {
     out.dayMeta = {
       startedBy: data.dayMeta.startedBy || "",
@@ -1788,6 +1832,7 @@ if (Array.isArray(data.orders)) {
   if (data.extras) out.extraList = normalizeExtraList(data.extras);
   if (data.beverages) out.beverageList = normalizeBeverageList(data.beverages);
   if (data.inventory) out.inventory = data.inventory;
+  if (Array.isArray(data.inventoryLedger)) out.inventoryLedger = data.inventoryLedger;
   if (Array.isArray(data.bulkInventoryItems)) out.bulkInventoryItems = data.bulkInventoryItems;
   if (Array.isArray(data.bulkInventoryHistory)) out.bulkInventoryHistory = data.bulkInventoryHistory;
   if (typeof data.nextOrderNo === "number") out.nextOrderNo = data.nextOrderNo;
@@ -1885,13 +1930,16 @@ if (Array.isArray(data.workerSessions)) {
 
 function normalizeOrderForSupabase(order) {
   const normalized = enrichOrderWithChannel(order);
+  const idemKey =
+    normalized.idemKey ||
+    `idk_${DEVICE_ID}_${normalized.orderNo || "no"}_${toMillis(normalized.createdAt || normalized.date) || "time"}_${Math.round(Number(normalized.total || 0) * 100)}`;
   return sanitizeForSupabase({
     shop_id: SHOP_ID,
     order_no: normalized.orderNo,
     day_id: normalized.dayId || "",
     shift_started_at: toIso(normalized.shiftStartedAt),
     shift_ended_at: toIso(normalized.shiftEndedAt),
-    device_id: normalized.deviceId || "",
+    device_id: normalized.deviceId || normalized.lastModifiedDeviceId || DEVICE_ID,
     worker: normalized.worker,
     payment: normalized.payment,
     payment_parts: Array.isArray(normalized.paymentParts)
@@ -1920,7 +1968,7 @@ function normalizeOrderForSupabase(order) {
     date: toIso(normalized.date) || new Date().toISOString(),
     restocked_at: toIso(normalized.restockedAt),
     cart: normalized.cart || [],
-    idem_key: normalized.idemKey || "",
+    idem_key: idemKey,
     source: normalized.source || "",
     online_order_id: normalized.onlineOrderId || "",
     online_order_key: normalized.onlineOrderKey || "",
@@ -1928,6 +1976,8 @@ function normalizeOrderForSupabase(order) {
     online_source_doc_id: normalized.onlineSourceDocId || "",
     channel: normalized.channel || "",
     channel_order_no: normalized.channelOrderNo || "",
+    last_modified_device_id: normalized.lastModifiedDeviceId || DEVICE_ID,
+    sync_status: normalized.syncStatus || SYNC_STATUS.pending,
     created_at: toIso(normalized.createdAt) || new Date().toISOString(),
     updated_at: new Date().toISOString(),
   });
@@ -1979,6 +2029,8 @@ function orderFromSupabaseRow(row = {}) {
     onlineSourceDocId: row.online_source_doc_id || "",
     channel: row.channel || "",
     channelOrderNo: row.channel_order_no || "",
+    lastModifiedDeviceId: row.last_modified_device_id || DEVICE_ID,
+    syncStatus: row.sync_status || SYNC_STATUS.synced,
     createdAt: row.created_at ? asDate(row.created_at) : undefined,
     updatedAt: row.updated_at ? asDate(row.updated_at) : undefined,
   };
@@ -3268,15 +3320,17 @@ function posStateFromRow(row) {
     ...state,
     updatedAt: row.updated_at || state.updatedAt,
     writerId: row.writer_id || state.writerId,
+    lastModifiedDeviceId: row.last_modified_device_id || state.lastModifiedDeviceId,
     writeSeq: Number(row.write_seq || state.writeSeq || 0),
     clientTime: row.client_time ?? state.clientTime,
   };
 }
 
 async function loadPosState() {
+  if (!supabase) throw new Error("Supabase is not configured.");
   const { data, error } = await supabase
     .from("pos_state")
-    .select("state, updated_at, writer_id, write_seq, client_time")
+    .select("state, updated_at, writer_id, last_modified_device_id, write_seq, client_time")
     .eq("id", POS_STATE_ID)
     .eq("shop_id", SHOP_ID)
     .maybeSingle();
@@ -3284,43 +3338,42 @@ async function loadPosState() {
   return posStateFromRow(data);
 }
 
-async function savePosState(state) {
+async function savePosStateOptimistic(state, expectedSeq) {
+  if (!supabase) throw new Error("Supabase is not configured.");
   const safeState = sanitizeForSupabase(state || {});
-  const expectedSeq = Number(safeState?.writeSeq || 1) - 1;
-
   const row = {
     id: POS_STATE_ID,
     shop_id: SHOP_ID,
     state: safeState,
     writer_id: safeState?.writerId || null,
+    last_modified_device_id: safeState?.lastModifiedDeviceId || safeState?.deviceId || DEVICE_ID,
     write_seq: Number(safeState?.writeSeq || 0),
     client_time: safeState?.clientTime != null ? Number(safeState.clientTime) : null,
     updated_at: new Date().toISOString(),
   };
 
-  const { data: existing } = await supabase
-    .from("pos_state")
-    .select("write_seq")
-    .eq("id", POS_STATE_ID)
-    .maybeSingle();
-
-  if (!existing) {
-    const { error } = await supabase.from("pos_state").insert(row);
+  if (!expectedSeq) {
+    const { error } = await supabase.from("pos_state").upsert(row, { onConflict: "id" });
     if (error) throw error;
-  } else {
-    if (Number(existing.write_seq) > expectedSeq) {
-      throw new Error(`Concurrency conflict: cloud seq ${existing.write_seq} > local seq ${expectedSeq}`);
-    }
-    const { error } = await supabase
-      .from("pos_state")
-      .update(row)
-      .eq("id", POS_STATE_ID)
-      .eq("write_seq", existing.write_seq);
-    if (error) throw error;
+    return true;
   }
+
+  const { data, error } = await supabase
+    .from("pos_state")
+    .update(row)
+    .eq("id", POS_STATE_ID)
+    .eq("write_seq", expectedSeq)
+    .select("id");
+
+  if (error) throw error;
+  if (!data || data.length === 0) {
+    return false; // OCC Conflict
+  }
+  return true;
 }
 
 function subscribeToPosState(callback) {
+  if (!supabase) return () => {};
   const channel = supabase
     .channel(`pos-state-${SHOP_ID}`)
     .on(
@@ -3341,6 +3394,7 @@ function subscribeToPosState(callback) {
 }
 
 async function loadOrders(startDate, endDate, dayId = "") {
+  if (!supabase) throw new Error("Supabase is not configured.");
   let request = supabase
     .from("orders")
     .select("*")
@@ -3351,10 +3405,7 @@ async function loadOrders(startDate, endDate, dayId = "") {
     request = request.eq("day_id", dayId);
   }
 
-  const twelveHoursAgo = new Date(Date.now() - 12 * 60 * 60 * 1000);
-  const effectiveStartDate = startDate || twelveHoursAgo;
-
-  const startIso = toIso(effectiveStartDate);
+  const startIso = toIso(startDate);
   const endIso = toIso(endDate);
   if (startIso && !dayId) request = request.gte("date", startIso);
   if (endIso) request = request.lte("date", endIso);
@@ -3364,7 +3415,86 @@ async function loadOrders(startDate, endDate, dayId = "") {
   return (data || []).map(orderFromSupabaseRow);
 }
 
+async function loadCompleteCloudState() {
+  if (!supabase) throw new Error("Supabase is not configured.");
+
+  const warnings = [];
+  let remoteState = null;
+  let cloudOrders = [];
+  let counterLastOrderNo = 0;
+
+  try {
+    remoteState = await loadPosState();
+  } catch (err) {
+    warnings.push(`pos_state read failed: ${String(err?.message || err)}`);
+  }
+
+  try {
+    const remoteDayMeta = remoteState?.dayMeta || {};
+    const remoteStartedAt = remoteDayMeta?.startedAt ? new Date(remoteDayMeta.startedAt) : null;
+    const remoteEndedAt = remoteDayMeta?.endedAt ? new Date(remoteDayMeta.endedAt) : null;
+    const remoteDayId =
+      remoteDayMeta?.dayId ||
+      (remoteStartedAt && !Number.isNaN(+remoteStartedAt)
+        ? `day_${remoteStartedAt.getTime()}`
+        : "");
+    const activeRemoteShift =
+      remoteStartedAt &&
+      !Number.isNaN(+remoteStartedAt) &&
+      !remoteEndedAt &&
+      Date.now() - remoteStartedAt.getTime() <= MAX_ACTIVE_SHIFT_MS;
+
+    cloudOrders = activeRemoteShift
+      ? await loadOrders(remoteStartedAt, null, remoteDayId)
+      : [];
+  } catch (err) {
+    warnings.push(`orders read failed: ${String(err?.message || err)}`);
+  }
+
+  try {
+    counterLastOrderNo = await loadCounter();
+  } catch (err) {
+    warnings.push(`counter read failed: ${String(err?.message || err)}`);
+  }
+
+  if (!remoteState && !cloudOrders.length) {
+    if (warnings.length) throw new Error(warnings.join(" | "));
+    return null;
+  }
+
+  const snapshot = remoteState && typeof remoteState === "object" ? { ...remoteState } : {};
+  const stateOrders = Array.isArray(snapshot.orders) ? snapshot.orders : [];
+  const mergedOrders = dedupeOrders([...stateOrders, ...cloudOrders]).map(enrichOrderWithChannel);
+
+  // The orders table is authoritative for current active orders. This prevents an
+  // empty pos_state.orders array from hiding orders that still exist in Supabase.
+  snapshot.orders = mergedOrders;
+
+  const maxLoadedOrderNo = mergedOrders.reduce((max, order) => {
+    const n = Number(order?.orderNo || 0);
+    return Number.isFinite(n) ? Math.max(max, n) : max;
+  }, 0);
+  const nextCandidates = [
+    Number(snapshot.nextOrderNo || 0),
+    Number(counterLastOrderNo || 0) + 1,
+    maxLoadedOrderNo + 1,
+  ].filter((n) => Number.isFinite(n) && n > 0);
+  if (nextCandidates.length) snapshot.nextOrderNo = Math.max(...nextCandidates);
+
+  snapshot.updatedAt = snapshot.updatedAt || nowIso();
+  snapshot.__cloudLoadMeta = {
+    posStateFound: Boolean(remoteState),
+    ordersLoadedFromOrdersTable: cloudOrders.length,
+    totalOrdersLoaded: mergedOrders.length,
+    counterLastOrderNo: Number(counterLastOrderNo || 0),
+    warnings,
+  };
+
+  return snapshot;
+}
+
 function subscribeToOrders(callback) {
+  if (!supabase) return () => {};
   const channel = supabase
     .channel(`orders-${SHOP_ID}`)
     .on(
@@ -3385,13 +3515,70 @@ function subscribeToOrders(callback) {
 }
 
 async function addOrder(order) {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  const row = normalizeOrderForSupabase(order);
+  if (row.idem_key) {
+    const { data: existing, error: existingError } = await supabase
+      .from("orders")
+      .select("*")
+      .eq("shop_id", SHOP_ID)
+      .eq("idem_key", row.idem_key)
+      .maybeSingle();
+    if (existingError) throw existingError;
+    if (existing?.id) {
+      const { data, error } = await supabase
+        .from("orders")
+        .update(row)
+        .eq("id", existing.id)
+        .select("id")
+        .single();
+      if (error) throw error;
+      return data;
+    }
+  }
   const { data, error } = await supabase
     .from("orders")
-    .insert(normalizeOrderForSupabase(order))
+    .insert(row)
     .select("id")
     .single();
   if (error) throw error;
   return data;
+}
+
+async function findExistingCloudOrderForSync(order = {}) {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  if (order.cloudId) {
+    const { data, error } = await supabase
+      .from("orders")
+      .select("id")
+      .eq("shop_id", SHOP_ID)
+      .eq("id", order.cloudId)
+      .maybeSingle();
+    if (error) throw error;
+    if (data?.id) return data;
+  }
+  if (order.idemKey) {
+    const { data, error } = await supabase
+      .from("orders")
+      .select("id")
+      .eq("shop_id", SHOP_ID)
+      .eq("idem_key", order.idemKey)
+      .maybeSingle();
+    if (error) throw error;
+    if (data?.id) return data;
+  }
+  if (order.orderNo != null && order.dayId) {
+    const { data, error } = await supabase
+      .from("orders")
+      .select("id")
+      .eq("shop_id", SHOP_ID)
+      .eq("day_id", order.dayId)
+      .eq("order_no", Number(order.orderNo))
+      .maybeSingle();
+    if (error) throw error;
+    if (data?.id) return data;
+  }
+  return null;
 }
 
 function normalizeOrderPatchForSupabase(patch = {}) {
@@ -3425,6 +3612,8 @@ function normalizeOrderPatchForSupabase(patch = {}) {
     onlineSourceCollection: "online_source_collection",
     onlineSourceDocId: "online_source_doc_id",
     channelOrderNo: "channel_order_no",
+    lastModifiedDeviceId: "last_modified_device_id",
+    syncStatus: "sync_status",
     createdAt: "created_at",
     updatedAt: "updated_at",
   };
@@ -3449,10 +3638,13 @@ function normalizeOrderPatchForSupabase(patch = {}) {
     }
   }
   if (!row.updated_at) row.updated_at = new Date().toISOString();
+  if (!row.last_modified_device_id) row.last_modified_device_id = DEVICE_ID;
+  if (!row.sync_status) row.sync_status = SYNC_STATUS.pending;
   return sanitizeForSupabase(row);
 }
 
 async function updateOrderById(id, patch) {
+  if (!supabase) throw new Error("Supabase is not configured.");
   if (!id) return null;
   const { data, error } = await supabase
     .from("orders")
@@ -3466,6 +3658,7 @@ async function updateOrderById(id, patch) {
 }
 
 async function updateOrderByOrderNo(orderNo, patch, dayId = "") {
+  if (!supabase) throw new Error("Supabase is not configured.");
   let request = supabase
     .from("orders")
     .update(normalizeOrderPatchForSupabase(patch))
@@ -3478,7 +3671,182 @@ async function updateOrderByOrderNo(orderNo, patch, dayId = "") {
   return (data || []).map(orderFromSupabaseRow);
 }
 
+function deviceFromSupabaseRow(row = {}) {
+  const deviceId = row.device_id || row.id || "";
+  return {
+    id: row.id || deviceId,
+    deviceId,
+    shopId: row.shop_id || SHOP_ID,
+    label: row.label || "",
+    appSurface: row.app_surface || "",
+    mode: row.mode || "",
+    os: row.os || "",
+    browser: row.browser || "",
+    platform: row.platform || "",
+    lastIp: row.last_ip || "",
+    userAgent: row.user_agent || "",
+    pendingCount: Number(row.pending_count || 0),
+    lastSyncAt: row.last_sync_at ? new Date(row.last_sync_at) : null,
+    firstSeenAt: row.first_seen_at ? new Date(row.first_seen_at) : null,
+    lastSeenAt: row.last_seen_at ? new Date(row.last_seen_at) : null,
+    approvedBy: row.approved_by || "",
+    blockedAt: row.blocked_at ? new Date(row.blocked_at) : null,
+    updatedAt: row.updated_at ? new Date(row.updated_at) : null,
+  };
+}
+
+async function findDeviceRow(deviceId) {
+  if (!supabase || !deviceId) return null;
+  const byDeviceId = await supabase
+    .from("devices")
+    .select("*")
+    .eq("shop_id", SHOP_ID)
+    .eq("device_id", deviceId)
+    .maybeSingle();
+  if (!byDeviceId.error && byDeviceId.data) return byDeviceId.data;
+
+  const byLegacyId = await supabase
+    .from("devices")
+    .select("*")
+    .eq("shop_id", SHOP_ID)
+    .eq("id", deviceId)
+    .maybeSingle();
+  if (byLegacyId.error) {
+    if (byDeviceId.error) throw byDeviceId.error;
+    throw byLegacyId.error;
+  }
+  return byLegacyId.data || null;
+}
+
+async function countDevicesForShop() {
+  if (!supabase) return 0;
+  const modern = await supabase
+    .from("devices")
+    .select("device_id", { count: "exact", head: true })
+    .eq("shop_id", SHOP_ID);
+  if (!modern.error) return Number(modern.count || 0);
+
+  const legacy = await supabase
+    .from("devices")
+    .select("id", { count: "exact", head: true })
+    .eq("shop_id", SHOP_ID);
+  if (legacy.error) throw modern.error;
+  return Number(legacy.count || 0);
+}
+
+async function upsertDeviceHeartbeat(status = {}) {
+  if (!supabase) return false;
+  const deviceInfo = detectDeviceDetails();
+  const now = new Date().toISOString();
+  const existing = await findDeviceRow(DEVICE_ID).catch(() => null);
+  const deviceCount = await countDevicesForShop().catch(() => 0);
+  const mode =
+    existing?.mode ||
+    (existing && deviceInfo.appSurface === "local-electron"
+      ? "admin"
+      : Number(deviceCount || 0) === 0
+      ? "admin"
+      : "pending");
+  const row = sanitizeForSupabase({
+    id: existing?.id || DEVICE_ID,
+    device_id: DEVICE_ID,
+    shop_id: SHOP_ID,
+    label: existing?.label || status.label || deviceInfo.label || "Cashier device",
+    app_surface: deviceInfo.appSurface,
+    mode,
+    os: deviceInfo.os || "",
+    browser: deviceInfo.browser || "",
+    platform: deviceInfo.platform || "",
+    last_ip: status.lastIp || existing?.last_ip || "",
+    user_agent: deviceInfo.userAgent || "",
+    last_seen_at: now,
+    last_sync_at: status.lastSyncAt ? toIso(status.lastSyncAt) : existing?.last_sync_at || null,
+    pending_count: Number(status.pendingCount || 0),
+    first_seen_at: existing?.first_seen_at || now,
+    updated_at: now,
+  });
+
+  const modern = await supabase.from("devices").upsert(row, { onConflict: "device_id" });
+  if (!modern.error) return true;
+
+  const legacyRow = sanitizeForSupabase({
+    id: DEVICE_ID,
+    shop_id: SHOP_ID,
+    label: row.label,
+    app_surface: row.app_surface,
+    last_seen_at: row.last_seen_at,
+    last_sync_at: row.last_sync_at,
+    pending_count: row.pending_count,
+    updated_at: row.updated_at,
+  });
+  const legacy = await supabase.from("devices").upsert(legacyRow, { onConflict: "id" });
+  if (legacy.error) throw modern.error;
+  return true;
+}
+
+async function loadDevices() {
+  if (!supabase) return [];
+  const { data, error } = await supabase
+    .from("devices")
+    .select("*")
+    .eq("shop_id", SHOP_ID)
+    .order("last_seen_at", { ascending: false });
+  if (error) throw error;
+  return (data || []).map(deviceFromSupabaseRow);
+}
+
+async function updateDeviceRecord(deviceId, patch = {}) {
+  if (!supabase || !deviceId) return null;
+  const row = {};
+  if (patch.label != null) row.label = String(patch.label || "");
+  if (patch.mode != null) row.mode = String(patch.mode || "pending");
+  if (patch.approvedBy != null) row.approved_by = String(patch.approvedBy || "");
+  if (patch.mode === "blocked") row.blocked_at = new Date().toISOString();
+  if (patch.mode && patch.mode !== "blocked") row.blocked_at = null;
+
+  const modern = await supabase
+    .from("devices")
+    .update(sanitizeForSupabase(row))
+    .eq("shop_id", SHOP_ID)
+    .eq("device_id", deviceId)
+    .select("*")
+    .maybeSingle();
+  if (!modern.error) return modern.data ? deviceFromSupabaseRow(modern.data) : null;
+
+  const legacy = await supabase
+    .from("devices")
+    .update(sanitizeForSupabase(row))
+    .eq("shop_id", SHOP_ID)
+    .eq("id", deviceId)
+    .select("*")
+    .maybeSingle();
+  if (legacy.error) throw modern.error;
+  return legacy.data ? deviceFromSupabaseRow(legacy.data) : null;
+}
+
+function subscribeToDevices(callback) {
+  if (!supabase) return () => {};
+  const channel = supabase
+    .channel(`devices-${SHOP_ID}`)
+    .on(
+      "postgres_changes",
+      {
+        event: "*",
+        schema: "public",
+        table: "devices",
+        filter: `shop_id=eq.${SHOP_ID}`,
+      },
+      callback
+    )
+    .subscribe();
+
+  return () => {
+    supabase.removeChannel(channel);
+  };
+}
+
 async function purgeOrdersInRange(startDate, endDate) {
+  if (!supabase) return 0;
   try {
     let selectReq = supabase
       .from("orders")
@@ -3507,6 +3875,7 @@ async function purgeOrdersInRange(startDate, endDate) {
 }
 
 async function allocateOrderNoAtomic() {
+  if (!supabase) throw new Error("Supabase is not configured.");
   const { data, error } = await supabase.rpc("allocate_order_no", {
     p_shop_id: SHOP_ID,
   });
@@ -3515,6 +3884,7 @@ async function allocateOrderNoAtomic() {
 }
 
 async function resetOrderCounter(lastOrderNo = 0) {
+  if (!supabase) throw new Error("Supabase is not configured.");
   const { data, error } = await supabase.rpc("reset_order_counter", {
     p_shop_id: SHOP_ID,
     p_last_order_no: Number(lastOrderNo || 0),
@@ -3524,6 +3894,7 @@ async function resetOrderCounter(lastOrderNo = 0) {
 }
 
 async function loadCounter() {
+  if (!supabase) throw new Error("Supabase is not configured.");
   const { data, error } = await supabase
     .from("counters")
     .select("last_order_no")
@@ -3534,6 +3905,7 @@ async function loadCounter() {
 }
 
 function subscribeToCounter(callback) {
+  if (!supabase) return () => {};
   const channel = supabase
     .channel(`counter-${SHOP_ID}`)
     .on(
@@ -3545,130 +3917,6 @@ function subscribeToCounter(callback) {
         filter: `shop_id=eq.${SHOP_ID}`,
       },
       (payload) => callback(Number(payload.new?.last_order_no || 0), payload)
-    )
-    .subscribe();
-
-  return () => {
-    supabase.removeChannel(channel);
-  };
-}
-
-function deviceFromSupabaseRow(row = {}) {
-  return {
-    deviceId: row.device_id || "",
-    shopId: row.shop_id || SHOP_ID,
-    label: row.label || "",
-    mode: row.mode || "pending",
-    os: row.os || "",
-    browser: row.browser || "",
-    platform: row.platform || "",
-    lastIp: row.last_ip || "",
-    userAgent: row.user_agent || "",
-    firstSeenAt: row.first_seen_at ? new Date(row.first_seen_at) : null,
-    lastSeenAt: row.last_seen_at ? new Date(row.last_seen_at) : null,
-    approvedBy: row.approved_by || "",
-    updatedAt: row.updated_at ? new Date(row.updated_at) : null,
-  };
-}
-
-async function loadDevices() {
-  const { data, error } = await supabase
-    .from("devices")
-    .select("*")
-    .eq("shop_id", SHOP_ID)
-    .order("last_seen_at", { ascending: false });
-  if (error) throw error;
-  return (data || []).map(deviceFromSupabaseRow);
-}
-
-async function registerOrTouchDevice(deviceInfo, lastIp = "") {
-  const deviceId = deviceInfo?.deviceId;
-  if (!deviceId) throw new Error("Missing device id.");
-  const now = new Date().toISOString();
-
-  const { data: existing, error: existingError } = await supabase
-    .from("devices")
-    .select("*")
-    .eq("shop_id", SHOP_ID)
-    .eq("device_id", deviceId)
-    .maybeSingle();
-  if (existingError) throw existingError;
-
-  const heartbeat = sanitizeForSupabase({
-    label: existing?.label || deviceInfo.label || deviceId,
-    os: deviceInfo.os || "",
-    browser: deviceInfo.browser || "",
-    platform: deviceInfo.platform || "",
-    user_agent: deviceInfo.userAgent || "",
-    last_ip: lastIp || existing?.last_ip || "",
-    last_seen_at: now,
-  });
-
-  if (existing) {
-    const { data, error } = await supabase
-      .from("devices")
-      .update(heartbeat)
-      .eq("shop_id", SHOP_ID)
-      .eq("device_id", deviceId)
-      .select("*")
-      .maybeSingle();
-    if (error) throw error;
-    return deviceFromSupabaseRow(data || existing);
-  }
-
-  const { count, error: countError } = await supabase
-    .from("devices")
-    .select("device_id", { count: "exact", head: true })
-    .eq("shop_id", SHOP_ID);
-  if (countError) throw countError;
-
-  const row = {
-    shop_id: SHOP_ID,
-    device_id: deviceId,
-    ...heartbeat,
-    mode: Number(count || 0) === 0 ? "admin" : "pending",
-    first_seen_at: now,
-  };
-  const { data, error } = await supabase
-    .from("devices")
-    .insert(row)
-    .select("*")
-    .single();
-  if (error) throw error;
-  return deviceFromSupabaseRow(data);
-}
-
-async function updateDeviceRecord(deviceId, patch = {}) {
-  const row = {};
-  if (patch.label != null) row.label = String(patch.label || "");
-  if (patch.mode != null) row.mode = String(patch.mode || "pending");
-  if (patch.approvedBy != null) row.approved_by = String(patch.approvedBy || "");
-  if (patch.mode === "blocked") row.blocked_at = new Date().toISOString();
-  if (patch.mode && patch.mode !== "blocked") row.blocked_at = null;
-
-  const { data, error } = await supabase
-    .from("devices")
-    .update(sanitizeForSupabase(row))
-    .eq("shop_id", SHOP_ID)
-    .eq("device_id", deviceId)
-    .select("*")
-    .maybeSingle();
-  if (error) throw error;
-  return data ? deviceFromSupabaseRow(data) : null;
-}
-
-function subscribeToDevices(callback) {
-  const channel = supabase
-    .channel(`devices-${SHOP_ID}`)
-    .on(
-      "postgres_changes",
-      {
-        event: "*",
-        schema: "public",
-        table: "devices",
-        filter: `shop_id=eq.${SHOP_ID}`,
-      },
-      callback
     )
     .subscribe();
 
@@ -3741,8 +3989,60 @@ function findDefByLine(line, defs){
   return null;
 }
 
-function buildReceiptHTML(order, widthMm = 80) {
+function resolveReceiptAssetUrl(assetName) {
+  const cleanName = String(assetName || "").replace(/^\/+/, "");
+  if (!cleanName) return "";
+  if (typeof window === "undefined" || !window.location) return `/${cleanName}`;
+  try {
+    const isFileProto = window.location.protocol === "file:";
+    if (isFileProto) {
+      const url = new URL(cleanName, window.location.href);
+      return url.href;
+    }
+    return new URL(cleanName, window.location.href).href;
+  } catch {
+    return `/${cleanName}`;
+  }
+}
+
+function resolveReceiptImages(images = {}) {
+  return {
+    logo: images.logo || resolveReceiptAssetUrl("tuxlogo.jpg"),
+    menuQr: images.menuQr || resolveReceiptAssetUrl("menu-qr.jpg"),
+    deliveryLogo: images.deliveryLogo || resolveReceiptAssetUrl("delivery-logo.jpg"),
+  };
+}
+
+function getReceiptPrinterBridge() {
+  if (typeof window === "undefined") return null;
+  return window.tuxCashierPrinter || null;
+}
+
+function openReceiptPreviewWindow(html) {
+  const win = window.open("", "_blank", "width=460,height=760");
+  if (!win) {
+    alert("Receipt preview was blocked. Allow popups for this app or use Print.");
+    return false;
+  }
+  win.document.open();
+  win.document.write(html);
+  win.document.close();
+  win.focus();
+  return true;
+}
+
+async function promptText(message, defaultValue = "") {
+  const dialogBridge =
+    typeof window !== "undefined" ? window.tuxCashierDialogs : null;
+  if (dialogBridge?.prompt) {
+    return dialogBridge.prompt(message, defaultValue);
+  }
+  return window.prompt(message, defaultValue);
+}
+
+function buildReceiptHTML(order, widthMm = 80, copy = "Customer", images = {}) {
   const m = Math.max(0, Math.min(4, 4)); // padding mm
+  const receiptImages = resolveReceiptImages(images);
   const currency = (v) => `E£${Number(v || 0).toFixed(2)}`;
   const dt = new Date(order.date);
   const orderDateStr = fmtDate(dt);
@@ -3856,7 +4156,7 @@ const cashBlock = (() => {
 <html>
 <head>
 <meta charset="utf-8">
-<title>Receipt</title>
+<title>${escHtml(copy || "Receipt")} Receipt</title>
 <style>
   @page { size: ${widthMm}mm auto; margin: 0; }
   html, body { margin: 0; padding: 0; }
@@ -3924,7 +4224,7 @@ const cashBlock = (() => {
 </head>
 <body>
   <div class="receipt">
-    <div class="brand"><img src="/tuxlogo.jpg" alt="TUX logo"></div>
+    <div class="brand"><img src="${escHtml(receiptImages.logo)}" alt="TUX logo"></div>
    <div class="title">TUX — Burger Truck</div>
     <div class="meta address">El-Saada St – Zahraa El-Maadi</div>
     <!-- Order meta -->
@@ -3957,8 +4257,8 @@ const cashBlock = (() => {
       <div class="thanks">Thank you for choosing TUX
 See you soon</div>
       <div class="logos">
-        <img class="menu" src="/menu-qr.jpg" alt="Menu QR">
-        <img class="delivery" src="/delivery-logo.jpg" alt="Delivery">
+        <img class="menu" src="${escHtml(receiptImages.menuQr)}" alt="Menu QR">
+        <img class="delivery" src="${escHtml(receiptImages.deliveryLogo)}" alt="Delivery">
       </div>
     </div>
   </div>
@@ -3966,8 +4266,17 @@ See you soon</div>
 </html>
 `;
 }
-function printReceiptHTML(order, widthMm = 80, copy = "Customer", images) {
+async function printReceiptHTML(order, widthMm = 80, copy = "Customer", images) {
   const html = buildReceiptHTML(order, widthMm, copy, images);
+  const printerBridge = getReceiptPrinterBridge();
+  if (printerBridge?.printReceipt) {
+    try {
+      return await printerBridge.printReceipt(html, { widthMm, copy });
+    } catch (err) {
+      console.warn("Native receipt print failed; falling back to browser print.", err);
+    }
+  }
+
   const ifr = document.createElement("iframe");
   Object.assign(ifr.style, { position:"fixed", right:0, bottom:0, width:0, height:0, border:0 });
   let htmlWritten = false;
@@ -3992,6 +4301,19 @@ function printReceiptHTML(order, widthMm = 80, copy = "Customer", images) {
   doc.close();
   htmlWritten = true;
   setTimeout(() => { try { if (document.body.contains(ifr)) ifr.remove(); } catch {} }, 12000);
+}
+
+async function previewReceiptHTML(order, widthMm = 80, copy = "Preview", images) {
+  const html = buildReceiptHTML(order, widthMm, copy, images);
+  const printerBridge = getReceiptPrinterBridge();
+  if (printerBridge?.previewReceipt) {
+    try {
+      return await printerBridge.previewReceipt(html, { widthMm, copy });
+    } catch (err) {
+      console.warn("Native receipt preview failed; falling back to browser preview.", err);
+    }
+  }
+  return { success: openReceiptPreviewWindow(html) };
 }
 const normalizePhone = (s) => {
   let digits = String(s || "").replace(/\D/g, "");
@@ -4309,7 +4631,30 @@ setMenu((arr) => [
   setNewItemPrice(0);
   setNewItemColor("#ffffff");
 };
-const [inventory, setInventory] = useState(DEFAULT_INVENTORY);
+const [baseInventory, setBaseInventory] = useState(DEFAULT_INVENTORY);
+  const [inventoryLedger, setInventoryLedger] = useState([]);
+
+  const inventory = useMemo(() => {
+    if (!baseInventory) return [];
+    const ledgerSums = {};
+    for (const item of (inventoryLedger || [])) {
+      ledgerSums[item.itemId] = (ledgerSums[item.itemId] || 0) + (Number(item.qty) || 0);
+    }
+    return baseInventory.map(it => ({ ...it, qty: (Number(it.qty) || 0) + (ledgerSums[it.id] || 0) }));
+  }, [baseInventory, inventoryLedger]);
+
+  const setInventory = useCallback((action) => {
+    setBaseInventory(prevBase => {
+      const ledgerSums = {};
+      for (const item of (inventoryLedger || [])) {
+        ledgerSums[item.itemId] = (ledgerSums[item.itemId] || 0) + (Number(item.qty) || 0);
+      }
+      const currentEffective = (prevBase || []).map(it => ({ ...it, qty: (Number(it.qty) || 0) + (ledgerSums[it.id] || 0) }));
+      const nextEffective = typeof action === 'function' ? action(currentEffective) : action;
+      if (!Array.isArray(nextEffective)) return nextEffective;
+      return nextEffective.map(it => ({ ...it, qty: (Number(it.qty) || 0) - (ledgerSums[it.id] || 0) }));
+    });
+  }, [inventoryLedger]);
 const [bulkInventoryItems, setBulkInventoryItems] = useState(() => {
   const l = loadLocal();
   return Array.isArray(l.bulkInventoryItems) ? l.bulkInventoryItems : [];
@@ -4603,8 +4948,8 @@ const [usageMonth, setUsageMonth] = useState(() => {
   const l = loadLocal();
   return l?.usageMonth || new Date().toISOString().slice(0, 7);
 });
-const resetUsageViewAdmin = () => {
-  const okAdmin = !!promptAdminAndPin();
+const resetUsageViewAdmin = async () => {
+  const okAdmin = !!(await promptAdminAndPin());
   if (!okAdmin) return;
 
   setUsageFilter("week");
@@ -4771,10 +5116,10 @@ const allTimeVarianceTotal = useMemo(
   () => Object.values(allTimeVarianceByMethod).reduce((s, v) => s + Number(v || 0), 0),
   [allTimeVarianceByMethod]
 );
-const resetAllReconciliations = () => {
-  const okAdmin = !!promptAdminAndPin();
+const resetAllReconciliations = async () => {
+  const okAdmin = !!(await promptAdminAndPin());
   if (!okAdmin) return;
-  const phrase = window.prompt(
+  const phrase = await promptText(
     "Type RESET RECONCILIATIONS to clear saved reconciliations and variance totals.",
     ""
   );
@@ -4831,6 +5176,7 @@ const latestReconciliationForCurrentDay = useMemo(() => {
   );
 }, [currentDayId, reconHistory, dayMeta?.startedAt]);
 const saveReconciliation = () => {
+  if (!assertDeviceCanWrite("save reconciliation data")) return;
   if (!dayMeta.startedAt || dayMeta.endedAt) return alert("Start an active shift first.");
   const who = String(reconSavedBy || dayMeta.currentWorker || "").trim();
   if (!who) return alert("Select or type who saved it (Saved by).");
@@ -4881,8 +5227,17 @@ if (!hasMeaningfulActualCounts) {
     totalVariance: Number(totalVariance.toFixed(2)),
     status: Math.abs(Number(totalVariance || 0)) < 0.01 ? "balanced" : "variance",
   };
-  setReconHistory(arr => [rec, ...(arr || []).filter((row) => row?.id !== rec.id)]);
-  setDayMeta(d => ({ ...d, dayId, reconciledAt: savedAt, reconciliationId: rec.id, updatedAt: nowIso() }));
+  const nextDayMeta = { ...dayMeta, dayId, reconciledAt: savedAt, reconciliationId: rec.id, updatedAt: nowIso() };
+  const nextReconHistory = [rec, ...(reconHistory || []).filter((row) => row?.id !== rec.id)];
+  setReconHistory(nextReconHistory);
+  setDayMeta(nextDayMeta);
+  saveLocalPartial(
+    {
+      reconHistory: nextReconHistory,
+      dayMeta: nextDayMeta,
+    },
+    { sections: [RECONCILIATION_SECTION, DAY_META_SECTION], updatedAt: toIso(savedAt) }
+  );
   alert("Reconciliation saved ✅");
 };
   const [menu, setMenu] = useState(BASE_MENU);
@@ -4986,21 +5341,21 @@ const [newInvName, setNewInvName] = useState("");
 const [newInvUnit, setNewInvUnit] = useState("");
 const [newInvQty, setNewInvQty] = useState(0);
   const [adminPins, setAdminPins] = useState({ ...DEFAULT_ADMIN_PINS });
-const verifyAdminPin = (n) => {
+const verifyAdminPin = async (n) => {
   const expected = norm(adminPins[n] || "");
   if (!expected) {
     alert(`Admin ${n} has no PIN set; add it in Settings → Admin PINs.`);
     return false;
   }
-  const entered = window.prompt(`Enter PIN for Admin ${n}:`, "");
+  const entered = await promptText(`Enter PIN for Admin ${n}:`, "");
   if (entered == null) return false;
   return norm(entered) === expected;
 };
 const lockAdminPin = (n) => {
   setUnlockedPins((u) => ({ ...u, [n]: false }));
 };
-const unlockAdminPin = (n) => {
-  if (!verifyAdminPin(n)) return;
+const unlockAdminPin = async (n) => {
+  if (!(await verifyAdminPin(n))) return;
   setUnlockedPins((u) => ({ ...u, [n]: true }));
 };
   const [unlockedPins, setUnlockedPins] = useState({}); 
@@ -5097,22 +5452,126 @@ const [lastLocalEditAt, setLastLocalEditAt] = useState(0);
   const [fbUser, setFbUser] = useState(null);
   const [cloudEnabled, setCloudEnabled] = useState(true);
   const [realtimeOrders, setRealtimeOrders] = useState(true);
-const [cloudStatus, setCloudStatus] = useState({
-  lastSaveAt: null,
-  lastLoadAt: null,
-  error: null,
-});
-const [currentDeviceInfo] = useState(() => detectDeviceDetails());
-const [devices, setDevices] = useState([]);
-const [deviceStatus, setDeviceStatus] = useState({
-  lastSeenAt: null,
-  error: null,
-});
+  const [cloudStatus, setCloudStatus] = useState({
+    lastSaveAt: null,
+    lastLoadAt: null,
+    error: null,
+  });
+  const [localDbStatus, setLocalDbStatus] = useState({
+    available: false,
+    orderCount: 0,
+    pendingCount: 0,
+  });
+  const [syncDevices, setSyncDevices] = useState([]);
+  const [deviceStatus, setDeviceStatus] = useState({
+    lastSeenAt: null,
+    error: null,
+  });
+  const currentDeviceInfo = useMemo(() => detectDeviceDetails(), []);
+  const currentDevice = useMemo(
+    () =>
+      (syncDevices || []).find(
+        (device) => device?.deviceId === DEVICE_ID || device?.id === DEVICE_ID
+      ) || null,
+    [syncDevices]
+  );
+  const currentDeviceMode =
+    currentDevice?.mode ||
+    (deviceStatus.error
+      ? "admin"
+      : currentDeviceInfo.appSurface === "local-electron"
+      ? "admin"
+      : "pending");
+  const currentDeviceModeMeta = getDeviceModeMeta(currentDeviceMode);
+  const currentDeviceCanListen =
+    currentDeviceModeMeta.canListen || currentDeviceModeMeta.canAdmin || !!deviceStatus.error;
+  const currentDeviceCanWrite =
+    currentDeviceModeMeta.canWrite || currentDeviceModeMeta.canAdmin || !!deviceStatus.error;
+  const currentDeviceCanAdmin = currentDeviceModeMeta.canAdmin || !!deviceStatus.error;
+  const assertDeviceCanWrite = useCallback(
+    (actionLabel = "write to the system") => {
+      if (currentDeviceCanWrite) return true;
+      alert(
+        `This device is set to "${currentDeviceModeMeta.label}" and cannot ${actionLabel}. Ask an admin to approve it in Admin -> Connected Devices.`
+      );
+      return false;
+    },
+    [currentDeviceCanWrite, currentDeviceModeMeta.label]
+  );
+  const refreshDevices = useCallback(async () => {
+    if (!fbUser || !isSupabaseConfigured) return;
+    try {
+      const ip = await fetchDevicePublicIp();
+      await upsertDeviceHeartbeat({
+        pendingCount: localDbStatus.pendingCount,
+        lastSyncAt: cloudStatusRef.current?.lastSaveAt || cloudStatusRef.current?.lastLoadAt,
+        lastIp: ip,
+      });
+      const devices = await loadDevices();
+      setSyncDevices(devices);
+      setDeviceStatus({ lastSeenAt: new Date(), error: null });
+    } catch (err) {
+      console.warn("Device registry sync failed:", err);
+      setDeviceStatus((status) => ({ ...status, error: String(err?.message || err) }));
+    }
+  }, [fbUser, localDbStatus.pendingCount]);
+  const updateDeviceMode = useCallback(
+    async (deviceId, mode) => {
+      if (!currentDeviceCanAdmin) {
+        alert("This device is not allowed to manage connected devices.");
+        return;
+      }
+      try {
+        const updated = await updateDeviceRecord(deviceId, {
+          mode,
+          approvedBy: dayMeta.currentWorker || "Admin",
+        });
+        if (updated) {
+          setSyncDevices((list) =>
+            list.map((device) => (device.deviceId === updated.deviceId ? updated : device))
+          );
+        }
+        await refreshDevices();
+      } catch (err) {
+        console.warn("Device mode update failed:", err);
+        alert(`Device update failed: ${String(err?.message || err)}`);
+      }
+    },
+    [currentDeviceCanAdmin, dayMeta.currentWorker, refreshDevices]
+  );
+  const renameDevice = useCallback(
+    async (deviceId, label) => {
+      if (!currentDeviceCanAdmin) {
+        alert("This device is not allowed to manage connected devices.");
+        return;
+      }
+      try {
+        const updated = await updateDeviceRecord(deviceId, { label });
+        if (updated) {
+          setSyncDevices((list) =>
+            list.map((device) => (device.deviceId === updated.deviceId ? updated : device))
+          );
+        }
+        await refreshDevices();
+      } catch (err) {
+        console.warn("Device rename failed:", err);
+        alert(`Device rename failed: ${String(err?.message || err)}`);
+      }
+    },
+    [currentDeviceCanAdmin, refreshDevices]
+  );
   const [hydrated, setHydrated] = useState(false);
   const [lastAppliedCloudAt, setLastAppliedCloudAt] = useState(0);
   // Prevent our own cloud writes from boomeranging back
-const clientIdRef = useRef(`cli_${Math.random().toString(36).slice(2)}`);
+const clientIdRef = useRef(DEVICE_ID);
 const writeSeqRef = useRef(0);
+const pendingOrderSyncRef = useRef(false);
+const ordersRef = useRef([]);
+const startupSyncRanRef = useRef(false);
+const cloudStatusRef = useRef(cloudStatus);
+const lastAppliedCloudAtRef = useRef(lastAppliedCloudAt);
+const lastLocalEditAtRef = useRef(lastLocalEditAt);
+const applyRemoteStateRef = useRef(null);
   // Printing preferences (kept)
   const [autoPrintOnCheckout, setAutoPrintOnCheckout] = useState(true);
   const [preferredPaperWidthMm, setPreferredPaperWidthMm] = useState(80);
@@ -5129,117 +5588,16 @@ const writeSeqRef = useRef(0);
     try {
       setFbReady(true);
       setFbUser({ uid: clientIdRef.current });
+      if (!isSupabaseConfigured) {
+        setCloudStatus((s) => ({
+          ...s,
+          error: "Supabase is not configured. Local offline mode is active.",
+        }));
+      }
     } catch (e) {
       setCloudStatus((s) => ({ ...s, error: String(e) }));
     }
   }, []);
-const reloadDevices = useCallback(async () => {
-  try {
-    const all = await loadDevices();
-    setDevices(all);
-  } catch (err) {
-    console.warn("Device registry load failed:", err);
-    setDeviceStatus((s) => ({ ...s, error: String(err?.message || err) }));
-  }
-}, []);
-
-const refreshDevices = useCallback(async () => {
-  if (!fbUser) return;
-  try {
-    const ip = await fetchDevicePublicIp();
-    const current = await registerOrTouchDevice(currentDeviceInfo, ip);
-    await reloadDevices();
-    setDeviceStatus({ lastSeenAt: current.lastSeenAt || new Date(), error: null });
-  } catch (err) {
-    console.warn("Device registry sync failed:", err);
-    setDeviceStatus((s) => ({ ...s, error: String(err?.message || err) }));
-  }
-}, [fbUser, currentDeviceInfo, reloadDevices]);
-
-useEffect(() => {
-  if (!fbUser) return undefined;
-  let cancelled = false;
-  const sync = async () => {
-    if (cancelled) return;
-    await refreshDevices();
-  };
-  sync();
-  const heartbeat = setInterval(sync, 60 * 1000);
-  const unsub = subscribeToDevices(reloadDevices);
-  return () => {
-    cancelled = true;
-    clearInterval(heartbeat);
-    unsub();
-  };
-}, [fbUser, refreshDevices, reloadDevices]);
-
-const currentDevice = useMemo(
-  () => devices.find((d) => d.deviceId === currentDeviceInfo.deviceId) || null,
-  [devices, currentDeviceInfo.deviceId]
-);
-const currentDeviceMode = currentDevice?.mode || (deviceStatus.error ? "admin" : "pending");
-const currentDeviceModeMeta = getDeviceModeMeta(currentDeviceMode);
-const currentDeviceCanListen =
-  currentDeviceModeMeta.canListen || currentDeviceModeMeta.canAdmin || !!deviceStatus.error;
-const currentDeviceCanWrite =
-  currentDeviceModeMeta.canWrite || currentDeviceModeMeta.canAdmin || !!deviceStatus.error;
-const currentDeviceCanAdmin = currentDeviceModeMeta.canAdmin || !!deviceStatus.error;
-const assertDeviceCanWrite = useCallback(
-  (actionLabel = "write to the system") => {
-    if (currentDeviceCanWrite) return true;
-    alert(
-      `This device is set to "${currentDeviceModeMeta.label}" and cannot ${actionLabel}. Ask an admin to approve it in Admin -> Connected Devices.`
-    );
-    return false;
-  },
-  [currentDeviceCanWrite, currentDeviceModeMeta.label]
-);
-
-const updateDeviceMode = useCallback(
-  async (deviceId, mode) => {
-    if (!currentDeviceCanAdmin) {
-      alert("This device is not allowed to manage connected devices.");
-      return;
-    }
-    try {
-      const updated = await updateDeviceRecord(deviceId, {
-        mode,
-        approvedBy: dayMeta.currentWorker || "Admin",
-      });
-      if (updated) {
-        setDevices((list) =>
-          list.map((device) => (device.deviceId === updated.deviceId ? updated : device))
-        );
-      }
-      await refreshDevices();
-    } catch (err) {
-      console.warn("Device mode update failed:", err);
-      alert(`Device update failed: ${String(err?.message || err)}`);
-    }
-  },
-  [currentDeviceCanAdmin, dayMeta.currentWorker, refreshDevices]
-);
-
-const renameDevice = useCallback(
-  async (deviceId, label) => {
-    if (!currentDeviceCanAdmin) {
-      alert("This device is not allowed to manage connected devices.");
-      return;
-    }
-    try {
-      const updated = await updateDeviceRecord(deviceId, { label });
-      if (updated) {
-        setDevices((list) =>
-          list.map((device) => (device.deviceId === updated.deviceId ? updated : device))
-        );
-      }
-    } catch (err) {
-      console.warn("Device rename failed:", err);
-      alert(`Device rename failed: ${String(err?.message || err)}`);
-    }
-  },
-  [currentDeviceCanAdmin]
-);
   useEffect(() => {
   if (purchaseFilter === "day") {
     setNewPurchase(p => ({ ...p, date: purchaseDay }));
@@ -5286,6 +5644,7 @@ useEffect(() => {
     }
     return changed ? out : prev;
   });
+// eslint-disable-next-line react-hooks/exhaustive-deps
 }, [purchaseCategories, localHydrated, hydrated]);
 useEffect(() => {
   if (!newPurchase.categoryId || newPurchase.ingredientId) return;
@@ -5344,7 +5703,8 @@ useEffect(() => {
  if (l.paymentMethods) setPaymentMethods(l.paymentMethods);
   if (l.orderTypes) setOrderTypes(l.orderTypes);
   if (typeof l.defaultDeliveryFee === "number") setDefaultDeliveryFee(l.defaultDeliveryFee);
-  if (l.inventory) setInventory(l.inventory);
+  if (l.inventory) setBaseInventory(l.inventory);
+  if (Array.isArray(l.inventoryLedger)) setInventoryLedger(l.inventoryLedger);
   if (Array.isArray(l.bulkInventoryItems)) setBulkInventoryItems(l.bulkInventoryItems);
   if (Array.isArray(l.bulkInventoryHistory)) setBulkInventoryHistory(l.bulkInventoryHistory);
   if (l.utilityBills) setUtilityBills(normalizeUtilityBills(l.utilityBills));
@@ -5426,6 +5786,14 @@ if (typeof l.nextOrderNo === "number") setNextOrderNo(l.nextOrderNo);
     );
   }
   setLocalHydrated(true);
+  loadLocalOrdersFromDb()
+    .then((dbOrders) => {
+      if (!dbOrders.length) return;
+      setOrders((prev) =>
+        dedupeOrders([...prev, ...dbOrders]).map(enrichOrderWithChannel)
+      );
+    })
+    .catch((err) => console.warn("IndexedDB order hydration failed:", err));
 }, [localHydrated]);
   useEffect(() => {
 if (!localHydrated) return;
@@ -5467,7 +5835,8 @@ useEffect(() => {
   saveLocalPartial({ usageFilter, usageWeekDate, usageMonth });
 }, [usageFilter, usageWeekDate, usageMonth, localHydrated]);
 useEffect(() => { if (!localHydrated) return; saveLocalPartial({ customers }); }, [customers, localHydrated]);                  // ⬅️ NEW
-useEffect(() => { if (!localHydrated) return; saveLocalPartial({ inventory }); }, [inventory, localHydrated]);
+useEffect(() => { if (!localHydrated) return; saveLocalPartial({ inventory: baseInventory }); }, [baseInventory, localHydrated]);
+useEffect(() => { if (!localHydrated) return; saveLocalPartial({ inventoryLedger }); }, [inventoryLedger, localHydrated]);
 useEffect(() => { if (!localHydrated) return; saveLocalPartial({ bulkInventoryItems }); }, [bulkInventoryItems, localHydrated]);
 useEffect(() => { if (!localHydrated) return; saveLocalPartial({ bulkInventoryHistory }); }, [bulkInventoryHistory, localHydrated]);
 useEffect(() => {
@@ -5507,11 +5876,43 @@ useEffect(() => { if (!localHydrated) return; saveLocalPartial({ inventoryLocked
 useEffect(() => { if (!localHydrated) return; saveLocalPartial({ nextOrderNo }); }, [nextOrderNo, localHydrated]);
 useEffect(() => {
   if (!localHydrated) return;
-  if (!realtimeOrders) saveLocalPartial({ orders });
-}, [orders, realtimeOrders, localHydrated]);
+  saveLocalPartial({ orders });
+}, [orders, localHydrated]);
 
 useEffect(() => {
-  setLastLocalEditAt(Date.now());
+  ordersRef.current = orders || [];
+}, [orders]);
+
+useEffect(() => {
+  cloudStatusRef.current = cloudStatus;
+}, [cloudStatus]);
+
+useEffect(() => {
+  lastAppliedCloudAtRef.current = lastAppliedCloudAt || 0;
+}, [lastAppliedCloudAt]);
+
+useEffect(() => {
+  lastLocalEditAtRef.current = lastLocalEditAt || 0;
+}, [lastLocalEditAt]);
+
+useEffect(() => {
+  if (!localHydrated) return;
+  let cancelled = false;
+  saveLocalOrdersToDb(orders)
+    .then(() => getLocalDbStatus())
+    .then((status) => {
+      if (!cancelled) setLocalDbStatus(status);
+    })
+    .catch((err) => console.warn("IndexedDB order save failed:", err));
+  return () => {
+    cancelled = true;
+  };
+}, [orders, localHydrated]);
+
+useEffect(() => {
+  const editedAt = Date.now();
+  lastLocalEditAtRef.current = editedAt;
+  setLastLocalEditAt(editedAt);
   // eslint-disable-next-line react-hooks/exhaustive-deps
 }, [
   menu, extraList, beverageList, workers, paymentMethods, orderTypes, defaultDeliveryFee,
@@ -5547,7 +5948,7 @@ const [syncCostsFromPurchases, setSyncCostsFromPurchases] = useState(() => {
 });
 useEffect(() => {
   if (!purchases?.length || !syncCostsFromPurchases) return;
-  setInventory(current => {
+  setBaseInventory(current => {
     let changed = false;
     const next = current.map(it => {
       const last = getLatestPurchaseForInv(it, purchases, purchaseCategories);
@@ -5648,8 +6049,8 @@ const buildFullStateForCloud = useCallback(
   (overrides = {}, options = {}) =>
     withPersistedAdminSettings(
       {
-        orders: realtimeOrders ? [] : orders,
-        inventory,
+        orders,
+        inventory: baseInventory,
         bulkInventoryItems,
         bulkInventoryHistory,
         nextOrderNo,
@@ -5674,6 +6075,7 @@ const buildFullStateForCloud = useCallback(
       },
       options
     ),
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   [
     withPersistedAdminSettings,
     realtimeOrders,
@@ -5701,7 +6103,7 @@ const buildFullStateForCloud = useCallback(
     reportMonth,
   ]
 );
-const supabaseReady = fbReady;
+const supabaseReady = fbReady && isSupabaseConfigured;
 const stateDocRef = supabaseReady;
 const ordersColRef = supabaseReady;
 const counterDocRef = supabaseReady;
@@ -5709,25 +6111,103 @@ const onlineOrderCollections = useMemo(() => ONLINE_ORDER_COLLECTIONS, []);
 const writeFullStateToCloud = useCallback(
   async (overrides = {}, options = {}) => {
     if (!stateDocRef || !fbUser) throw new Error("Supabase not ready.");
-    const bodyBase = packStateForCloud(buildFullStateForCloud(overrides, options));
-    writeSeqRef.current += 1;
-    const body = {
-      ...bodyBase,
-      writerId: clientIdRef.current,
-      writeSeq: writeSeqRef.current,
-      clientTime: Date.now(),
-    };
-    await savePosState(body);
-    const now = Date.now();
-    setLastLocalEditAt(now);
-    setLastAppliedCloudAt(now);
-    setCloudStatus((s) => ({ ...s, lastSaveAt: new Date(now), error: null }));
-    return body;
+    if (!currentDeviceCanWrite) {
+      throw new Error(
+        `This device is set to "${currentDeviceModeMeta.label}" and cannot write to the system.`
+      );
+    }
+    if (!shouldAttemptOnlineSync()) throw new Error("Offline. Local changes are saved and pending sync.");
+
+    let currentWriteSeq = writeSeqRef.current;
+    let attempt = 0;
+    const maxAttempts = 5;
+    let currentLocalState = buildFullStateForCloud(overrides, options);
+
+    while (attempt < maxAttempts) {
+      attempt++;
+      const bodyBase = packStateForCloud(currentLocalState);
+      const nextWriteSeq = currentWriteSeq + 1;
+      const body = {
+        ...bodyBase,
+        writerId: clientIdRef.current,
+        deviceId: clientIdRef.current,
+        lastModifiedDeviceId: clientIdRef.current,
+        syncStatus: SYNC_STATUS.synced,
+        pendingSync: false,
+        writeSeq: nextWriteSeq,
+        clientTime: Date.now(),
+      };
+
+      const success = await savePosStateOptimistic(body, currentWriteSeq);
+      if (success) {
+        writeSeqRef.current = nextWriteSeq;
+        saveLocalPartial({}, { updatedAt: body.updatedAt || nowIso(), syncedFromCloud: true });
+        const now = Date.now();
+        setLastLocalEditAt(now);
+        setLastAppliedCloudAt(now);
+        setCloudStatus((s) => ({ ...s, lastSaveAt: new Date(now), error: null }));
+        console.log(`OCC Save successful on attempt ${attempt}. Next seq: ${nextWriteSeq}`);
+        
+        // Also call syncWithCloudNow in the background to ensure React state reflects any merges
+        if (attempt > 1) {
+          syncWithCloudNow(true, { force: false }).catch(err => console.warn("Background resync failed:", err));
+        }
+        
+        return body;
+      }
+
+      console.warn(`OCC Conflict detected (attempt ${attempt}/${maxAttempts}). Fetching latest cloud state...`);
+      if (attempt >= maxAttempts) break;
+
+      const latestRaw = await loadCompleteCloudState();
+      if (!latestRaw) throw new Error("OCC Conflict but cloud state is empty.");
+
+      currentWriteSeq = Number(latestRaw.writeSeq || latestRaw.write_seq || 0);
+      writeSeqRef.current = currentWriteSeq;
+      const unpacked = unpackStateFromCloud(latestRaw, currentLocalState.dayMeta);
+
+      // Merge dynamic arrays using stable IDs
+      currentLocalState.expenses = mergeByIdPreferNewest(currentLocalState.expenses, unpacked.expenses, { fallbackPrefix: "expense" });
+      currentLocalState.purchases = mergeByIdPreferNewest(currentLocalState.purchases, unpacked.purchases, { fallbackPrefix: "purchase" });
+      currentLocalState.customers = mergeByIdPreferNewest(currentLocalState.customers, unpacked.customers, { fallbackPrefix: "customer" });
+      currentLocalState.workerSessions = mergeByIdPreferNewest(currentLocalState.workerSessions, unpacked.workerSessions, { fallbackPrefix: "worker_session" });
+      currentLocalState.bankTx = mergeByIdPreferNewest(currentLocalState.bankTx, unpacked.bankTx, { fallbackPrefix: "bank_tx" });
+      currentLocalState.reconHistory = mergeByIdPreferNewest(currentLocalState.reconHistory, unpacked.reconHistory, { fallbackPrefix: "recon" });
+      currentLocalState.historicalOrders = mergeByIdPreferNewest(currentLocalState.historicalOrders, unpacked.historicalOrders, { fallbackPrefix: "h_order" });
+      currentLocalState.historicalExpenses = mergeByIdPreferNewest(currentLocalState.historicalExpenses, unpacked.historicalExpenses, { fallbackPrefix: "h_expense" });
+      currentLocalState.historicalPurchases = mergeByIdPreferNewest(currentLocalState.historicalPurchases, unpacked.historicalPurchases, { fallbackPrefix: "h_purchase" });
+
+      // Merge single-object settings if remote is newer
+      const localMeta = currentLocalState[SECTION_UPDATED_AT_KEY] || {};
+      const remoteMeta = unpacked[SECTION_UPDATED_AT_KEY] || {};
+      
+      if (toMs(remoteMeta[ADMIN_SETTINGS_SECTION]) > toMs(localMeta[ADMIN_SETTINGS_SECTION])) {
+        currentLocalState.menu = unpacked.menu;
+        currentLocalState.extraList = unpacked.extras;
+        currentLocalState.beverageList = unpacked.beverages;
+      }
+      if (toMs(remoteMeta[ADMIN_SETTINGS_SECTION]) > toMs(localMeta[ADMIN_SETTINGS_SECTION])) {
+        currentLocalState.paymentMethods = unpacked.paymentMethods;
+        currentLocalState.orderTypes = unpacked.orderTypes;
+        currentLocalState.workers = unpacked.workers;
+        currentLocalState.adminPins = unpacked.adminPins;
+        currentLocalState.deliveryZones = unpacked.deliveryZones;
+        currentLocalState.equipmentList = unpacked.equipmentList;
+        currentLocalState.utilityBills = unpacked.utilityBills;
+        currentLocalState.laborProfile = unpacked.laborProfile;
+      }
+      if (toMs(remoteMeta[DAY_META_SECTION]) > toMs(localMeta[DAY_META_SECTION])) {
+        currentLocalState.dayMeta = unpacked.dayMeta;
+      }
+    }
+    
+    console.error("Failed to sync to cloud after maximum OCC retry attempts.");
+    throw new Error("Failed to sync to cloud due to high concurrency. Please try again.");
   },
-  [stateDocRef, fbUser, buildFullStateForCloud]
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  [stateDocRef, fbUser, buildFullStateForCloud, currentDeviceCanWrite, currentDeviceModeMeta.label]
 );
 const saveAdminSettings = useCallback(async () => {
-  if (!assertDeviceCanWrite("save admin settings")) return;
   const stamp = nowIso();
   const localState = loadLocal();
   const sectionUpdatedAt = addSectionUpdatedAt(
@@ -5778,81 +6258,179 @@ const saveAdminSettings = useCallback(async () => {
   stateDocRef,
   fbUser,
   writeFullStateToCloud,
-  assertDeviceCanWrite,
 ]);
+
+const saveLocalDataNow = useCallback(async () => {
+  try {
+    const stamp = nowIso();
+    const localState = {
+      ...buildFullStateForCloud({}, { useCurrentAdminDraft: true }),
+      updatedAt: stamp,
+      writerId: clientIdRef.current,
+      deviceId: clientIdRef.current,
+      lastModifiedDeviceId: clientIdRef.current,
+      syncStatus: SYNC_STATUS.pending,
+      pendingSync: true,
+    };
+    const packed = packStateForCloud(localState);
+    const saved = saveLocalState(LS_KEY, packed);
+    if (!saved) throw new Error("Local storage write failed.");
+    await saveLocalOrdersToDb(orders);
+    const status = await getLocalDbStatus();
+    setLocalDbStatus(status);
+    setLastLocalEditAt(Date.now());
+    alert("Saved local data.");
+    return true;
+  } catch (err) {
+    const message = String(err?.message || err);
+    console.warn("Save local data failed:", err);
+    alert("Save local data failed: " + message);
+    return false;
+  }
+}, [buildFullStateForCloud, orders]);
+
 const applyRemoteState = useCallback(
   (rawData, options = {}) => {
     if (!rawData) return null;
     const force = Boolean(options.force);
     const unpacked = unpackStateFromCloud(rawData, dayMeta);
     const localState = loadLocal();
+    const canUseRemoteKey = (key, options = {}) =>
+      force || shouldApplyRemoteKey(localState, rawData, key, options);
+    const canUseRemoteSection = (section, options = {}) =>
+      force || shouldApplyRemoteSection(localState, rawData, section, options);
 
-    if (!realtimeOrders && unpacked.orders) setOrders(unpacked.orders);
-    if (unpacked.inventory) setInventory(unpacked.inventory);
-    applyBulkInventoryFromCloud(unpacked.bulkInventoryItems, unpacked.bulkInventoryHistory);
-    if (unpacked.nextOrderNo != null) setNextOrderNo(unpacked.nextOrderNo);
-    if (unpacked.customers) setCustomers(dedupeCustomers(unpacked.customers));
-    if (unpacked.inventoryLocked != null) setInventoryLocked(unpacked.inventoryLocked);
-    if (unpacked.inventorySnapshot) setInventorySnapshot(unpacked.inventorySnapshot);
-    if (unpacked.inventoryLockedAt != null) setInventoryLockedAt(unpacked.inventoryLockedAt);
-    if (unpacked.expenses) setExpenses(unpacked.expenses);
-    if (unpacked.bankTx) setBankTx(unpacked.bankTx);
-    if (unpacked.onlineOrdersRaw) setOnlineOrdersRaw(unpacked.onlineOrdersRaw);
-    if (unpacked.onlineOrderStatus) setOnlineOrderStatus(unpacked.onlineOrderStatus);
-    if (unpacked.lastSeenOnlineOrderTs != null)
+    if (unpacked.orders && canUseRemoteKey("orders")) {
+      setOrders((prev) => {
+        const pending = prev.filter(o => o.syncStatus === SYNC_STATUS.pending);
+        return mergeByIdPreferNewest(force ? pending : prev, unpacked.orders, { fallbackPrefix: "order" }).map(enrichOrderWithChannel);
+      });
+    }
+    if (unpacked.inventory && canUseRemoteKey("inventory")) {
+      setBaseInventory(unpacked.inventory);
+    }
+    if (unpacked.inventoryLedger && canUseRemoteKey("inventoryLedger")) {
+      setInventoryLedger((prev) => {
+        const pending = prev.filter(il => il.syncStatus === SYNC_STATUS.pending);
+        return mergeByIdPreferNewest(force ? pending : prev, unpacked.inventoryLedger, { fallbackPrefix: "inv_ledger" });
+      });
+    }
+    applyBulkInventoryFromCloud(
+      canUseRemoteKey("bulkInventoryItems")
+        ? unpacked.bulkInventoryItems
+        : undefined,
+      canUseRemoteKey("bulkInventoryHistory")
+        ? unpacked.bulkInventoryHistory
+        : undefined
+    );
+    if (unpacked.nextOrderNo != null && canUseRemoteKey("nextOrderNo")) {
+      setNextOrderNo(unpacked.nextOrderNo);
+    }
+    if (unpacked.customers && canUseRemoteKey("customers")) {
+      setCustomers((prev) => {
+        const pending = prev.filter(c => c.syncStatus === SYNC_STATUS.pending);
+        const merged = mergeByIdPreferNewest(force ? pending : prev, unpacked.customers, { fallbackPrefix: "customer" });
+        return dedupeCustomers(merged);
+      });
+    }
+    if (unpacked.inventoryLocked != null && canUseRemoteKey("inventoryLocked")) {
+      setInventoryLocked(unpacked.inventoryLocked);
+    }
+    if (unpacked.inventorySnapshot && canUseRemoteKey("inventorySnapshot")) {
+      setInventorySnapshot(unpacked.inventorySnapshot);
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(unpacked, "inventoryLockedAt") &&
+      canUseRemoteKey("inventoryLockedAt")
+    ) {
+      setInventoryLockedAt(unpacked.inventoryLockedAt);
+    }
+    if (unpacked.expenses && canUseRemoteKey("expenses")) {
+      setExpenses((prev) => {
+        const pending = prev.filter(e => e.syncStatus === SYNC_STATUS.pending);
+        return mergeByIdPreferNewest(force ? pending : prev, unpacked.expenses, { fallbackPrefix: "expense" });
+      });
+    }
+    if (unpacked.bankTx && canUseRemoteKey("bankTx")) {
+      setBankTx((prev) => {
+        const pending = prev.filter(t => t.syncStatus === SYNC_STATUS.pending);
+        return mergeByIdPreferNewest(force ? pending : prev, unpacked.bankTx, { fallbackPrefix: "bank_tx" });
+      });
+    }
+    if (unpacked.onlineOrdersRaw && canUseRemoteKey("onlineOrdersRaw")) {
+      setOnlineOrdersRaw(unpacked.onlineOrdersRaw);
+    }
+    if (unpacked.onlineOrderStatus && canUseRemoteKey("onlineOrderStatus")) {
+      setOnlineOrderStatus(unpacked.onlineOrderStatus);
+    }
+    if (
+      unpacked.lastSeenOnlineOrderTs != null &&
+      canUseRemoteKey("lastSeenOnlineOrderTs")
+    )
       setLastSeenOnlineOrderTs(unpacked.lastSeenOnlineOrderTs);
-    if (unpacked.purchases) setPurchases(unpacked.purchases);
-    if (unpacked.purchaseCategories)
+    if (unpacked.purchases && canUseRemoteKey("purchases")) {
+      setPurchases((prev) => {
+        const pending = prev.filter(p => p.syncStatus === SYNC_STATUS.pending);
+        return mergeByIdPreferNewest(force ? pending : prev, unpacked.purchases, { fallbackPrefix: "purchase" });
+      });
+    }
+    if (unpacked.purchaseCategories && canUseRemoteKey("purchaseCategories"))
       setPurchaseCategories(normalizePurchaseCategories(unpacked.purchaseCategories));
 
     if (
       unpacked.dayMeta &&
-      (force || shouldApplyRemoteSection(localState, rawData, DAY_META_SECTION))
+      (force || canUseRemoteSection(DAY_META_SECTION))
     ) {
       setDayMeta((prev) => {
         if (!force && prev?.endedAt && !unpacked.dayMeta?.endedAt) return prev;
+        if (force && prev?.syncStatus === SYNC_STATUS.pending) {
+          const localMs = recordUpdatedMs(prev);
+          const remoteMs = recordUpdatedMs(unpacked.dayMeta);
+          if (localMs > remoteMs) return prev;
+        }
         return unpacked.dayMeta;
       });
     }
 
-    if (unpacked.workerSessions) {
-      setWorkerSessions((prev) =>
-        mergeByIdPreferNewest(prev, unpacked.workerSessions, {
-          fallbackPrefix: "worker_session",
-        })
-      );
+    if (
+      unpacked.workerSessions &&
+      canUseRemoteSection(WORKER_SESSIONS_SECTION)
+    ) {
+      setWorkerSessions((prev) => {
+        const pending = prev.filter(s => s.syncStatus === SYNC_STATUS.pending);
+        return mergeByIdPreferNewest(force ? pending : prev, unpacked.workerSessions, { fallbackPrefix: "worker_session" });
+      });
     }
-    if (unpacked.reconHistory) {
-      setReconHistory((prev) =>
-        mergeByIdPreferNewest(prev, unpacked.reconHistory, {
-          fallbackPrefix: "reconciliation",
-        })
-      );
+    if (
+      unpacked.reconHistory &&
+      canUseRemoteSection(RECONCILIATION_SECTION)
+    ) {
+      setReconHistory((prev) => {
+        const pending = prev.filter(r => r.syncStatus === SYNC_STATUS.pending);
+        return mergeByIdPreferNewest(force ? pending : prev, unpacked.reconHistory, { fallbackPrefix: "reconciliation" });
+      });
     }
-    if (unpacked.historicalOrders) {
-      setHistoricalOrders((prev) =>
-        mergeByIdPreferNewest(prev, unpacked.historicalOrders, {
-          fallbackPrefix: "historical_order",
-        })
-      );
+    if (unpacked.historicalOrders && canUseRemoteSection(HISTORY_SECTION)) {
+      setHistoricalOrders((prev) => {
+        const pending = prev.filter(o => o.syncStatus === SYNC_STATUS.pending);
+        return mergeByIdPreferNewest(force ? pending : prev, unpacked.historicalOrders, { fallbackPrefix: "historical_order" });
+      });
     }
-    if (unpacked.historicalExpenses) {
-      setHistoricalExpenses((prev) =>
-        mergeByIdPreferNewest(prev, unpacked.historicalExpenses, {
-          fallbackPrefix: "historical_expense",
-        })
-      );
+    if (unpacked.historicalExpenses && canUseRemoteSection(HISTORY_SECTION)) {
+      setHistoricalExpenses((prev) => {
+        const pending = prev.filter(e => e.syncStatus === SYNC_STATUS.pending);
+        return mergeByIdPreferNewest(force ? pending : prev, unpacked.historicalExpenses, { fallbackPrefix: "historical_expense" });
+      });
     }
-    if (unpacked.historicalPurchases) {
-      setHistoricalPurchases((prev) =>
-        mergeByIdPreferNewest(prev, unpacked.historicalPurchases, {
-          fallbackPrefix: "historical_purchase",
-        })
-      );
+    if (unpacked.historicalPurchases && canUseRemoteSection(HISTORY_SECTION)) {
+      setHistoricalPurchases((prev) => {
+        const pending = prev.filter(p => p.syncStatus === SYNC_STATUS.pending);
+        return mergeByIdPreferNewest(force ? pending : prev, unpacked.historicalPurchases, { fallbackPrefix: "historical_purchase" });
+      });
     }
 
     const canApplyReportFilters =
-      force || shouldApplyRemoteSection(localState, rawData, REPORT_FILTERS_SECTION);
+      force || canUseRemoteSection(REPORT_FILTERS_SECTION);
     if (canApplyReportFilters) {
       if (typeof unpacked.reportFilter === "string") setReportFilter(unpacked.reportFilter);
       if (typeof unpacked.reportDay === "string") setReportDay(unpacked.reportDay);
@@ -5862,7 +6440,7 @@ const applyRemoteState = useCallback(
     const canApplyAdminSettings =
       force ||
       (!adminHasUnsavedChanges &&
-        shouldApplyRemoteSection(localState, rawData, ADMIN_SETTINGS_SECTION));
+        canUseRemoteSection(ADMIN_SETTINGS_SECTION));
     if (canApplyAdminSettings) {
       if (unpacked.menu) setMenu(unpacked.menu);
       if (unpacked.extraList) setExtraList(unpacked.extraList);
@@ -5899,7 +6477,7 @@ const applyRemoteState = useCallback(
           [SECTION_UPDATED_AT_KEY]: sectionUpdatedAt,
           adminSettingsUpdatedAt: remoteStamp,
         },
-        { sections: [ADMIN_SETTINGS_SECTION], updatedAt: remoteStamp }
+        { sections: [ADMIN_SETTINGS_SECTION], updatedAt: remoteStamp, syncedFromCloud: true }
       );
       setAdminSavedSnapshot(remoteAdminSnapshot);
       setAdminSaveStatus({ kind: "idle", message: "" });
@@ -5907,6 +6485,7 @@ const applyRemoteState = useCallback(
 
     return unpacked;
   },
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   [
     dayMeta,
     realtimeOrders,
@@ -5915,6 +6494,45 @@ const applyRemoteState = useCallback(
     buildAdminSettingsSnapshot,
   ]
 );
+
+useEffect(() => {
+  applyRemoteStateRef.current = applyRemoteState;
+}, [applyRemoteState]);
+
+const loadLocalDataNow = useCallback(async () => {
+  try {
+    const localState = loadLocal();
+    const localOrders = await loadLocalOrdersFromDb().catch((err) => {
+      console.warn("IndexedDB local order load failed:", err);
+      return [];
+    });
+    const hasLocalState =
+      localState &&
+      Object.keys(localState).some(
+        (key) => !["updatedAt", "syncStatus", "pendingSync"].includes(key)
+      );
+    if (!hasLocalState && !localOrders.length) {
+      alert("No saved local data found.");
+      return false;
+    }
+
+    const snapshot = {
+      ...(localState || {}),
+      orders: dedupeOrders([...(Array.isArray(localState?.orders) ? localState.orders : []), ...localOrders]),
+    };
+    applyRemoteState(snapshot, { force: true });
+    const status = await getLocalDbStatus();
+    setLocalDbStatus(status);
+    setCloudStatus((s) => ({ ...s, lastLoadAt: new Date(), error: null }));
+    alert(`Loaded local data. Orders loaded: ${snapshot.orders.length}`);
+    return true;
+  } catch (err) {
+    const message = String(err?.message || err);
+    console.warn("Load local data failed:", err);
+    alert("Load local data failed: " + message);
+    return false;
+  }
+}, [applyRemoteState]);
 
   useEffect(() => {
     if (!counterDocRef || !fbUser) return;
@@ -5936,13 +6554,23 @@ const applyRemoteState = useCallback(
     };
   }, [counterDocRef, fbUser]);
   useEffect(() => {
+    if (fbReady && !stateDocRef && !hydrated) {
+      setHydrated(true);
+    }
+  }, [fbReady, stateDocRef, hydrated]);
+  useEffect(() => {
     if (!stateDocRef || !fbUser || hydrated) return;
     (async () => {
       try {
-        const data = await loadPosState();
+        const data = await loadCompleteCloudState();
         if (data) {
           applyRemoteState(data);
-          setCloudStatus((s) => ({ ...s, lastLoadAt: new Date(), error: null }));
+          const warnings = data.__cloudLoadMeta?.warnings || [];
+          setCloudStatus((s) => ({
+            ...s,
+            lastLoadAt: new Date(),
+            error: warnings.length ? warnings.join(" | ") : null,
+          }));
         }
       } catch (e) {
         console.warn("Initial cloud load failed:", e);
@@ -5963,11 +6591,12 @@ const applyRemoteState = useCallback(
         writeSeqRef.current = Math.max(writeSeqRef.current, seq);
       }
       const ts = data.updatedAt ? new Date(data.updatedAt).getTime() : 0;
-      if (ts && ts <= (lastAppliedCloudAt || 0)) return;
-if (ts && lastLocalEditAt && ts < lastLocalEditAt) return;
-      applyRemoteState(data);
+      if (ts && ts <= (lastAppliedCloudAtRef.current || 0)) return;
+if (ts && lastLocalEditAtRef.current && ts < lastLocalEditAtRef.current) return;
+      applyRemoteStateRef.current?.(data);
 
       const appliedAt = ts || Date.now();
+      lastAppliedCloudAtRef.current = appliedAt;
       setLastAppliedCloudAt(appliedAt);
       setCloudStatus((s) => ({ ...s, lastLoadAt: new Date(), error: null }));
 
@@ -5977,172 +6606,246 @@ if (ts && lastLocalEditAt && ts < lastLocalEditAt) return;
   });
 
   return () => unsub();
-}, [cloudEnabled, stateDocRef, fbUser, lastAppliedCloudAt, lastLocalEditAt, applyRemoteState]);
-  // Manual pull
-  const loadFromCloud = async () => {
-    if (!stateDocRef || !fbUser) return alert("Supabase not ready.");
-    try {
-      const data = await loadPosState();
-      if (!data) return alert("No cloud state yet to load.");
-      applyRemoteState(data, { force: true });
-      setCloudStatus((s) => ({ ...s, lastLoadAt: new Date(), error: null }));
-      alert("Loaded from cloud ✔");
-    } catch (e) {
-      setCloudStatus((s) => ({ ...s, error: String(e) }));
-      alert("Cloud load failed: " + e);
-    }
- };
- const saveToCloudNow = async () => {
-  if (!stateDocRef || !fbUser) return alert("Supabase not ready.");
-  if (!assertDeviceCanWrite("sync to cloud")) return;
-  try {
-    await writeFullStateToCloud();
-    /*
-    const bodyBase = packStateForCloud({
-      menu,
-      extraList,
-      beverageList,
-      orders: realtimeOrders ? [] : orders,
-      inventory,
-      bulkInventoryItems,
-      bulkInventoryHistory,
-      nextOrderNo,
-       reconHistory,
-        workerProfiles,
- workerSessions,
-      dark,
-      workers,
-      paymentMethods,
-      inventoryLocked,
-      inventorySnapshot,
-      inventoryLockedAt,
-      adminPins,
-      orderTypes,
-      defaultDeliveryFee,
-      expenses,
-      purchases,
-      purchaseCategories,
-     customers,
-      deliveryZones,
-      dayMeta,
-      utilityBills,
-      laborProfile,
-      equipmentList,
-      bankTx,
-      realtimeOrders,
-      onlineOrdersRaw,
-      onlineOrderStatus,
-      lastSeenOnlineOrderTs,
-      historicalOrders,
-      historicalExpenses,
-      historicalPurchases,
-      reportFilter,
-      reportDay,
-      reportMonth,
-    });
-    writeSeqRef.current += 1;
-    const body = {
-      ...bodyBase,
-      writerId: clientIdRef.current,
-      writeSeq: writeSeqRef.current,
-      clientTime: Date.now(),
-    };
-    await savePosState(body);
-    const now = Date.now();
-   setLastLocalEditAt(now);
-    setLastAppliedCloudAt(now);
-    setCloudStatus((s) => ({ ...s, lastSaveAt: new Date(), error: null }));
-    */
+}, [cloudEnabled, stateDocRef, fbUser]);
+  const syncWithCloudNow = useCallback(
+    async (notify = false, options = {}) => {
+      const forceRemoteLoad = Boolean(options?.force);
+      if (!stateDocRef || !fbUser) {
+        const message = "Supabase is not configured. Local offline mode is active.";
+        setCloudStatus((s) => ({ ...s, error: message }));
+        if (notify) alert(message);
+        return false;
+      }
+      if (!currentDeviceCanListen) {
+        const message = `This device is set to "${currentDeviceModeMeta.label}" and cannot listen to cloud data.`;
+        setCloudStatus((s) => ({ ...s, error: message }));
+        if (notify) alert(message);
+        return false;
+      }
 
-    alert("Synced to cloud ✔");
-  } catch (e) {
-    alert("Sync failed: " + e);
-  }
-};
+      try {
+        const localState = loadLocal();
+        const pendingOrders = (localState.orders || []).filter(o => o.syncStatus === SYNC_STATUS.pending);
+        if (pendingOrders.length > 0) {
+          const updatedLocalOrders = [...(localState.orders || [])];
+          let changed = false;
+          for (let i = 0; i < updatedLocalOrders.length; i++) {
+            const o = updatedLocalOrders[i];
+            if (o.syncStatus === SYNC_STATUS.pending) {
+              try {
+                const existing = await findExistingCloudOrderForSync(o);
+                const dbOrder = normalizeOrderForSupabase(o);
+                if (existing) {
+                  dbOrder.id = existing.id;
+                  await supabase.from("orders").update(dbOrder).eq("id", existing.id);
+                  updatedLocalOrders[i] = { ...o, cloudId: existing.id, syncStatus: SYNC_STATUS.synced };
+                  await markLocalOrderSynced(o, existing.id);
+                  changed = true;
+                } else {
+                  const inserted = await addOrder({ ...o, syncStatus: SYNC_STATUS.synced });
+                  if (inserted) {
+                    updatedLocalOrders[i] = { ...o, cloudId: inserted.id, syncStatus: SYNC_STATUS.synced };
+                    await markLocalOrderSynced(o, inserted.id);
+                    changed = true;
+                  }
+                }
+              } catch(e) {
+                console.warn(`Sync failed for order #${o.orderNo}:`, e);
+              }
+            }
+          }
+          if (changed) {
+            saveLocalPartial({ orders: updatedLocalOrders });
+          }
+        }
+
+        const remoteState = await loadCompleteCloudState();
+        if (!remoteState) {
+          const message = "No cloud data yet to load.";
+          setCloudStatus((s) => ({ ...s, error: message }));
+          if (notify) alert(message);
+          return false;
+        }
+
+        applyRemoteState(remoteState, { force: forceRemoteLoad });
+        const remoteUpdatedAt = remoteState.updatedAt ? new Date(remoteState.updatedAt).getTime() : Date.now();
+        const appliedAt = Number.isFinite(remoteUpdatedAt) ? remoteUpdatedAt : Date.now();
+        const warnings = remoteState.__cloudLoadMeta?.warnings || [];
+        const totalOrdersLoaded = Number(remoteState.__cloudLoadMeta?.totalOrdersLoaded || 0);
+        setLastAppliedCloudAt(appliedAt);
+        setCloudStatus((s) => ({
+          ...s,
+          lastLoadAt: new Date(),
+          error: warnings.length ? warnings.join(" | ") : null,
+        }));
+        if (notify) {
+          alert(
+            `Loaded from cloud ✔\nOrders loaded: ${totalOrdersLoaded}` +
+              (warnings.length ? `\nWarnings: ${warnings.join(" | ")}` : "")
+          );
+        }
+        return true;
+      } catch (e) {
+        const message = String(e?.message || e);
+        setCloudStatus((s) => ({ ...s, error: message }));
+        if (notify) alert("Cloud load failed: " + message);
+        return false;
+      }
+    },
+    [stateDocRef, fbUser, applyRemoteState, currentDeviceCanListen, currentDeviceModeMeta.label]
+  );
+
+  // Manual pull: read-only. This loads the latest POS state from Supabase and never writes back.
+  const loadFromCloud = async () => syncWithCloudNow(true, { force: true });
+
+  // Manual push: this is the only cloud button here that writes the full POS state to Supabase.
+  const saveToCloudNow = async () => {
+    if (!stateDocRef || !fbUser) return alert("Supabase not ready.");
+    if (!assertDeviceCanWrite("sync to cloud")) return false;
+    try {
+      const activeStart = dayMeta?.startedAt && !dayMeta?.endedAt ? new Date(dayMeta.startedAt) : null;
+      const activeDayId =
+        currentDayId ||
+        (activeStart && !Number.isNaN(+activeStart) ? `day_${activeStart.getTime()}` : "");
+      const cloudOrders = activeStart && !Number.isNaN(+activeStart)
+        ? await loadOrders(activeStart, null, activeDayId).catch((err) => {
+        console.warn("Pre-sync cloud order safety check failed:", err);
+        return [];
+      })
+        : [];
+      if ((!orders || orders.length === 0) && cloudOrders.length > 0) {
+        const message =
+          `Sync blocked for safety. This local app has 0 orders, but Supabase has ${cloudOrders.length} active order(s). ` +
+          "Press Refresh from Cloud first. This prevents an empty app from overwriting cloud state.";
+        setCloudStatus((s) => ({ ...s, error: message }));
+        alert(message);
+        return false;
+      }
+      await writeFullStateToCloud();
+      alert("Synced to cloud ✔");
+      return true;
+    } catch (e) {
+      const message = String(e?.message || e);
+      setCloudStatus((s) => ({ ...s, error: message }));
+      alert("Sync to cloud failed: " + message);
+      return false;
+    }
+  };
+  const syncPendingOrdersToCloud = useCallback(async () => {
+    if (!cloudEnabled || !ordersColRef || !fbUser || !shouldAttemptOnlineSync()) return false;
+    if (!currentDeviceCanWrite) return false;
+    const pending = (ordersRef.current || []).filter((order) => order?.syncStatus === SYNC_STATUS.pending);
+    if (!pending.length || pendingOrderSyncRef.current) return false;
+
+    pendingOrderSyncRef.current = true;
+    let syncedCount = 0;
+    const errors = [];
+    try {
+      for (const order of pending) {
+        try {
+          const payload = {
+            ...order,
+            lastModifiedDeviceId: order.lastModifiedDeviceId || DEVICE_ID,
+            syncStatus: SYNC_STATUS.synced,
+          };
+          let cloudId = order.cloudId;
+          if (cloudId) {
+            await updateOrderById(cloudId, payload);
+          } else {
+            const ref = await addOrder(payload);
+            cloudId = ref?.id || cloudId;
+          }
+          const orderKey = orderDedupeKey(order);
+          setOrders((prev) =>
+            prev.map((row) => {
+              const rowKey = orderDedupeKey(row);
+              return rowKey === orderKey
+                ? { ...row, cloudId, syncStatus: SYNC_STATUS.synced, lastModifiedDeviceId: DEVICE_ID }
+                : row;
+            })
+          );
+          await markLocalOrderSynced(order, cloudId);
+          syncedCount += 1;
+        } catch (err) {
+          errors.push(String(err?.message || err));
+        }
+      }
+      setCloudStatus((status) => ({
+        ...status,
+        lastSaveAt: syncedCount ? new Date() : status.lastSaveAt,
+        error: errors.length ? `Pending order sync failed: ${errors.join(" | ")}` : status.error,
+      }));
+      getLocalDbStatus()
+        .then((status) => {
+          setLocalDbStatus(status);
+          return upsertDeviceHeartbeat({
+            pendingCount: status.pendingCount,
+            lastSyncAt: syncedCount ? new Date() : null,
+          });
+        })
+        .catch((err) => console.warn("Device heartbeat failed:", err));
+      return syncedCount > 0;
+    } finally {
+      pendingOrderSyncRef.current = false;
+    }
+  }, [cloudEnabled, ordersColRef, fbUser, currentDeviceCanWrite]);
+useEffect(() => {
+  if (!cloudEnabled || !stateDocRef || !fbUser || !hydrated) return undefined;
+  if (startupSyncRanRef.current) return undefined;
+  startupSyncRanRef.current = true;
+
+  // Startup cloud sync is intentionally read-only.
+  // Load the newest data from the cloud on startup, preserving local pending changes.
+  syncWithCloudNow(false, { force: true }).then(() => syncPendingOrdersToCloud()).catch(err => {
+    console.warn("Startup cloud sync failed", err);
+  });
+  return undefined;
+}, [cloudEnabled, stateDocRef, fbUser, hydrated, syncWithCloudNow, syncPendingOrdersToCloud]);
 useEffect(() => {
   if (!cloudEnabled || !stateDocRef || !fbUser || !hydrated) return undefined;
 
-  let cancelled = false;
+  const retrySync = () => {
+    syncPendingOrdersToCloud()
+      .then(() => syncWithCloudNow(false))
+      .catch((err) => console.warn("Pending order sync failed", err));
+  };
 
-  (async () => {
-    try {
-      // Startup cloud sync is intentionally read-only.
-      // Do not write full POS state just because a device opened the app.
-      if (cancelled) return;
-      /*
- const bodyBase = packStateForCloud({
-        menu,
-        extraList,
-        beverageList,
-        orders: realtimeOrders ? [] : orders,
-        inventory,
-        bulkInventoryItems,
-        bulkInventoryHistory,
-        nextOrderNo,
-        dark,
-        workers,
-        paymentMethods,
-        inventoryLocked,
-        inventorySnapshot,
-        inventoryLockedAt,
-        adminPins,
-        orderTypes,
-        defaultDeliveryFee,
-        expenses,
-        purchases,
-        purchaseCategories,
-        customers,
-        deliveryZones,
-        utilityBills,
-        laborProfile,
-        equipmentList,
-          workerProfiles,
-         workerSessions,
-        dayMeta,
-        bankTx,
-         realtimeOrders,
-         reconHistory,
-        onlineOrdersRaw,
-        onlineOrderStatus,
-        lastSeenOnlineOrderTs,
-        historicalOrders,
-        historicalExpenses,
-        historicalPurchases,
-        reportFilter,
-        reportDay,
-        reportMonth,
-      });
-      writeSeqRef.current += 1;
-      const body = {
-        ...bodyBase,
-        writerId: clientIdRef.current,
-        writeSeq: writeSeqRef.current,
-        clientTime: Date.now(),
-      };
-
-      await savePosState(body);
-      if (cancelled) return;
-      const now = Date.now();
-      setLastAppliedCloudAt(now);
-      setCloudStatus((s) => ({ ...s, lastSaveAt: new Date(), error: null }));
-      */
-    } catch (e) {
-      if (!cancelled) {
-        setCloudStatus((s) => ({ ...s, error: String(e) }));
-      }
-    }
-  })();
+  window.addEventListener("online", retrySync);
+  const intervalId = window.setInterval(retrySync, 120000);
 
   return () => {
-    cancelled = true;
+    window.removeEventListener("online", retrySync);
+    window.clearInterval(intervalId);
   };
-}, [
-  cloudEnabled,
-  stateDocRef,
-  fbUser,
-  hydrated,
-  writeFullStateToCloud,
-]);
+}, [cloudEnabled, stateDocRef, fbUser, hydrated, syncWithCloudNow, syncPendingOrdersToCloud]);
+useEffect(() => {
+  if (!cloudEnabled || !stateDocRef || !fbUser || !hydrated) return undefined;
+  let cancelled = false;
+  const sendHeartbeat = () => {
+    getLocalDbStatus()
+      .then((status) => {
+        if (!cancelled) setLocalDbStatus(status);
+        return refreshDevices();
+      })
+      .catch((err) => console.warn("Device heartbeat failed:", err));
+  };
+  sendHeartbeat();
+  const intervalId = window.setInterval(sendHeartbeat, 60000);
+  const unsubscribe = subscribeToDevices(() => {
+    if (!cancelled) {
+      loadDevices()
+        .then((devices) => {
+          if (!cancelled) setSyncDevices(devices);
+        })
+        .catch((err) => console.warn("Device registry reload failed:", err));
+    }
+  });
+  return () => {
+    cancelled = true;
+    window.clearInterval(intervalId);
+    unsubscribe();
+  };
+}, [cloudEnabled, stateDocRef, fbUser, hydrated, refreshDevices]);
   const startedAtMs = dayMeta?.startedAt
     ? new Date(dayMeta.startedAt).getTime()
     : null;
@@ -6154,41 +6857,39 @@ useEffect(() => {
   useEffect(() => {
     if (!realtimeOrders || !ordersColRef || !fbUser) return;
     if (!currentDeviceCanListen) {
-      setOrders([]);
+      setOrders((prev) => prev.filter((order) => order?.syncStatus === SYNC_STATUS.pending));
       return;
     }
-    if (!startedAtMs || endedAtMs) {
-      setOrders([]);
-      return;
-    }
-    if (activeShiftIsStale) {
-      setOrders([]);
-      setCloudStatus((s) => ({
-        ...s,
-        error: `Active shift is older than ${Math.floor(
-          MAX_ACTIVE_SHIFT_MS / 3600000
-        )} hours. End the stale shift or start a fresh one before loading live orders.`,
-      }));
+    if (!startedAtMs || endedAtMs || activeShiftIsStale) {
+      setOrders((prev) => prev.filter((order) => order?.syncStatus === SYNC_STATUS.pending));
       return;
     }
     let active = true;
+    let refreshTimer = null;
     const refreshOrders = async () => {
       try {
-        const arr = await loadOrders(
-          new Date(startedAtMs),
-          endedAtMs ? new Date(endedAtMs) : null,
-          currentDayId
-        );
-        if (active) setOrders(dedupeOrders(arr).map(enrichOrderWithChannel));
+        const arr = await loadOrders(new Date(startedAtMs), null, currentDayId);
+        if (active) {
+          setOrders(prev => {
+            const pending = prev.filter(o => o.syncStatus === SYNC_STATUS.pending);
+            const merged = mergeByIdPreferNewest(pending, arr, { fallbackPrefix: "order" });
+            return dedupeOrders(merged).map(enrichOrderWithChannel);
+          });
+        }
       } catch (err) {
         console.warn("Realtime orders load failed:", err);
         setCloudStatus((s) => ({ ...s, error: String(err) }));
       }
     };
+    const scheduleRefreshOrders = () => {
+      if (refreshTimer) window.clearTimeout(refreshTimer);
+      refreshTimer = window.setTimeout(refreshOrders, 350);
+    };
     refreshOrders();
-    const unsub = subscribeToOrders(refreshOrders);
+    const unsub = subscribeToOrders(scheduleRefreshOrders);
    return () => {
       active = false;
+      if (refreshTimer) window.clearTimeout(refreshTimer);
       unsub();
     };
   }, [
@@ -6198,8 +6899,8 @@ useEffect(() => {
     startedAtMs,
     endedAtMs,
     currentDayId,
-    currentDeviceCanListen,
     activeShiftIsStale,
+    currentDeviceCanListen,
   ]);
 const recomputeOnlineOrders = useCallback(() => {
     const sources = onlineOrderSourcesRef.current || {};
@@ -7085,6 +7786,7 @@ const addWorkerProfile = () => {
   setNewWName(""); setNewWPin(""); setNewWRate("");
 };
 const startDayIfNeeded = (starterName) => {
+  if (!assertDeviceCanWrite("start a shift")) return "";
   if (dayMeta.startedAt && !dayMeta.endedAt) return currentDayId;
   const startTime = new Date();
   const dayId = `day_${startTime.getTime()}`;
@@ -7203,10 +7905,10 @@ const closeOpenSessionsAt = useCallback(
   },
   [setLastLocalEditAt]
 );
-const resetWorkerLog = () => {
-  const okAdmin = !!promptAdminAndPin();
+const resetWorkerLog = async () => {
+  const okAdmin = !!(await promptAdminAndPin());
   if (!okAdmin) return;
-  const phrase = window.prompt(
+  const phrase = await promptText(
     "Type RESET WORKER LOG to delete all worker sessions.",
     ""
   );
@@ -7307,8 +8009,8 @@ const workerMonthlyTotalPay = useMemo(
   () => workerMonthlyStats.reduce((s, r) => s + Number(r.pay || 0), 0),
   [workerMonthlyStats]
 );
-  const promptAdminAndPin = () => {
-    const adminStr = window.prompt("Enter Admin number (1 to 6):", "1");
+  const promptAdminAndPin = async () => {
+    const adminStr = await promptText("Enter Admin number (1 to 6):", "1");
     if (!adminStr) return null;
     const n = Number(adminStr);
     if (![1, 2, 3, 4, 5, 6].includes(n)) {
@@ -7317,7 +8019,7 @@ const workerMonthlyTotalPay = useMemo(
     }
 
 
-    const entered = window.prompt(`Enter PIN for Admin ${n}:`, "");
+    const entered = await promptText(`Enter PIN for Admin ${n}:`, "");
     if (entered == null) return null;
 
     const expected = norm(adminPins[n]);
@@ -7444,18 +8146,18 @@ const workerMonthlyTotalPay = useMemo(
     });
     setBulkRefillQty("");
   };
-  const handleBulkRemoveItem = (itemId) => {
+  const handleBulkRemoveItem = async (itemId) => {
     const target = (bulkInventoryItems || []).find((it) => it.id === itemId);
     if (!target) return;
-    const adminNum = promptAdminAndPin();
+    const adminNum = await promptAdminAndPin();
     if (!adminNum) return;
     if (!window.confirm(`Admin ${adminNum}: Remove ${target.name}?`)) return;
     setBulkInventoryItems((rows) => rows.filter((it) => it.id !== itemId));
     setBulkInventoryHistory((rows) => rows.filter((row) => row.itemId !== itemId));
     if (bulkRefillItemId === itemId) setBulkRefillItemId("");
   };
-  const handleBulkResetAll = () => {
-    const adminNum = promptAdminAndPin();
+  const handleBulkResetAll = async () => {
+    const adminNum = await promptAdminAndPin();
     if (!adminNum) return;
     if (!window.confirm(`Admin ${adminNum}: Reset all Bulk Inventory data?`)) return;
     setBulkInventoryItems([]);
@@ -7464,8 +8166,8 @@ const workerMonthlyTotalPay = useMemo(
     setBulkHistoryItemId("all");
   };
 
-  const resetAllCustomerContacts = () => {
-    const adminNum = promptAdminAndPin();
+  const resetAllCustomerContacts = async () => {
+    const adminNum = await promptAdminAndPin();
     if (!adminNum) return;
     if (
       !window.confirm(
@@ -7499,9 +8201,9 @@ const workerMonthlyTotalPay = useMemo(
     setInventoryLockedAt(new Date());
   };
 
-  const unlockInventoryWithPin = () => {
+  const unlockInventoryWithPin = async () => {
     if (!inventoryLocked) return alert("Inventory is already unlocked.");
-    const adminNum = promptAdminAndPin();
+    const adminNum = await promptAdminAndPin();
     if (!adminNum) return;
     if (!window.confirm(`Admin ${adminNum}: Unlock inventory for editing? Snapshot will be kept.`))
       return;
@@ -7511,10 +8213,10 @@ const workerMonthlyTotalPay = useMemo(
 
 
 const endDay = async () => {
-    if (!dayMeta.startedAt || dayMeta.endedAt) return alert("Start an active shift first.");
     if (!assertDeviceCanWrite("end the day")) return;
+    if (!dayMeta.startedAt || dayMeta.endedAt) return alert("Start an active shift first.");
 
-    const who = window.prompt("Enter your name to END THE DAY:", "");
+    const who = await promptText("Enter your name to END THE DAY:", "");
     const endBy = norm(who);
     if (!endBy) return alert("Name is required.");
 
@@ -7537,7 +8239,16 @@ const endDay = async () => {
       return;
     }
 
-    const savedReconciliation = latestReconciliationForCurrentDay;
+    const metaReconciledAt = dayMeta.reconciledAt ? new Date(dayMeta.reconciledAt) : null;
+    const savedReconciliation =
+      latestReconciliationForCurrentDay ||
+      (metaReconciledAt && !Number.isNaN(+metaReconciledAt)
+        ? {
+            id: dayMeta.reconciliationId || `rec_${currentDayId}`,
+            savedAt: metaReconciledAt,
+            reconciledAt: metaReconciledAt,
+          }
+        : null);
     const reconciliationSavedAt = savedReconciliation
       ? new Date(
           savedReconciliation.savedAt ||
@@ -7657,6 +8368,8 @@ const endDay = async () => {
     const closedSessions = closeOpenSessionsAt(endTime) || [];
     setOrders(clearedOrders);
     setNextOrderNo(1);
+    setInventoryLocked(false);
+    setInventoryLockedAt(null);
 
     const endedMeta = {
       ...dayMeta,
@@ -7669,7 +8382,22 @@ const endDay = async () => {
       updatedAt: nowIso(),
     };
     setDayMeta(endedMeta);
-    saveLocalPartial({ dayMeta: endedMeta });
+    saveLocalPartial(
+      {
+        orders: clearedOrders,
+        expenses: clearedExpenses,
+        workerSessions: closedSessions,
+        dayMeta: endedMeta,
+        bankTx: updatedBankTx,
+        nextOrderNo: 1,
+        inventoryLocked: false,
+        inventoryLockedAt: null,
+        historicalOrders: newHistoricalOrders,
+        historicalExpenses: newHistoricalExpenses,
+        historicalPurchases: newHistoricalPurchases,
+      },
+      { sections: [DAY_META_SECTION, WORKER_SESSIONS_SECTION, HISTORY_SECTION] }
+    );
     setLastLocalEditAt(Date.now());
 
     setReconCounts({});
@@ -7678,12 +8406,14 @@ const endDay = async () => {
     if (cloudEnabled && stateDocRef && fbUser) {
       try {
         await writeFullStateToCloud({
-          orders: realtimeOrders ? [] : clearedOrders,
+          orders: clearedOrders,
           expenses: clearedExpenses,
           workerSessions: closedSessions,
           dayMeta: endedMeta,
           bankTx: updatedBankTx,
           nextOrderNo: 1,
+          inventoryLocked: false,
+          inventoryLockedAt: null,
           historicalOrders: newHistoricalOrders,
           historicalExpenses: newHistoricalExpenses,
           historicalPurchases: newHistoricalPurchases,
@@ -7994,13 +8724,83 @@ const recordCustomerFromOrder = (order) => {
     return upsertCustomer(prev, updated);
   });
 };
+// eslint-disable-next-line no-unused-vars
+const buildCurrentReceiptOrder = () => {
+  const total = currentOrderTotal;
+  const itemsTotal = roundMoney(Math.max(0, cartItemsSubtotal - currentDiscountAmount));
+  const orderCustomerName =
+    orderType === "Delivery"
+      ? String(deliveryName || "").trim()
+      : String(customerName || "").trim();
+  const orderCustomerPhone =
+    orderType === "Delivery"
+      ? normalizePhone(deliveryPhone)
+      : normalizePhone(customerPhone);
+
+  let paymentLabel = payment || "Unspecified";
+  let paymentParts = [];
+  if (splitPay) {
+    if (payA) paymentParts.push({ method: payA, amount: Math.max(0, Number(amtA || 0)) });
+    if (payB) paymentParts.push({ method: payB, amount: Math.max(0, Number(amtB || 0)) });
+    paymentLabel = summarizePaymentParts(paymentParts, "Split");
+  } else {
+    paymentParts = [{ method: paymentLabel, amount: total }];
+    paymentLabel = summarizePaymentParts(paymentParts, paymentLabel);
+  }
+
+  let cashVal = null;
+  let changeDue = null;
+  if (splitPay) {
+    const cashPart = paymentParts.find((p) => p.method === "Cash");
+    if (cashPart) {
+      cashVal = Number(cashReceivedSplit || 0);
+      changeDue = Math.max(0, cashVal - Number(cashPart.amount || 0));
+    }
+  } else if (payment === "Cash") {
+    cashVal = Number(cashReceived || 0);
+    changeDue = Math.max(0, cashVal - total);
+  }
+
+  const now = new Date();
+  return enrichOrderWithChannel({
+    orderNo: nextOrderNo,
+    date: now,
+    createdAt: now,
+    updatedAt: now,
+    lastModifiedDeviceId: DEVICE_ID,
+    syncStatus: SYNC_STATUS.pending,
+    worker: worker || "Not selected",
+    payment: paymentLabel,
+    paymentParts,
+    orderType,
+    deliveryFee: currentDeliveryFee,
+    deliveryName: orderCustomerName,
+    deliveryPhone: orderCustomerPhone,
+    deliveryAddress: orderType === "Delivery" ? String(deliveryAddress || "").trim() : "",
+    deliveryZoneId: orderType === "Delivery" ? deliveryZoneId || "" : "",
+    notifyViaWhatsapp: false,
+    whatsappSentAt: null,
+    total,
+    itemsTotal,
+    discountPercentage: 0,
+    discountAmount: currentDiscountAmount,
+    cashReceived: cashVal,
+    changeDue,
+    cart,
+    done: false,
+    voided: false,
+    restockedAt: undefined,
+    note: orderNote.trim(),
+    source: "onsite",
+  });
+};
 const checkout = async () => {
   if (isCheckingOut) return;
   setIsCheckingOut(true);
   try {
+    if (!assertDeviceCanWrite("create orders")) return;
     if (!dayMeta.startedAt || dayMeta.endedAt)
       return alert("Start a shift first (Shift → Start Shift).");
-    if (!assertDeviceCanWrite("create orders")) return;
     if (cart.length === 0) return alert("Cart is empty.");
     if (!worker) return alert("Select worker.");
     if (!orderType) return alert("Select order type.");
@@ -8071,12 +8871,23 @@ const checkout = async () => {
         );
       }
     }
-    setInventory((inv) =>
-      inv.map((it) => {
-        const need = Number(required[it.id] || 0);
-        return need ? { ...it, qty: it.qty - need } : it;
-      })
-    );
+    const ts = Date.now();
+    const newLedgerItems = [];
+    for (const [id, need] of Object.entries(required)) {
+      if (need) {
+        newLedgerItems.push({
+          id: `il_${clientIdRef.current}_${ts}_${id}_${Math.random().toString(36).substring(2, 7)}`,
+          itemId: id,
+          qty: -need,
+          createdAt: new Date(ts).toISOString(),
+          updatedAt: new Date(ts).toISOString(),
+          syncStatus: SYNC_STATUS.pending
+        });
+      }
+    }
+    if (newLedgerItems.length > 0) {
+      setInventoryLedger(prev => [...prev, ...newLedgerItems]);
+    }
 
     const itemsTotal = roundMoney(Math.max(0, cartItemsSubtotal - currentDiscountAmount));
     const delFee = currentDeliveryFee;
@@ -8122,8 +8933,12 @@ const checkout = async () => {
       orderNo: optimisticNo,
       dayId: currentDayId,
       shiftStartedAt: dayMeta.startedAt,
-      deviceId: currentDeviceInfo.deviceId,
+      deviceId: DEVICE_ID,
       date: new Date(),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      lastModifiedDeviceId: DEVICE_ID,
+      syncStatus: SYNC_STATUS.pending,
       worker,
       payment: paymentLabel,
       paymentParts,
@@ -8152,9 +8967,6 @@ const checkout = async () => {
       source: "onsite",
     });
     recordCustomerFromOrder(order);
-    if (autoPrintOnCheckout) {
-      printReceiptHTML(order, Number(preferredPaperWidthMm) || 80, "Customer");
-    }
     setNextOrderNo(optimisticNo + 1);
     let allocatedNo = optimisticNo;
     if (cloudEnabled && counterDocRef && fbUser) {
@@ -8172,20 +8984,24 @@ const checkout = async () => {
         console.warn("Atomic order number allocation failed, using optimistic number.", e);
       }
     }
-    if (!realtimeOrders) setOrders((o) => [order, ...o]);
+    setOrders((o) => dedupeOrders([order, ...o]));
     if (cloudEnabled && ordersColRef && fbUser) {
       try {
         const ref = await addOrder(order);
-        if (!realtimeOrders) {
-          setOrders((prev) =>
-            prev.map((oo) =>
-              oo.orderNo === order.orderNo ? { ...oo, cloudId: ref.id } : oo
-            )
-          );
-        }
+        setOrders((prev) =>
+          prev.map((oo) =>
+            oo.orderNo === order.orderNo ? { ...oo, cloudId: ref.id, syncStatus: SYNC_STATUS.synced } : oo
+          )
+        );
+        await markLocalOrderSynced(order, ref.id);
       } catch (e) {
         console.warn("Cloud order write failed:", e);
       }
+    }
+    if (autoPrintOnCheckout) {
+      void printReceiptHTML(order, Number(preferredPaperWidthMm) || 80, "Customer").catch((err) => {
+        console.warn("Receipt auto-print failed:", err);
+      });
     }
     setCart([]);
     setWorker("");
@@ -8212,11 +9028,11 @@ const checkout = async () => {
 };
 const integrateOnlineOrder = async (onlineOrder) => {
   if (!onlineOrder) return null;
+  if (!assertDeviceCanWrite("process online orders")) return null;
   if (!dayMeta.startedAt || dayMeta.endedAt) {
     alert("Start a shift first (Shift → Start Shift) before processing online orders.");
     return null;
   }
-  if (!assertDeviceCanWrite("process online orders")) return null;
   const existing = findPosOrderForOnline(onlineOrder);
   if (existing) return existing;
 
@@ -8243,14 +9059,23 @@ const integrateOnlineOrder = async (onlineOrder) => {
     return { ...prev, [key]: entry };
   });
 
-  setInventory((inv) =>
-    inv.map((item) => {
-      const need = Number(required[item.id] || 0);
-      if (!need) return item;
-      const nextQty = Number(item.qty || 0) - need;
-      return { ...item, qty: Number(nextQty.toFixed(4)) };
-    })
-  );
+  const ts = Date.now();
+  const newLedgerItems = [];
+  for (const [id, need] of Object.entries(required)) {
+    if (need) {
+      newLedgerItems.push({
+        id: `il_${clientIdRef.current}_${ts}_${id}_${Math.random().toString(36).substring(2, 7)}`,
+        itemId: id,
+        qty: -need,
+        createdAt: new Date(ts).toISOString(),
+        updatedAt: new Date(ts).toISOString(),
+        syncStatus: SYNC_STATUS.pending
+      });
+    }
+  }
+  if (newLedgerItems.length > 0) {
+    setInventoryLedger(prev => [...prev, ...newLedgerItems]);
+  }
 
   const deliveryFee = Number(onlineOrder.deliveryFee || 0);
   const computedItemsTotal = cartWithUses.reduce((sum, line) => {
@@ -8407,8 +9232,12 @@ const onlineFallbackId =
     orderNo,
     dayId: currentDayId,
     shiftStartedAt: dayMeta.startedAt,
-    deviceId: currentDeviceInfo.deviceId,
+    deviceId: DEVICE_ID,
     date: new Date(),
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    lastModifiedDeviceId: DEVICE_ID,
+    syncStatus: SYNC_STATUS.pending,
     worker: dayMeta.currentWorker || "Online",
     payment: paymentLabel,
     paymentParts,
@@ -8657,18 +9486,17 @@ const onlineFallbackId =
     }
   }
 
-  if (!realtimeOrders) setOrders((o) => [posOrder, ...o]);
+  setOrders((o) => dedupeOrders([posOrder, ...o]));
   if (cloudEnabled && ordersColRef && fbUser) {
     try {
       const ref = await addOrder(posOrder);
       posOrder.cloudId = ref.id;
-      if (!realtimeOrders) {
-        setOrders((prev) =>
-          prev.map((ord) =>
-            ord.orderNo === posOrder.orderNo ? { ...ord, cloudId: ref.id } : ord
-          )
-        );
-      }
+      setOrders((prev) =>
+        prev.map((ord) =>
+          ord.orderNo === posOrder.orderNo ? { ...ord, cloudId: ref.id, syncStatus: SYNC_STATUS.synced } : ord
+        )
+      );
+      await markLocalOrderSynced(posOrder, ref.id);
     } catch (err) {
       console.warn("Cloud write failed for online order integration:", err);
     }
@@ -8697,24 +9525,30 @@ const onlineFallbackId =
   return posOrder;
 };
 const markOrderDone = async (orderNo) => {
-  if (!assertDeviceCanWrite("mark orders done")) return;
-  // If not live, update locally
-  if (!realtimeOrders) {
-    setOrders((o) =>
-      o.map((ordr) =>
-        ordr.orderNo !== orderNo || ordr.done
-          ? ordr
-          : { ...ordr, done: true }
-      )
-    );
-  }
+  if (!assertDeviceCanWrite("update orders")) return;
+  const updatedAt = new Date().toISOString();
+  setOrders((o) =>
+    o.map((ordr) =>
+      ordr.orderNo !== orderNo || ordr.done
+        ? ordr
+        : {
+            ...ordr,
+            done: true,
+            updatedAt,
+            lastModifiedDeviceId: DEVICE_ID,
+            syncStatus: SYNC_STATUS.pending,
+          }
+    )
+  );
 
   try {
     if (!cloudEnabled || !ordersColRef || !fbUser) return;
     let targetId = orders.find((o) => o.orderNo === orderNo)?.cloudId;
     const payload = {
       done: true,
-      updatedAt: new Date().toISOString(),
+      updatedAt,
+      lastModifiedDeviceId: DEVICE_ID,
+      syncStatus: SYNC_STATUS.synced,
     };
     if (targetId) await updateOrderById(targetId, payload);
     else await updateOrderByOrderNo(orderNo, payload, currentDayId);
@@ -8742,6 +9576,14 @@ const printOnlineOrder = (onlineOrder) => {
     return;
   }
   printReceiptHTML(posOrder, Number(preferredPaperWidthMm) || 80, "Customer");
+};
+const previewOnlineOrder = (onlineOrder) => {
+  const posOrder = findPosOrderForOnline(onlineOrder);
+  if (!posOrder) {
+    alert("Make the online order in POS before previewing.");
+    return;
+  }
+  previewReceiptHTML(posOrder, Number(preferredPaperWidthMm) || 80, "Preview");
 };
 const voidOnlineOrderAndRestock = async (onlineOrder) => {
   const posOrder = findPosOrderForOnline(onlineOrder);
@@ -8782,7 +9624,7 @@ const voidOrderAndRestock = async (orderNo) => {
   if (ord.done) return alert("This order is DONE and cannot be cancelled.");
   if (ord.voided) return alert("This order is already cancelled/returned.");
 
-  const reasonRaw = window.prompt(
+  const reasonRaw = await promptText(
     `Reason for CANCEL (restock) — order #${orderNo}:`,
     ""
   );
@@ -8796,23 +9638,40 @@ const voidOrderAndRestock = async (orderNo) => {
       giveBack[k] = (giveBack[k] || 0) + (uses[k] || 0);
     }
   }
-  setInventory((inv) =>
-    inv.map((it) => {
-      const back = giveBack[it.id] || 0;
-      return back ? { ...it, qty: it.qty + back } : it;
-    })
-  );
+  const ts = Date.now();
+  const newLedgerItems = [];
+  for (const [id, back] of Object.entries(giveBack)) {
+    if (back) {
+      newLedgerItems.push({
+        id: `il_${clientIdRef.current}_${ts}_${id}_${Math.random().toString(36).substring(2, 7)}`,
+        itemId: id,
+        qty: back,
+        createdAt: new Date(ts).toISOString(),
+        updatedAt: new Date(ts).toISOString(),
+        syncStatus: SYNC_STATUS.pending
+      });
+    }
+  }
+  if (newLedgerItems.length > 0) {
+    setInventoryLedger(prev => [...prev, ...newLedgerItems]);
+  }
 
   const when = new Date();
-  if (!realtimeOrders) {
-    setOrders((o) =>
-      o.map((x) =>
-        x.orderNo === orderNo
-          ? { ...x, voided: true, restockedAt: when, voidReason: reason }
-          : x
-      )
-    );
-  }
+  setOrders((o) =>
+    o.map((x) =>
+      x.orderNo === orderNo
+        ? {
+            ...x,
+            voided: true,
+            restockedAt: when,
+            voidReason: reason,
+            updatedAt: when,
+            lastModifiedDeviceId: DEVICE_ID,
+            syncStatus: SYNC_STATUS.pending,
+          }
+        : x
+    )
+  );
 
   try {
     if (!cloudEnabled || !ordersColRef || !fbUser) return;
@@ -8822,6 +9681,8 @@ const voidOrderAndRestock = async (orderNo) => {
       voidReason: reason,
       restockedAt: toIso(when),
       updatedAt: new Date().toISOString(),
+      lastModifiedDeviceId: DEVICE_ID,
+      syncStatus: SYNC_STATUS.synced,
     };
     if (targetId) await updateOrderById(targetId, payload);
     else await updateOrderByOrderNo(orderNo, payload, currentDayId);
@@ -8838,7 +9699,7 @@ const voidOrderToExpense = async (orderNo) => {
   if (!isExpenseVoidEligible(ord.orderType)) {
     return alert("This action is only for non Dine-in / Take-Away orders.");
   }
-  const reasonRaw = window.prompt(
+  const reasonRaw = await promptText(
     `Reason for RETURN (no restock) — order #${orderNo}:`,
     ""
   );
@@ -8853,6 +9714,7 @@ const voidOrderToExpense = async (orderNo) => {
     `Void order #${orderNo} WITHOUT restock and add expense for wasted items (E£${itemsOnly.toFixed(2)})?`
   );
   if (!ok) return;
+  const when = new Date();
   const expRow = {
     id: `exp_ret_${orderNo}_${Date.now()}`,
     name: `Returned order #${orderNo} — ${ord.orderType || "-"}`,
@@ -8860,21 +9722,31 @@ const voidOrderToExpense = async (orderNo) => {
     qty: 1,
     unitPrice: itemsOnly,
     note: reason,
-    date: new Date(),
+    date: when,
     locked: true,
     source: "order_return",
     orderNo,
+    createdAt: when,
+    updatedAt: when,
+    lastModifiedDeviceId: DEVICE_ID,
+    syncStatus: SYNC_STATUS.pending,
   };
   setExpenses((arr) => [expRow, ...arr]);
-  if (!realtimeOrders) {
-    setOrders((o) =>
-      o.map((x) =>
-        x.orderNo === orderNo
-          ? { ...x, voided: true, restockedAt: undefined, voidReason: reason }
-          : x
-      )
-    );
-  }
+  setOrders((o) =>
+    o.map((x) =>
+      x.orderNo === orderNo
+        ? {
+            ...x,
+            voided: true,
+            restockedAt: undefined,
+            voidReason: reason,
+            updatedAt: when,
+            lastModifiedDeviceId: DEVICE_ID,
+            syncStatus: SYNC_STATUS.pending,
+          }
+        : x
+    )
+  );
 
   try {
     if (cloudEnabled && ordersColRef && fbUser) {
@@ -8883,6 +9755,8 @@ const voidOrderToExpense = async (orderNo) => {
         voided: true,
         voidReason: reason,
         updatedAt: new Date().toISOString(),
+        lastModifiedDeviceId: DEVICE_ID,
+        syncStatus: SYNC_STATUS.synced,
       };
       if (targetId) await updateOrderById(targetId, payload);
       else await updateOrderByOrderNo(orderNo, payload, currentDayId);
@@ -8912,15 +9786,15 @@ const voidOrderToExpense = async (orderNo) => {
   }, [reportFilter, reportDay, reportMonth, dayMeta]);
 
 
-  const resetReports = () => {
-    const adminNum = promptAdminAndPin();
+  const resetReports = async () => {
+    const adminNum = await promptAdminAndPin();
     if (!adminNum) return;
-    const phrase = window.prompt(
+    const phrase = await promptText(
       `Admin ${adminNum}: type RESET REPORT HISTORY to permanently clear reports.`,
       ""
     );
     if (String(phrase || "").trim() !== "RESET REPORT HISTORY") return;
-    const reason = String(window.prompt("Enter reset reason:", "") || "").trim();
+    const reason = String((await promptText("Enter reset reason:", "")) || "").trim();
     if (!reason) return alert("A reset reason is required.");
 
     const now = new Date();
@@ -9665,8 +10539,8 @@ if (targetItem) {
   setNewCategoryName("");
   setNewCategoryUnit("piece");
 };
-const resetAllPurchases = () => {
-  const okAdmin = !!promptAdminAndPin();
+const resetAllPurchases = async () => {
+  const okAdmin = !!(await promptAdminAndPin());
   if (!okAdmin) return;
   if (!window.confirm("Reset ALL purchases (cannot be undone)?")) return;
   setPurchases([]);
@@ -9977,10 +10851,10 @@ const endedStr   = m.endedAt   ? fmtDateTime(m.endedAt)   : "—";
     transition: "background 0.2s ease, color 0.2s ease",
   };
 
-const handleTabClick = (key) => {
+const handleTabClick = async (key) => {
   if (key === "admin") {
     if (!adminUnlocked) {
-      const ok = !!promptAdminAndPin(); // uses your existing Admin PINs (1..6)
+      const ok = !!(await promptAdminAndPin()); // uses your existing Admin PINs (1..6)
       if (!ok) return;                  // stay on current tab if PIN fails/cancelled
       setAdminUnlocked(true);
     }
@@ -10403,8 +11277,8 @@ const generatePurchasesPDF = () => {
       ["workerlog", "Worker Log"],
       ["contacts", "Customer Contacts"],
       ["reports", "Reports"],
-      ["devices", "Connected Devices"],
       ["edit", "Edit"],
+      ["devices", "Connected Devices"],
       ["settings", "Settings"],
     ].map(([key, label]) => (
       <button
@@ -12250,11 +13124,7 @@ const cogs = Number(
                     minWidth: 140,
                   }}
                 >
-                  {!currentDeviceCanWrite
-                    ? "Device cannot write"
-                    : isCheckingOut
-                    ? "Processing..."
-                    : "Checkout"}
+                  {isCheckingOut ? "Processing..." : "Checkout"}
                 </button>
                 <small>
                   Next order #: <b>{nextOrderNo}</b>
@@ -12270,6 +13140,32 @@ const cogs = Number(
      {activeTab === "board" && (
         <div>
           <h2>Orders Board {realtimeOrders ? "(Live)" : ""}</h2>
+          {!currentDeviceCanListen && (
+            <div
+              style={{
+                marginBottom: 10,
+                padding: 10,
+                borderRadius: 6,
+                background: dark ? "#3a2512" : "#fff3e0",
+                border: `1px solid ${dark ? "#8d6e63" : "#ffcc80"}`,
+              }}
+            >
+              This device is set to {currentDeviceModeMeta.label} and cannot listen to live orders.
+            </div>
+          )}
+          {activeShiftIsStale && (
+            <div
+              style={{
+                marginBottom: 10,
+                padding: 10,
+                borderRadius: 6,
+                background: dark ? "#3a2512" : "#fff3e0",
+                border: `1px solid ${dark ? "#8d6e63" : "#ffcc80"}`,
+              }}
+            >
+              This shift started on {dayMeta.startedAt ? fmtDateTime(dayMeta.startedAt) : "-"} and is over 24 hours old. End it or start a fresh shift before loading live orders.
+            </div>
+          )}
           <div
             style={{
               display: "flex",
@@ -12500,32 +13396,46 @@ const cogs = Number(
                         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
                           <button
                             onClick={() => integrateOnlineOrder(o)}
-                            disabled={isIntegrated || isProcessing}
+                            disabled={isIntegrated || isProcessing || !currentDeviceCanWrite}
                             style={{
-                              background: isIntegrated ? "#9e9e9e" : "#6d4c41",
+                              background: isIntegrated || !currentDeviceCanWrite ? "#9e9e9e" : "#6d4c41",
                               color: "white",
                               border: "none",
                               borderRadius: 6,
                               padding: "6px 10px",
-                              cursor: isIntegrated || isProcessing ? "not-allowed" : "pointer",
+                              cursor: isIntegrated || isProcessing || !currentDeviceCanWrite ? "not-allowed" : "pointer",
                             }}
                           >
                             Make
                           </button>
                           <button
                             onClick={() => markOnlineOrderDone(o)}
-                            disabled={!isIntegrated || isDone || isVoided}
+                            disabled={!isIntegrated || isDone || isVoided || !currentDeviceCanWrite}
                             style={{
-                              background: !isIntegrated || isDone || isVoided ? "#9e9e9e" : "#43a047",
+                              background: !isIntegrated || isDone || isVoided || !currentDeviceCanWrite ? "#9e9e9e" : "#43a047",
                               color: "white",
                               border: "none",
                               borderRadius: 6,
                               padding: "6px 10px",
                               cursor:
-                                !isIntegrated || isDone || isVoided ? "not-allowed" : "pointer",
+                                !isIntegrated || isDone || isVoided || !currentDeviceCanWrite ? "not-allowed" : "pointer",
                             }}
                           >
                             Mark DONE (locks)
+                          </button>
+                          <button
+                            onClick={() => previewOnlineOrder(o)}
+                            disabled={!isIntegrated || isVoided}
+                            style={{
+                              background: !isIntegrated || isVoided ? "#5e35b188" : "#5e35b1",
+                              color: "white",
+                              border: "none",
+                              borderRadius: 6,
+                              padding: "6px 10px",
+                              cursor: !isIntegrated || isVoided ? "not-allowed" : "pointer",
+                            }}
+                          >
+                            Preview
                           </button>
                           <button
                             onClick={() => printOnlineOrder(o)}
@@ -12543,16 +13453,16 @@ const cogs = Number(
                           </button>
                           <button
                             onClick={() => voidOnlineOrderAndRestock(o)}
-                            disabled={!isIntegrated || isDone || isVoided}
+                            disabled={!isIntegrated || isDone || isVoided || !currentDeviceCanWrite}
                             style={{
                               background:
-                                !isIntegrated || isDone || isVoided ? "#ef9a9a" : "#c62828",
+                                !isIntegrated || isDone || isVoided || !currentDeviceCanWrite ? "#ef9a9a" : "#c62828",
                               color: "white",
                               border: "none",
                               borderRadius: 6,
                               padding: "6px 10px",
                               cursor:
-                                !isIntegrated || isDone || isVoided ? "not-allowed" : "pointer",
+                                !isIntegrated || isDone || isVoided || !currentDeviceCanWrite ? "not-allowed" : "pointer",
                             }}
                           >
                             Cancel (restock)
@@ -12563,6 +13473,7 @@ const cogs = Number(
                               !isIntegrated ||
                               isDone ||
                               isVoided ||
+                              !currentDeviceCanWrite ||
                               !isExpenseVoidEligible(posOrder?.orderType)
                             }
                             style={{
@@ -12570,6 +13481,7 @@ const cogs = Number(
                                 !isIntegrated ||
                                 isDone ||
                                 isVoided ||
+                                !currentDeviceCanWrite ||
                                 !isExpenseVoidEligible(posOrder?.orderType)
                                   ? "#ffb74d"
                                   : "#fb8c00",
@@ -12581,6 +13493,7 @@ const cogs = Number(
                                 !isIntegrated ||
                                 isDone ||
                                 isVoided ||
+                                !currentDeviceCanWrite ||
                                 !isExpenseVoidEligible(posOrder?.orderType)
                                   ? "not-allowed"
                                   : "pointer",
@@ -12606,19 +13519,6 @@ const cogs = Number(
                 </ul>
               )}
             </>
-          ) : !currentDeviceCanListen ? (
-            <div style={{ padding: 12, borderRadius: 6, background: dark ? "#2c1d1d" : "#ffebee" }}>
-              This device is set to "{currentDeviceModeMeta.label}" and cannot listen to live orders.
-            </div>
-          ) : !dayMeta.startedAt || dayMeta.endedAt ? (
-            <div style={{ padding: 12, borderRadius: 6, background: dark ? "#222" : "#f5f5f5" }}>
-              Start a shift to load the live Orders Board.
-            </div>
-          ) : activeShiftIsStale ? (
-            <div style={{ padding: 12, borderRadius: 6, background: dark ? "#332d1e" : "#fff8e1" }}>
-              This shift started at {fmtDateTime(dayMeta.startedAt)} and is older than{" "}
-              {Math.floor(MAX_ACTIVE_SHIFT_MS / 3600000)} hours. End the stale shift or start a fresh one.
-            </div>
           ) : (
             <>
               {orders.length === 0 && <p>No orders yet.</p>}
@@ -12790,13 +13690,14 @@ const cogs = Number(
                         {!o.done && !o.voided && (
                           <button
                             onClick={() => markOrderDone(o.orderNo)}
+                            disabled={!currentDeviceCanWrite}
                             style={{
-                              background: "#43a047",
+                              background: currentDeviceCanWrite ? "#43a047" : "#9e9e9e",
                               color: "white",
                               border: "none",
                               borderRadius: 6,
                               padding: "6px 10px",
-                              cursor: "pointer",
+                              cursor: currentDeviceCanWrite ? "pointer" : "not-allowed",
                             }}
                           >
                             Mark DONE (locks)
@@ -12817,8 +13718,23 @@ const cogs = Number(
                             DONE (locked)
                           </button>
                         )}
-
-                        {/* Single Print button (removed all other print options) */}
+                        {/* Print receipt */}
+                        <button
+                          onClick={() =>
+                            previewReceiptHTML(o, Number(preferredPaperWidthMm) || 80, "Preview")
+                          }
+                          disabled={o.voided}
+                          style={{
+                            background: o.voided ? "#5e35b188" : "#5e35b1",
+                            color: "white",
+                            border: "none",
+                            borderRadius: 6,
+                            padding: "6px 10px",
+                            cursor: o.voided ? "not-allowed" : "pointer",
+                          }}
+                        >
+                          Preview
+                        </button>
                         <button
                           onClick={() =>
                             printReceiptHTML(o, Number(preferredPaperWidthMm) || 80, "Customer")
@@ -12838,14 +13754,14 @@ const cogs = Number(
 
                         <button
                           onClick={() => voidOrderAndRestock(o.orderNo)}
-                          disabled={o.done || o.voided}
+                          disabled={o.done || o.voided || !currentDeviceCanWrite}
                           style={{
-                            background: o.done || o.voided ? "#ef9a9a" : "#c62828",
+                            background: o.done || o.voided || !currentDeviceCanWrite ? "#ef9a9a" : "#c62828",
                             color: "white",
                             border: "none",
                             borderRadius: 6,
                             padding: "6px 10px",
-                            cursor: o.done || o.voided ? "not-allowed" : "pointer",
+                            cursor: o.done || o.voided || !currentDeviceCanWrite ? "not-allowed" : "pointer",
                           }}
                         >
                           Cancel (restock)
@@ -12854,13 +13770,14 @@ const cogs = Number(
                         {!o.done && !o.voided && isExpenseVoidEligible(o.orderType) && (
                           <button
                             onClick={() => voidOrderToExpense(o.orderNo)}
+                            disabled={!currentDeviceCanWrite}
                             style={{
-                              background: "#fb8c00",
+                              background: currentDeviceCanWrite ? "#fb8c00" : "#ffb74d",
                               color: "white",
                               border: "none",
                               borderRadius: 6,
                               padding: "6px 10px",
-                              cursor: "pointer",
+                              cursor: currentDeviceCanWrite ? "pointer" : "not-allowed",
                             }}
                           >
                             Returned
@@ -14981,8 +15898,8 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
       ))}
 {/* Add this reset button */}
       <button
-        onClick={() => {
-          const okAdmin = !!promptAdminAndPin();
+        onClick={async () => {
+          const okAdmin = !!(await promptAdminAndPin());
           if (!okAdmin) return;
           if (!window.confirm("Reset ALL bank transactions? This cannot be undone.")) return;
           skipLockedBankReinsertRef.current = true;
@@ -17118,40 +18035,24 @@ setExtraList((arr) => [
         </div>
       )}
 
-      {/* CONNECTED DEVICES */}
       {activeTab === "admin" && adminSubTab === "devices" && (
         <div>
           <h2>Connected Devices</h2>
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))",
-              gap: 12,
-              marginBottom: 12,
-            }}
-          >
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 12, marginBottom: 12 }}>
             <div style={{ padding: 10, borderRadius: 6, border: `1px solid ${cardBorder}` }}>
               <h4 style={{ marginTop: 0 }}>This Device</h4>
-              <div style={{ display: "grid", gap: 4, fontSize: 13 }}>
+              <div style={{ display: "grid", gap: 5, fontSize: 13 }}>
+                <div><b>ID:</b> {currentDeviceInfo.deviceId}</div>
                 <div><b>Mode:</b> {currentDeviceModeMeta.label}</div>
-                <div><b>Device ID:</b> {currentDeviceInfo.deviceId}</div>
-                <div><b>OS:</b> {currentDeviceInfo.os}</div>
-                <div><b>Browser:</b> {currentDeviceInfo.browser}</div>
-                <div><b>IP:</b> {currentDevice?.lastIp || "Detecting..."}</div>
-                <div>
-                  <b>Last seen:</b>{" "}
-                  {deviceStatus.lastSeenAt ? deviceStatus.lastSeenAt.toLocaleString() : "Not synced yet"}
-                </div>
+                <div><b>OS:</b> {currentDeviceInfo.os} / {currentDeviceInfo.browser}</div>
+                <div><b>Surface:</b> {currentDeviceInfo.appSurface}</div>
+                <div><b>Last seen:</b> {deviceStatus.lastSeenAt ? deviceStatus.lastSeenAt.toLocaleString() : "-"}</div>
+                {deviceStatus.error && <div style={{ color: "#c62828" }}>Registry: {deviceStatus.error}</div>}
               </div>
-              {deviceStatus.error && (
-                <div style={{ marginTop: 8, color: "#c62828", fontSize: 12 }}>
-                  Device registry error: {deviceStatus.error}
-                </div>
-              )}
             </div>
             <div style={{ padding: 10, borderRadius: 6, border: `1px solid ${cardBorder}` }}>
               <h4 style={{ marginTop: 0 }}>Permissions</h4>
-              <div style={{ display: "grid", gap: 6, fontSize: 13 }}>
+              <div style={{ display: "grid", gap: 5, fontSize: 13 }}>
                 <div>Listen: <b>{currentDeviceCanListen ? "Allowed" : "Blocked"}</b></div>
                 <div>Write: <b>{currentDeviceCanWrite ? "Allowed" : "Blocked"}</b></div>
                 <div>Manage devices: <b>{currentDeviceCanAdmin ? "Allowed" : "Blocked"}</b></div>
@@ -17181,26 +18082,29 @@ setExtraList((arr) => [
                   <th style={{ textAlign: "left", padding: 8, borderBottom: `1px solid ${cardBorder}` }}>Mode</th>
                   <th style={{ textAlign: "left", padding: 8, borderBottom: `1px solid ${cardBorder}` }}>OS / Browser</th>
                   <th style={{ textAlign: "left", padding: 8, borderBottom: `1px solid ${cardBorder}` }}>IP</th>
+                  <th style={{ textAlign: "left", padding: 8, borderBottom: `1px solid ${cardBorder}` }}>Sync</th>
                   <th style={{ textAlign: "left", padding: 8, borderBottom: `1px solid ${cardBorder}` }}>Last Seen</th>
                   <th style={{ textAlign: "left", padding: 8, borderBottom: `1px solid ${cardBorder}` }}>Actions</th>
                 </tr>
               </thead>
               <tbody>
-                {devices.map((device) => {
-                  const isCurrent = device.deviceId === currentDeviceInfo.deviceId;
+                {(syncDevices || []).map((device) => {
+                  const deviceId = device.deviceId || device.id;
+                  const isCurrent = deviceId === currentDeviceInfo.deviceId;
                   return (
-                    <tr key={device.deviceId}>
+                    <tr key={deviceId}>
                       <td style={{ padding: 8, borderBottom: `1px solid ${cardBorder}` }}>
                         <div style={{ fontWeight: 700 }}>
-                          {device.label || device.deviceId} {isCurrent ? "(this device)" : ""}
+                          {device.label || deviceId} {isCurrent ? "(this device)" : ""}
                         </div>
-                        <div style={{ fontSize: 11, opacity: 0.7 }}>{device.deviceId}</div>
+                        <div style={{ fontSize: 11, opacity: 0.7 }}>{deviceId}</div>
+                        <div style={{ fontSize: 11, opacity: 0.7 }}>{device.appSurface || "app"}</div>
                       </td>
                       <td style={{ padding: 8, borderBottom: `1px solid ${cardBorder}` }}>
                         <select
                           value={device.mode || "pending"}
                           disabled={!currentDeviceCanAdmin || isCurrent}
-                          onChange={(e) => updateDeviceMode(device.deviceId, e.target.value)}
+                          onChange={(e) => updateDeviceMode(deviceId, e.target.value)}
                           style={{ padding: 6, borderRadius: 6, border: `1px solid ${btnBorder}` }}
                         >
                           {DEVICE_MODE_OPTIONS.map((mode) => (
@@ -17217,6 +18121,9 @@ setExtraList((arr) => [
                         {device.lastIp || "-"}
                       </td>
                       <td style={{ padding: 8, borderBottom: `1px solid ${cardBorder}` }}>
+                        Pending: {Number(device.pendingCount || 0)}
+                      </td>
+                      <td style={{ padding: 8, borderBottom: `1px solid ${cardBorder}` }}>
                         {device.lastSeenAt ? device.lastSeenAt.toLocaleString() : "-"}
                       </td>
                       <td style={{ padding: 8, borderBottom: `1px solid ${cardBorder}` }}>
@@ -17225,7 +18132,7 @@ setExtraList((arr) => [
                           onClick={() => {
                             const label = window.prompt("Device label:", device.label || "");
                             if (label == null) return;
-                            renameDevice(device.deviceId, label.trim());
+                            renameDevice(deviceId, label.trim());
                           }}
                           style={{
                             padding: "5px 8px",
@@ -17240,10 +18147,10 @@ setExtraList((arr) => [
                     </tr>
                   );
                 })}
-                {devices.length === 0 && (
+                {(!syncDevices || syncDevices.length === 0) && (
                   <tr>
-                    <td colSpan={6} style={{ padding: 12, opacity: 0.75 }}>
-                      No devices synced yet. Install and run the devices SQL migration, then refresh this tab.
+                    <td colSpan={7} style={{ padding: 12, opacity: 0.75 }}>
+                      No devices synced yet. Run the Supabase devices migration, then refresh this tab.
                     </td>
                   </tr>
                 )}
@@ -17307,13 +18214,58 @@ setExtraList((arr) => [
     Sync to Cloud
   </button>
   <button onClick={loadFromCloud} style={{ background: "#1976d2", color: "#fff", border: "none", borderRadius: 6, padding: "6px 10px" }}>
-    Load from Cloud
+    Refresh from Cloud
+  </button>
+  <button onClick={syncPendingOrdersToCloud} style={{ background: "#6d4c41", color: "#fff", border: "none", borderRadius: 6, padding: "6px 10px" }}>
+    Sync Pending Orders
+  </button>
+  <button onClick={saveLocalDataNow} style={{ background: "#455a64", color: "#fff", border: "none", borderRadius: 6, padding: "6px 10px" }}>
+    Save Local Data
+  </button>
+  <button onClick={loadLocalDataNow} style={{ background: "#00897b", color: "#fff", border: "none", borderRadius: 6, padding: "6px 10px" }}>
+    Load Local Data
   </button>
   <small style={{ opacity: 0.8 }}>
     Last save: {cloudStatus.lastSaveAt ? cloudStatus.lastSaveAt.toLocaleString() : "—"} • Last load: {cloudStatus.lastLoadAt ? cloudStatus.lastLoadAt.toLocaleString() : "—"}
   </small>
+  <small style={{ opacity: 0.8 }}>
+    Pending orders: {(orders || []).filter((order) => order?.syncStatus === SYNC_STATUS.pending).length}
+  </small>
+  <small style={{ opacity: 0.8 }}>
+    Local DB: {localDbStatus.available ? `${localDbStatus.orderCount} orders / ${localDbStatus.pendingCount} pending events` : "unavailable"}
+  </small>
+  <small style={{ opacity: 0.8 }}>
+    Device: {DEVICE_ID} {isSupabaseConfigured ? "" : "Local mode"}
+  </small>
   {cloudStatus.error && (
     <small style={{ color: "#c62828" }}>Error: {String(cloudStatus.error)}</small>
+  )}
+  {syncDevices.length > 0 && (
+    <div style={{ flexBasis: "100%", marginTop: 6 }}>
+      <div style={{ fontWeight: 700, marginBottom: 4 }}>Device Sync Health</div>
+      <div style={{ display: "grid", gap: 4 }}>
+        {syncDevices.map((device) => (
+          <div
+            key={device.deviceId || device.id}
+            style={{
+              display: "flex",
+              gap: 8,
+              flexWrap: "wrap",
+              padding: "4px 6px",
+              borderRadius: 6,
+              border: `1px solid ${btnBorder}`,
+              background: dark ? "#1d1d1d" : "#fafafa",
+            }}
+          >
+            <strong>{device.label || device.deviceId || device.id}</strong>
+            <span>{device.appSurface || "app"}</span>
+            <span>Mode: {getDeviceModeMeta(device.mode || "pending").label}</span>
+            <span>Pending: {Number(device.pendingCount || 0)}</span>
+            <span>Seen: {device.lastSeenAt ? device.lastSeenAt.toLocaleString() : "-"}</span>
+          </div>
+        ))}
+      </div>
+    </div>
   )}
 </div>
 
