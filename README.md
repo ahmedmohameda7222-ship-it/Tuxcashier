@@ -1,4 +1,10 @@
-# Getting Started with Create React App
+# Tux Cashier
+
+Tux Cashier is a POS/cashier app for a burger business.
+
+For the ChatGPT MCP connection setup, Supabase migration, Vercel environment variables, deployment steps, and testing checklist, see [MCP_README.md](MCP_README.md).
+
+## Create React App
 
 This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
 
