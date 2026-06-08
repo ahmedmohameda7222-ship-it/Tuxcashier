@@ -17200,20 +17200,6 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
         <div>
           <h2>Edit</h2>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
-            <button
-              onClick={restoreBaseBurgerItems}
-              style={{
-                background: "#2e7d32",
-                color: "#fff",
-                border: "none",
-                borderRadius: 6,
-                padding: "8px 12px",
-                cursor: "pointer",
-                fontWeight: 700,
-              }}
-            >
-              Restore Original Burger/Items
-            </button>
           </div>
           {/* Items editor */}
           <h3>Menu Items</h3>
@@ -18488,21 +18474,6 @@ setExtraList((arr) => [
             <div style={{ padding: 10, borderRadius: 6, border: `1px solid ${cardBorder}` }}>
               <h4 style={{ marginTop: 0 }}>Reset / Recovery</h4>
               <div style={{ display: "grid", gap: 8 }}>
-                <button
-                  onClick={restoreBaseBurgerItems}
-                  style={{
-                    background: "#2e7d32",
-                    color: "#fff",
-                    border: "none",
-                    borderRadius: 6,
-                    padding: "8px 12px",
-                    cursor: "pointer",
-                    fontWeight: 700,
-                    textAlign: "left",
-                  }}
-                >
-                  Restore Original Burger/Items
-                </button>
                 <button
                   onClick={deleteCurrentLocalBaseData}
                   style={{
