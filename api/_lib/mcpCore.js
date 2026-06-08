@@ -6,1522 +6,207 @@ const POS_STATE_ID = "pos";
 const DEFAULT_APP_URL = "https://tuxcashier.vercel.app";
 const TOKEN_PREFIX = "tux_mcp_live_";
 const DEFAULT_ADMIN_PASSCODE_PEPPER = "tux_mcp_admin_passcode_v1";
-const DEFAULT_ADMIN_SCOPES = [
-  "read:orders",
-  "read:inventory",
-  "read:reports",
-  "write:inventory",
-  "write:orders",
-  "write:expenses",
-  "write:prices",
-  "write:shift",
-];
-const ADMIN_DEFINITIONS = {
-  admin_1: {
-    id: "admin_1",
-    name: "Admin 1",
-    hashEnv: "TUX_ADMIN_1_PASSCODE_HASH",
-    defaultPasscodeHash:
-      "6e1411ae870ac31e280bce1db84b87e03c9c44a92d10c396c7b5ac8fd063a635",
-    defaultScopes: DEFAULT_ADMIN_SCOPES,
-  },
-};
+const DEFAULT_ADMIN_SCOPES = ["read:orders","read:inventory","read:reports","write:inventory","write:orders","write:expenses","write:prices","write:shift"];
+const VALID_SCOPES = [...DEFAULT_ADMIN_SCOPES, "read", "write", "admin", "write:bank", "write:settings", "write:reports"];
+const ADMIN_DEFINITIONS = { admin_1: { id: "admin_1", name: "Admin 1", hashEnv: "TUX_ADMIN_1_PASSCODE_HASH", defaultPasscodeHash: "6e1411ae870ac31e280bce1db84b87e03c9c44a92d10c396c7b5ac8fd063a635", defaultScopes: DEFAULT_ADMIN_SCOPES } };
 
 const READ_TOOL_NAMES = new Set([
-  "get_connection_info",
-  "get_today_sales_report",
-  "get_inventory_status",
-  "get_recent_orders",
-  "get_order_by_number",
-  "get_menu_items",
-  "get_worker_sales_report",
-  "get_expenses_report",
-  "get_bank_summary",
-  "get_current_shift",
+  "get_connection_info","get_recent_orders","get_order_board","get_order_by_number",
+  "get_expenses_report","get_expenses","get_expense_by_id","get_purchases_report","get_month_expenses_report","get_year_expenses_report",
+  "get_bank_summary","get_bank_transactions","get_bank_report",
+  "get_today_sales_report","get_worker_sales_report","get_month_sales_report","get_year_sales_report","get_date_range_sales_report","get_profit_report","get_worker_report_for_period","generate_daily_pdf_report","generate_monthly_pdf_report","export_report_json","export_report_csv",
+  "get_inventory_status","get_inventory_lock_status","get_inventory_usage","get_inventory_movements",
+  "get_menu_items","get_admin_settings","get_connected_admins","list_mcp_tokens","get_current_shift","get_day_status","get_shift_history"
 ]);
-
 const WRITE_TOOL_NAMES = new Set([
-  "add_inventory_restock",
-  "adjust_inventory_quantity",
-  "update_item_price",
-  "update_extra_price",
-  "mark_order_done",
-  "void_order",
-  "add_expense",
-  "change_shift",
+  "create_order","update_order","add_item_to_order","remove_item_from_order","mark_order_done","void_order","print_customer_receipt","print_kitchen_ticket",
+  "add_expense","update_expense","void_expense","delete_expense",
+  "add_bank_transaction","withdraw_from_bank","deposit_to_bank","adjust_bank_total",
+  "add_inventory_restock","adjust_inventory_quantity","lock_inventory","unlock_inventory","update_inventory_usage","add_inventory_item","update_inventory_item","delete_inventory_item","disable_inventory_item","set_low_stock_threshold",
+  "update_item_price","update_extra_price","add_menu_item","update_menu_item","delete_menu_item","disable_menu_item","add_extra","update_extra","delete_extra","disable_extra","add_beverage","update_beverage","delete_beverage","disable_beverage","update_item_category","update_item_name","update_item_description","update_item_image","update_item_consumption_usage",
+  "update_worker_list","add_worker","update_worker","disable_worker","update_payment_methods","update_order_types","update_default_delivery_fee","update_shop_settings","revoke_mcp_token","change_shift","start_day","end_day","start_shift","end_shift"
 ]);
-
-const TOOL_SCOPES = {
-  get_connection_info: "read:reports",
-  get_today_sales_report: "read:reports",
-  get_inventory_status: "read:inventory",
-  get_recent_orders: "read:orders",
-  get_order_by_number: "read:orders",
-  get_menu_items: "read:inventory",
-  get_worker_sales_report: "read:reports",
-  get_expenses_report: "read:reports",
-  get_bank_summary: "read:reports",
-  get_current_shift: "read:reports",
-  add_inventory_restock: "write:inventory",
-  adjust_inventory_quantity: "write:inventory",
-  update_item_price: "write:prices",
-  update_extra_price: "write:prices",
-  mark_order_done: "write:orders",
-  void_order: "write:orders",
-  add_expense: "write:expenses",
-  change_shift: "write:shift",
-};
-
-function getEnv(...names) {
-  for (const name of names) {
-    if (process.env[name]) return process.env[name];
-  }
-  return "";
-}
-
-function publicAppUrl() {
-  return (process.env.TUX_PUBLIC_APP_URL || DEFAULT_APP_URL).replace(/\/+$/, "");
-}
-
-function json(res, statusCode, body) {
-  res.statusCode = statusCode;
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.end(JSON.stringify(body));
-}
-
-function applyCors(req, res) {
-  const allowed = process.env.TUX_MCP_ALLOWED_ORIGIN || "";
-  const origin = req.headers.origin || "";
-  if (allowed === "*" || (allowed && origin === allowed)) {
-    res.setHeader("Access-Control-Allow-Origin", allowed === "*" ? "*" : origin);
-  } else if (!allowed && origin) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-  }
-  res.setHeader("Access-Control-Allow-Credentials", "true");
-  res.setHeader("Access-Control-Allow-Headers", "authorization, content-type");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-}
-
-function handleOptions(req, res) {
-  applyCors(req, res);
-  if (req.method === "OPTIONS") {
-    res.statusCode = 204;
-    res.end();
-    return true;
-  }
-  return false;
-}
-
-async function readBody(req) {
-  if (req.body && typeof req.body === "object") return req.body;
-  if (typeof req.body === "string") {
-    try {
-      return JSON.parse(req.body);
-    } catch {
-      return {};
-    }
-  }
-  return new Promise((resolve) => {
-    let raw = "";
-    req.on("data", (chunk) => {
-      raw += chunk;
-    });
-    req.on("end", () => {
-      if (!raw) return resolve({});
-      try {
-        resolve(JSON.parse(raw));
-      } catch {
-        resolve({});
-      }
-    });
-  });
-}
-
-function supabaseAdmin() {
-  const url = getEnv("SUPABASE_URL", "VITE_SUPABASE_URL", "REACT_APP_SUPABASE_URL");
-  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
-  if (!url || !serviceRoleKey) {
-    throw new Error("Server Supabase credentials are not configured.");
-  }
-  return createClient(url, serviceRoleKey, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-}
-
-function requirePepper() {
-  const pepper = process.env.TUX_MCP_TOKEN_PEPPER || "";
-  if (!pepper || pepper.length < 16) {
-    throw new Error("TUX_MCP_TOKEN_PEPPER must be configured server-side.");
-  }
-  return pepper;
-}
-
-function hashToken(token) {
-  return crypto
-    .createHash("sha256")
-    .update(String(token || ""))
-    .update(":")
-    .update(requirePepper())
-    .digest("hex");
-}
-
-function generateToken() {
-  return `${TOKEN_PREFIX}${crypto.randomBytes(32).toString("base64url")}`;
-}
-
-function displayPrefix(token) {
-  const raw = String(token || "");
-  return `${raw.slice(0, TOKEN_PREFIX.length + 8)}...`;
-}
-
-function normalizeScopes(scopes) {
-  const arr = Array.isArray(scopes) ? scopes : DEFAULT_ADMIN_SCOPES;
-  const clean = arr
-    .map((scope) => String(scope || "").trim().toLowerCase())
-    .filter((scope) =>
-      [
-        "read",
-        "write",
-        "admin",
-        "read:orders",
-        "read:inventory",
-        "read:reports",
-        "write:inventory",
-        "write:orders",
-        "write:expenses",
-        "write:prices",
-        "write:shift",
-      ].includes(scope)
-    );
-  return clean.length ? Array.from(new Set(clean)) : DEFAULT_ADMIN_SCOPES;
-}
-
-function hasScope(scopes, required) {
-  const set = new Set(normalizeScopes(scopes));
-  if (!required) return true;
-  if (set.has("admin")) return true;
-  if (required.startsWith("read:")) return set.has(required) || set.has("read") || set.has("write");
-  if (required.startsWith("write:")) return set.has(required) || set.has("write");
-  if (required === "read") return set.has("read") || set.has("write") || hasAnyScope(set, "read:");
-  if (required === "write") return set.has("write") || hasAnyScope(set, "write:");
-  return set.has(required);
-}
-
-function hasAnyScope(scopeSet, prefix) {
-  for (const scope of scopeSet) {
-    if (scope.startsWith(prefix)) return true;
-  }
-  return false;
-}
-
-function adminPasscodePepper() {
-  return process.env.TUX_ADMIN_PASSCODE_PEPPER || DEFAULT_ADMIN_PASSCODE_PEPPER;
-}
-
-function hashAdminPasscode(adminId, passcode, pepper = adminPasscodePepper()) {
-  return crypto
-    .createHash("sha256")
-    .update(String(adminId || ""))
-    .update(":")
-    .update(String(passcode || ""))
-    .update(":")
-    .update(String(pepper || ""))
-    .digest("hex");
-}
-
-function safeAdminDefinition(adminId) {
-  const normalized = String(adminId || "").trim().toLowerCase().replace(/^admin(\d+)$/, "admin_$1");
-  return ADMIN_DEFINITIONS[normalized] || null;
-}
-
-function verifyAdminPasscode(adminId, passcode) {
-  const admin = safeAdminDefinition(adminId);
-  if (!admin) {
-    const err = new Error("Unknown admin.");
-    err.statusCode = 400;
-    throw err;
-  }
-  const expectedHash = process.env[admin.hashEnv] || admin.defaultPasscodeHash;
-  const actualHash = hashAdminPasscode(admin.id, passcode);
-  const expected = Buffer.from(String(expectedHash || ""), "hex");
-  const actual = Buffer.from(String(actualHash || ""), "hex");
-  if (!expected.length || expected.length !== actual.length || !crypto.timingSafeEqual(expected, actual)) {
-    const err = new Error("Invalid admin passcode.");
-    err.statusCode = 401;
-    throw err;
-  }
-  return admin;
-}
-
-function adminFromBody(body = {}) {
-  const adminId = body.admin_id || body.adminId || body.admin || "admin_1";
-  const passcode = body.admin_passcode || body.adminPasscode || body.passcode;
-  if (!passcode) {
-    const err = new Error("admin_passcode is required.");
-    err.statusCode = 401;
-    throw err;
-  }
-  return verifyAdminPasscode(adminId, passcode);
-}
-
-function tokenFromReq(req) {
-  const auth = req.headers.authorization || req.headers.Authorization || "";
-  const bearer = String(auth).match(/^Bearer\s+(.+)$/i);
-  if (bearer) return bearer[1].trim();
-
-  if (req.query && req.query.token) {
-    return Array.isArray(req.query.token) ? req.query.token[0] : req.query.token;
-  }
-
-  try {
-    const parsed = new URL(req.url, publicAppUrl());
-    return parsed.searchParams.get("token") || "";
-  } catch {
-    return "";
-  }
-}
-
-async function requireMcpAuth(req, options = {}) {
-  const token = tokenFromReq(req);
-  if (!token) {
-    const err = new Error("Missing MCP connection token.");
-    err.statusCode = 401;
-    throw err;
-  }
-
-  const supabase = supabaseAdmin();
-  const tokenHash = hashToken(token);
-  const { data, error } = await supabase
-    .from("mcp_connection_tokens")
-    .select("id, shop_id, admin_id, admin_name, scopes, active, revoked_at, expires_at")
-    .eq("token_hash", tokenHash)
-    .eq("shop_id", SHOP_ID)
-    .maybeSingle();
-
-  if (error) throw error;
-  if (!data || data.active === false || data.revoked_at) {
-    const err = new Error("Invalid or revoked MCP connection token.");
-    err.statusCode = 401;
-    throw err;
-  }
-  if (data.expires_at && new Date(data.expires_at).getTime() <= Date.now()) {
-    const err = new Error("Expired MCP connection token.");
-    err.statusCode = 401;
-    throw err;
-  }
-
-  const requiredScope = options.requiredScope || "read";
-  if (!hasScope(data.scopes, requiredScope)) {
-    const err = new Error(`MCP token is missing required ${requiredScope} scope.`);
-    err.statusCode = 403;
-    throw err;
-  }
-
-  await supabase
-    .from("mcp_connection_tokens")
-    .update({ last_used_at: new Date().toISOString() })
-    .eq("id", data.id);
-
-  const context = {
-    adminId: data.admin_id || "unknown_admin",
-    adminName: data.admin_name || "Unknown Admin",
-    scopes: normalizeScopes(data.scopes),
-  };
-  req.mcpContext = context;
-
-  return {
-    supabase,
-    tokenRecord: data,
-    shopId: data.shop_id || SHOP_ID,
-    mcpContext: context,
-  };
-}
-
-async function loadShopState(supabase) {
-  const { data, error } = await supabase
-    .from("pos_state")
-    .select("state, write_seq")
-    .eq("id", POS_STATE_ID)
-    .eq("shop_id", SHOP_ID)
-    .maybeSingle();
-  if (error) throw error;
-  return {
-    state: data && data.state && typeof data.state === "object" ? data.state : {},
-    writeSeq: Number(data?.write_seq || 0),
-  };
-}
-
-async function saveShopState(supabase, state, writeSeq = 0) {
-  const nextSeq = Number(writeSeq || 0) + 1;
-  const payload = {
-    id: POS_STATE_ID,
-    shop_id: SHOP_ID,
-    state: {
-      ...(state || {}),
-      updatedAt: new Date().toISOString(),
-    },
-    writer_id: "mcp",
-    last_modified_device_id: "mcp",
-    write_seq: nextSeq,
-    client_time: Date.now(),
-  };
-
-  const { error } = await supabase.from("pos_state").upsert(payload, { onConflict: "id" });
-  if (error) throw error;
-  return payload.state;
-}
-
-async function fetchOrders(supabase, options = {}) {
-  const limit = Math.max(1, Math.min(Number(options.limit || 200), 500));
-  let query = supabase
-    .from("orders")
-    .select("*")
-    .eq("shop_id", SHOP_ID)
-    .order("date", { ascending: false, nullsFirst: false })
-    .order("created_at", { ascending: false })
-    .limit(limit);
-
-  if (options.orderNo != null) {
-    query = query.eq("order_no", Number(options.orderNo)).limit(1);
-  }
-  if (options.fromIso) query = query.gte("date", options.fromIso);
-  if (options.toIso) query = query.lte("date", options.toIso);
-
-  const { data, error } = await query;
-  if (error) throw error;
-  return (data || []).map((row) => {
-    try {
-      return normalizeOrderRow(row);
-    } catch (err) {
-      return {
-        id: row?.id || null,
-        orderNo: row?.order_no ?? row?.orderNo ?? null,
-        order_no: row?.order_no ?? row?.orderNo ?? null,
-        time: row?.date || row?.created_at || null,
-        worker: row?.worker || "",
-        payment: row?.payment || "",
-        orderType: row?.order_type || row?.orderType || "",
-        items: [],
-        cart: [],
-        extras: [],
-        done: Boolean(row?.done),
-        voided: Boolean(row?.voided),
-        malformed: true,
-        error: err.message || "Order row could not be normalized.",
-      };
-    }
-  });
-}
-
-function normalizeOrderRow(row = {}) {
-  const cart = safeArray(row.cart);
-  const paymentParts = safeArray(row.payment_parts ?? row.paymentParts);
-  return {
-    id: row.id,
-    orderNo: row.order_no ?? row.orderNo,
-    order_no: row.order_no ?? row.orderNo,
-    dayId: row.day_id || row.dayId || "",
-    time: row.date || row.created_at || row.createdAt || null,
-    date: row.date || row.created_at || row.createdAt || null,
-    createdAt: row.created_at || row.createdAt || null,
-    worker: row.worker || "",
-    payment: row.payment || "",
-    paymentMethod: row.payment || "",
-    paymentParts,
-    orderType: row.order_type || row.orderType || "",
-    deliveryFee: safeNumber(row.delivery_fee ?? row.deliveryFee),
-    deliveryName: row.delivery_name || row.deliveryName || "",
-    deliveryPhone: row.delivery_phone || row.deliveryPhone || "",
-    deliveryAddress: row.delivery_address || row.deliveryAddress || "",
-    itemsTotal: safeNumber(row.items_total ?? row.itemsTotal),
-    finalTotal: safeNumber(row.total ?? row.finalTotal),
-    total: safeNumber(row.total ?? row.finalTotal),
-    discountPercentage: safeNumber(row.discount_percentage ?? row.discountPercentage),
-    discountAmount: safeNumber(row.discount_amount ?? row.discountAmount),
-    done: Boolean(row.done),
-    voided: Boolean(row.voided),
-    voidReason: row.void_reason || row.voidReason || "",
-    note: row.note || "",
-    items: cart,
-    cart,
-    extras: collectExtras(cart),
-  };
-}
-
-function normalizeStateOrder(order = {}) {
-  return normalizeOrderRow({
-    ...order,
-    order_no: order.orderNo ?? order.order_no,
-    payment_parts: order.paymentParts || order.payment_parts,
-    order_type: order.orderType || order.order_type,
-    delivery_fee: order.deliveryFee || order.delivery_fee,
-    delivery_name: order.deliveryName || order.delivery_name,
-    delivery_phone: order.deliveryPhone || order.delivery_phone,
-    delivery_address: order.deliveryAddress || order.delivery_address,
-    items_total: order.itemsTotal || order.items_total,
-    discount_percentage: order.discountPercentage || order.discount_percentage,
-    discount_amount: order.discountAmount || order.discount_amount,
-    void_reason: order.voidReason || order.void_reason,
-    total: order.total || order.finalTotal,
-    date: order.date,
-    cart: order.cart,
-  });
-}
-
-function safeArray(value) {
-  if (Array.isArray(value)) return value.filter((item) => item && typeof item === "object");
-  if (typeof value === "string" && value.trim()) {
-    try {
-      const parsed = JSON.parse(value);
-      return Array.isArray(parsed) ? parsed.filter((item) => item && typeof item === "object") : [];
-    } catch {
-      return [];
-    }
-  }
-  return [];
-}
-
-function safeNumber(value) {
-  const n = Number(value ?? 0);
-  return Number.isFinite(n) ? n : 0;
-}
-
-function collectExtras(cart = []) {
-  const extras = [];
-  for (const line of cart || []) {
-    if (!line || typeof line !== "object") continue;
-    if (line?.itemType === "extra" || line?.extraId || line?.extra_id) {
-      extras.push(line);
-    }
-    if (Array.isArray(line?.extras)) {
-      extras.push(...line.extras.filter((extra) => extra && typeof extra === "object"));
-    }
-  }
-  return extras;
-}
-
-function dateWindowFor(state = {}, date) {
-  if (date) {
-    const start = new Date(`${date}T00:00:00.000`);
-    const end = new Date(`${date}T23:59:59.999`);
-    if (Number.isNaN(+start)) throw new Error("Invalid date. Use YYYY-MM-DD.");
-    return { fromIso: start.toISOString(), toIso: end.toISOString() };
-  }
-
-  const dayMeta = state.dayMeta || {};
-  if (dayMeta.startedAt && !dayMeta.endedAt) {
-    return {
-      fromIso: new Date(dayMeta.startedAt).toISOString(),
-      toIso: new Date().toISOString(),
-    };
-  }
-
-  const now = new Date();
-  const yyyy = now.getFullYear();
-  const mm = String(now.getMonth() + 1).padStart(2, "0");
-  const dd = String(now.getDate()).padStart(2, "0");
-  return dateWindowFor(state, `${yyyy}-${mm}-${dd}`);
-}
-
-function sameDate(value, date) {
-  if (!date) return true;
-  const d = new Date(value);
-  if (Number.isNaN(+d)) return false;
-  return d.toISOString().slice(0, 10) === date;
-}
-
-function money(value) {
-  return Number((Number(value || 0) || 0).toFixed(2));
-}
-
-function paymentBreakdown(orders = []) {
-  const out = {};
-  for (const order of orders) {
-    const total = money(order.total || order.finalTotal);
-    const parts = Array.isArray(order.paymentParts) ? order.paymentParts : [];
-    if (parts.length) {
-      for (const part of parts) {
-        const method = String(part.method || part.name || order.payment || "Unknown");
-        out[method] = money((out[method] || 0) + Number(part.amount || 0));
-      }
-    } else {
-      const method = order.payment || "Unknown";
-      out[method] = money((out[method] || 0) + total);
-    }
-  }
-  return out;
-}
-
-function workerBreakdown(orders = []) {
-  const map = new Map();
-  for (const order of orders) {
-    const worker = order.worker || "Unknown";
-    if (!map.has(worker)) {
-      map.set(worker, {
-        worker,
-        order_count: 0,
-        revenue_excluding_delivery: 0,
-        revenue_including_delivery: 0,
-        payment_breakdown: {},
-      });
-    }
-    const row = map.get(worker);
-    row.order_count += 1;
-    row.revenue_excluding_delivery = money(row.revenue_excluding_delivery + Number(order.itemsTotal || 0));
-    row.revenue_including_delivery = money(row.revenue_including_delivery + Number(order.total || order.finalTotal || 0));
-    const pb = paymentBreakdown([order]);
-    for (const [method, amount] of Object.entries(pb)) {
-      row.payment_breakdown[method] = money((row.payment_breakdown[method] || 0) + amount);
-    }
-  }
-  return Array.from(map.values());
-}
-
-function topItems(orders = []) {
-  const map = new Map();
-  for (const order of orders) {
-    for (const line of order.cart || []) {
-      if (!line || typeof line !== "object") continue;
-      const name = line.name || line.title || line.id || "Unknown item";
-      const qty = Number(line.qty || line.quantity || 1) || 1;
-      const price = Number(line.price || 0) || 0;
-      if (!map.has(name)) map.set(name, { name, qty: 0, total: 0 });
-      const row = map.get(name);
-      row.qty += qty;
-      row.total = money(row.total + qty * price);
-    }
-  }
-  return Array.from(map.values()).sort((a, b) => b.qty - a.qty).slice(0, 10);
-}
-
-function inventoryRows(state = {}) {
-  const inventory = Array.isArray(state.inventory) ? state.inventory : [];
-  const ledger = Array.isArray(state.inventoryLedger) ? state.inventoryLedger : [];
-  if (!ledger.length) return inventory;
-  const ledgerSums = {};
-  for (const row of ledger) {
-    const itemId = row.itemId || row.item_id;
-    if (!itemId) continue;
-    ledgerSums[itemId] = (ledgerSums[itemId] || 0) + (Number(row.qty) || 0);
-  }
-  return inventory.map((item) => ({
-    ...item,
-    qty: money(Number(item.qty || 0) + Number(ledgerSums[item.id] || 0)),
-  }));
-}
-
-function safeInput(input = {}) {
-  const copy = { ...(input || {}) };
-  delete copy.admin_secret;
-  delete copy.adminSecret;
-  delete copy.admin_passcode;
-  delete copy.adminPasscode;
-  delete copy.passcode;
-  delete copy.token;
-  return copy;
-}
-
-async function audit(supabase, auth, toolName, actionType, input, success, errorMessage, beforeState, afterState) {
-  try {
-    await supabase.from("mcp_audit_logs").insert({
-      shop_id: auth?.shopId || SHOP_ID,
-      token_id: auth?.tokenRecord?.id || null,
-      admin_id: auth?.mcpContext?.adminId || null,
-      admin_name: auth?.mcpContext?.adminName || null,
-      tool_name: toolName,
-      action_type: actionType,
-      input_summary: safeInput(input),
-      payload: safeInput(input),
-      before_state: sanitizeAuditState(beforeState),
-      after_state: sanitizeAuditState(afterState),
-      success: Boolean(success),
-      error: errorMessage || null,
-    });
-  } catch (err) {
-    console.warn("MCP audit log failed:", err.message || err);
-  }
-}
-
-function sanitizeAuditState(value) {
-  if (value === undefined) return null;
-  return sanitizeForAudit(value);
-}
-
-function sanitizeForAudit(value) {
-  if (value == null) return value;
-  if (Array.isArray(value)) return value.slice(0, 25).map(sanitizeForAudit);
-  if (typeof value === "object") {
-    const out = {};
-    for (const [key, inner] of Object.entries(value)) {
-      if (/token|secret|passcode|password|pin/i.test(key)) continue;
-      out[key] = sanitizeForAudit(inner);
-    }
-    return out;
-  }
-  return value;
-}
-
-function getToolDefinitions() {
-  const readOnly = "Requires a valid MCP connection token with the matching read scope.";
-  const write = "Requires a valid MCP connection token with the matching write scope. The admin identity is resolved from the token.";
-  return [
-    {
-      name: "get_connection_info",
-      description: "Returns the connected MCP admin identity and scopes for this token.",
-      inputSchema: { type: "object", properties: {} },
-    },
-    {
-      name: "get_today_sales_report",
-      description: `${readOnly} Returns current business day or selected date sales totals.`,
-      inputSchema: {
-        type: "object",
-        properties: { date: { type: "string", description: "Optional YYYY-MM-DD date." } },
-      },
-    },
-    {
-      name: "get_inventory_status",
-      description: `${readOnly} Returns inventory quantities and low-stock warnings.`,
-      inputSchema: { type: "object", properties: {} },
-    },
-    {
-      name: "get_recent_orders",
-      description: `${readOnly} Returns recent orders with cart, payment, worker, done, and voided status.`,
-      inputSchema: {
-        type: "object",
-        properties: {
-          limit: { type: "number", default: 20 },
-          status: { type: "string", enum: ["active", "done", "voided", "all"], default: "all" },
-        },
-      },
-    },
-    {
-      name: "get_order_by_number",
-      description: `${readOnly} Returns full order details for one order number.`,
-      inputSchema: {
-        type: "object",
-        required: ["order_no"],
-        properties: { order_no: { type: "number" } },
-      },
-    },
-    {
-      name: "get_menu_items",
-      description: `${readOnly} Returns menu items, extras, beverages, prices, and consumption mapping.`,
-      inputSchema: { type: "object", properties: {} },
-    },
-    {
-      name: "get_worker_sales_report",
-      description: `${readOnly} Returns sales totals grouped by worker.`,
-      inputSchema: {
-        type: "object",
-        properties: {
-          worker_name: { type: "string" },
-          date: { type: "string", description: "Optional YYYY-MM-DD date." },
-        },
-      },
-    },
-    {
-      name: "get_expenses_report",
-      description: `${readOnly} Returns expenses and totals for a date or current business day.`,
-      inputSchema: {
-        type: "object",
-        properties: { date: { type: "string", description: "Optional YYYY-MM-DD date." } },
-      },
-    },
-    {
-      name: "get_bank_summary",
-      description: `${readOnly} Returns current bank total and recent bank transactions.`,
-      inputSchema: { type: "object", properties: {} },
-    },
-    {
-      name: "get_current_shift",
-      description: `${readOnly} Returns current worker, shift status, and shift changes.`,
-      inputSchema: { type: "object", properties: {} },
-    },
-    {
-      name: "add_inventory_restock",
-      description: `${write} Adds a positive restock amount to an inventory item.`,
-      inputSchema: {
-        type: "object",
-        required: ["item", "quantity", "unit"],
-        properties: {
-          item: { type: "string" },
-          quantity: { type: "number" },
-          unit: { type: "string" },
-          worker_name: { type: "string" },
-          note: { type: "string" },
-        },
-      },
-    },
-    {
-      name: "adjust_inventory_quantity",
-      description: `${write} Sets or adjusts inventory quantity while preventing invalid negative final stock.`,
-      inputSchema: {
-        type: "object",
-        required: ["item", "unit", "reason"],
-        properties: {
-          item: { type: "string" },
-          new_quantity: { type: "number" },
-          delta: { type: "number" },
-          unit: { type: "string" },
-          reason: { type: "string" },
-        },
-      },
-    },
-    {
-      name: "update_item_price",
-      description: `${write} Updates a menu item price.`,
-      inputSchema: {
-        type: "object",
-        required: ["new_price"],
-        properties: {
-          item_id: { type: "string" },
-          item_name: { type: "string" },
-          new_price: { type: "number" },
-        },
-      },
-    },
-    {
-      name: "update_extra_price",
-      description: `${write} Updates an extra price.`,
-      inputSchema: {
-        type: "object",
-        required: ["new_price"],
-        properties: {
-          extra_id: { type: "string" },
-          extra_name: { type: "string" },
-          new_price: { type: "number" },
-        },
-      },
-    },
-    {
-      name: "mark_order_done",
-      description: `${write} Marks an order as done.`,
-      inputSchema: {
-        type: "object",
-        required: ["order_no"],
-        properties: { order_no: { type: "number" } },
-      },
-    },
-    {
-      name: "void_order",
-      description: `${write} Voids an order with a reason. Dangerous reset/delete tools are not provided.`,
-      inputSchema: {
-        type: "object",
-        required: ["order_no", "reason"],
-        properties: {
-          order_no: { type: "number" },
-          reason: { type: "string" },
-        },
-      },
-    },
-    {
-      name: "add_expense",
-      description: `${write} Adds an expense row to POS state.`,
-      inputSchema: {
-        type: "object",
-        required: ["name", "qty", "unit_price"],
-        properties: {
-          name: { type: "string" },
-          unit: { type: "string" },
-          qty: { type: "number" },
-          unit_price: { type: "number" },
-          note: { type: "string" },
-          worker_name: { type: "string" },
-        },
-      },
-    },
-    {
-      name: "change_shift",
-      description: `${write} Closes open worker sessions and starts a new worker shift in day metadata.`,
-      inputSchema: {
-        type: "object",
-        required: ["to_worker"],
-        properties: {
-          from_worker: { type: "string" },
-          to_worker: { type: "string" },
-        },
-      },
-    },
-  ];
-}
-
-async function callTool(req, toolName, input = {}) {
-  const requiredScope = TOOL_SCOPES[toolName] || (WRITE_TOOL_NAMES.has(toolName) ? "write" : "read");
-  const auth = await requireMcpAuth(req, { requiredScope });
-  const { supabase } = auth;
-
-  try {
-    const result = await executeTool(supabase, toolName, input, auth);
-    const auditInfo = result && result.__audit ? result.__audit : {};
-    if (result && result.__audit) delete result.__audit;
-    if (WRITE_TOOL_NAMES.has(toolName)) {
-      await audit(
-        supabase,
-        auth,
-        toolName,
-        "write",
-        input,
-        true,
-        null,
-        auditInfo.beforeState,
-        auditInfo.afterState
-      );
-    }
-    return result;
-  } catch (err) {
-    if (WRITE_TOOL_NAMES.has(toolName)) {
-      await audit(supabase, auth, toolName, "write", input, false, err.message || String(err));
-    }
-    throw err;
-  }
-}
-
-async function executeTool(supabase, toolName, input = {}, auth = {}) {
-  const { state, writeSeq } = await loadShopState(supabase);
-
-  if (toolName === "get_connection_info") {
-    const scopes = auth.mcpContext?.scopes || [];
-    return {
-      connected: true,
-      admin_id: auth.mcpContext?.adminId || "unknown_admin",
-      admin_name: auth.mcpContext?.adminName || "Unknown Admin",
-      scopes,
-      can_write: scopes.some((scope) => scope === "write" || scope === "admin" || scope.startsWith("write:")),
-    };
-  }
-
-  if (toolName === "get_today_sales_report") {
-    const window = dateWindowFor(state, input.date);
-    const orders = (await fetchOrders(supabase, { ...window, limit: 500 })).filter((o) => !o.voided);
-    const expenses = expensesForDate(state, input.date);
-    const grossItems = money(orders.reduce((sum, o) => sum + Number(o.itemsTotal || 0), 0));
-    const deliveryFees = money(orders.reduce((sum, o) => sum + Number(o.deliveryFee || 0), 0));
-    return {
-      business_day_id: state.dayMeta?.dayId || "",
-      started_at: state.dayMeta?.startedAt || window.fromIso,
-      ended_at: state.dayMeta?.endedAt || null,
-      total_orders: orders.length,
-      gross_items_total: grossItems,
-      delivery_fees_total: deliveryFees,
-      revenue_excluding_delivery: grossItems,
-      revenue_including_delivery: money(grossItems + deliveryFees),
-      payment_breakdown: paymentBreakdown(orders),
-      worker_breakdown: workerBreakdown(orders),
-      top_items: topItems(orders),
-      voided_orders_count: (await fetchOrders(supabase, { ...window, limit: 500 })).filter((o) => o.voided).length,
-      expenses_total: money(expenses.reduce((sum, e) => sum + expenseAmount(e), 0)),
-      estimated_margin: money(grossItems - expenses.reduce((sum, e) => sum + expenseAmount(e), 0)),
-    };
-  }
-
-  if (toolName === "get_inventory_status") {
-    const inventory = inventoryRows(state);
-    return {
-      inventory,
-      low_stock_warnings: inventory.filter((item) => Number(item.qty || 0) <= Number(item.minQty || 0)),
-      locked: Boolean(state.inventoryLocked),
-      last_updated: state.updatedAt || null,
-    };
-  }
-
-  if (toolName === "get_recent_orders") {
-    const limit = Math.max(1, Math.min(Number(input.limit || 20), 100));
-    let orders = await fetchOrders(supabase, { limit });
-    const status = input.status || "all";
-    if (status === "active") orders = orders.filter((o) => !o.done && !o.voided);
-    if (status === "done") orders = orders.filter((o) => o.done && !o.voided);
-    if (status === "voided") orders = orders.filter((o) => o.voided);
-    return orders.slice(0, limit);
-  }
-
-  if (toolName === "get_order_by_number") {
-    const orderNo = Number(input.order_no ?? input.orderNo);
-    if (!Number.isInteger(orderNo) || orderNo <= 0) throw new Error("order_no must be a positive integer.");
-    const [order] = await fetchOrders(supabase, { orderNo, limit: 1 });
-    if (!order) throw new Error(`Order ${orderNo} was not found.`);
-    return order;
-  }
-
-  if (toolName === "get_menu_items") {
-    return {
-      categories: state.purchaseCategories || [],
-      items: state.menu || [],
-      prices: (state.menu || []).map((item) => ({ id: item.id, name: item.name, price: item.price })),
-      extras: state.extras || state.extraList || [],
-      beverages: state.beverages || state.beverageList || [],
-      order_types: state.orderTypes || [],
-      default_delivery_fee: state.defaultDeliveryFee || 0,
-    };
-  }
-
-  if (toolName === "get_worker_sales_report") {
-    const window = dateWindowFor(state, input.date);
-    let orders = (await fetchOrders(supabase, { ...window, limit: 500 })).filter((o) => !o.voided);
-    if (input.worker_name) {
-      const wanted = String(input.worker_name).toLowerCase();
-      orders = orders.filter((o) => String(o.worker || "").toLowerCase() === wanted);
-    }
-    return { workers: workerBreakdown(orders) };
-  }
-
-  if (toolName === "get_expenses_report") {
-    const expenses = expensesForDate(state, input.date);
-    return {
-      expenses,
-      total_expenses: money(expenses.reduce((sum, e) => sum + expenseAmount(e), 0)),
-      grouped_totals: groupExpenses(expenses),
-    };
-  }
-
-  if (toolName === "get_bank_summary") {
-    const tx = Array.isArray(state.bankTx) ? state.bankTx : [];
-    const total = money(tx.reduce((sum, row) => sum + Number(row.amount || 0), 0));
-    return {
-      current_bank_total: total,
-      recent_deposits: tx.filter((row) => Number(row.amount || 0) > 0).slice(0, 10),
-      recent_withdrawals: tx.filter((row) => Number(row.amount || 0) < 0).slice(0, 10),
-      recent_adjustments: tx.slice(0, 20),
-      last_end_day_auto_post: tx.find((row) => row.source === "auto_day_margin") || null,
-    };
-  }
-
-  if (toolName === "get_current_shift") {
-    const dayMeta = state.dayMeta || {};
-    return {
-      current_worker: dayMeta.currentWorker || "",
-      started_at: dayMeta.startedAt || null,
-      ended_at: dayMeta.endedAt || null,
-      active: dayMeta.active === false ? false : Boolean(dayMeta.startedAt && !dayMeta.endedAt),
-      shift_changes: dayMeta.shiftChanges || [],
-      worker_sessions: state.workerSessions || [],
-      day_status: dayMeta.endedAt ? "ended" : dayMeta.startedAt ? "active" : "not_started",
-    };
-  }
-
-  if (toolName === "add_inventory_restock") {
-    const quantity = positiveNumber(input.quantity, "quantity");
-    const beforeItem = findInventoryItem(state, input.item);
-    const next = mutateInventory(state, input.item, (item) => ({
-      ...item,
-      qty: money(Number(item.qty || 0) + quantity),
-      unit: input.unit || item.unit,
-    }));
-    addInventoryLedger(
-      next,
-      input.item,
-      quantity,
-      input.unit,
-      input.worker_name || auth.mcpContext?.adminName || "",
-      input.note || "MCP restock"
-    );
-    const saved = await saveShopState(supabase, next, writeSeq);
-    const afterItem = findInventoryItem(saved, input.item);
-    return {
-      inventory: inventoryRows(saved),
-      item: afterItem,
-      admin_id: auth.mcpContext?.adminId,
-      admin_name: auth.mcpContext?.adminName,
-      __audit: { beforeState: beforeItem, afterState: afterItem },
-    };
-  }
-
-  if (toolName === "adjust_inventory_quantity") {
-    if (!input.reason) throw new Error("reason is required.");
-    const hasNewQuantity = input.new_quantity !== undefined && input.new_quantity !== null;
-    const hasDelta = input.delta !== undefined && input.delta !== null;
-    if (!hasNewQuantity && !hasDelta) throw new Error("Provide new_quantity or delta.");
-    const beforeItem = findInventoryItem(state, input.item);
-    const next = mutateInventory(state, input.item, (item) => {
-      const current = Number(item.qty || 0);
-      const finalQty = hasNewQuantity ? nonNegativeNumber(input.new_quantity, "new_quantity") : current + Number(input.delta || 0);
-      if (!Number.isFinite(finalQty) || finalQty < 0) throw new Error("Final inventory quantity cannot be negative.");
-      return { ...item, qty: money(finalQty), unit: input.unit || item.unit };
-    });
-    addInventoryLedger(next, input.item, Number(input.delta || 0), input.unit, auth.mcpContext?.adminName || "", input.reason);
-    const saved = await saveShopState(supabase, next, writeSeq);
-    const afterItem = findInventoryItem(saved, input.item);
-    return {
-      inventory: inventoryRows(saved),
-      item: afterItem,
-      admin_id: auth.mcpContext?.adminId,
-      admin_name: auth.mcpContext?.adminName,
-      __audit: { beforeState: beforeItem, afterState: afterItem },
-    };
-  }
-
-  if (toolName === "update_item_price") {
-    const price = positiveNumber(input.new_price, "new_price");
-    const beforeItem = findPricedItem(state.menu || [], input.item_id, input.item_name);
-    const next = { ...state };
-    next.menu = updatePricedList(next.menu || [], input.item_id, input.item_name, price, "item");
-    const saved = await saveShopState(supabase, next, writeSeq);
-    const afterItem = findPricedItem(saved.menu || [], input.item_id, input.item_name);
-    return { item: afterItem, __audit: { beforeState: beforeItem, afterState: afterItem } };
-  }
-
-  if (toolName === "update_extra_price") {
-    const price = nonNegativeNumber(input.new_price, "new_price");
-    const key = state.extras ? "extras" : "extraList";
-    const beforeExtra = findPricedItem(state[key] || [], input.extra_id, input.extra_name);
-    const next = { ...state, [key]: updatePricedList(state[key] || [], input.extra_id, input.extra_name, price, "extra") };
-    const saved = await saveShopState(supabase, next, writeSeq);
-    const afterExtra = findPricedItem(saved[key] || [], input.extra_id, input.extra_name);
-    return { extra: afterExtra, __audit: { beforeState: beforeExtra, afterState: afterExtra } };
-  }
-
-  if (toolName === "mark_order_done") {
-    const orderNo = positiveInteger(input.order_no ?? input.orderNo, "order_no");
-    const [beforeOrder] = await fetchOrders(supabase, { orderNo, limit: 1 });
-    const { data, error } = await supabase
-      .from("orders")
-      .update({ done: true, sync_status: "pending", last_modified_device_id: "mcp" })
-      .eq("shop_id", SHOP_ID)
-      .eq("order_no", orderNo)
-      .select("*")
-      .maybeSingle();
-    if (error) throw error;
-    if (!data) throw new Error(`Order ${orderNo} was not found.`);
-    await mirrorStateOrderDone(supabase, state, writeSeq, orderNo, { done: true });
-    const afterOrder = normalizeOrderRow(data);
-    return { ...afterOrder, __audit: { beforeState: beforeOrder, afterState: afterOrder } };
-  }
-
-  if (toolName === "void_order") {
-    const orderNo = positiveInteger(input.order_no ?? input.orderNo, "order_no");
-    if (!String(input.reason || "").trim()) throw new Error("reason is required.");
-    const [beforeOrder] = await fetchOrders(supabase, { orderNo, limit: 1 });
-    const { data, error } = await supabase
-      .from("orders")
-      .update({
-        voided: true,
-        void_reason: String(input.reason).trim(),
-        sync_status: "pending",
-        last_modified_device_id: "mcp",
-      })
-      .eq("shop_id", SHOP_ID)
-      .eq("order_no", orderNo)
-      .select("*")
-      .maybeSingle();
-    if (error) throw error;
-    if (!data) throw new Error(`Order ${orderNo} was not found.`);
-    await mirrorStateOrderDone(supabase, state, writeSeq, orderNo, {
-      voided: true,
-      voidReason: String(input.reason).trim(),
-    });
-    const afterOrder = normalizeOrderRow(data);
-    return { ...afterOrder, __audit: { beforeState: beforeOrder, afterState: afterOrder } };
-  }
-
-  if (toolName === "add_expense") {
-    const qty = positiveNumber(input.qty, "qty");
-    const unitPrice = nonNegativeNumber(input.unit_price, "unit_price");
-    const row = {
-      id: `mcp_expense_${Date.now()}`,
-      name: String(input.name || "").trim(),
-      unit: input.unit || "",
-      qty,
-      unitPrice,
-      note: input.note || "",
-      worker: input.worker_name || "",
-      date: new Date().toISOString(),
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      source: "mcp",
-      syncStatus: "pending",
-      lastModifiedDeviceId: "mcp",
-    };
-    if (!row.name) throw new Error("name is required.");
-    const next = { ...state, expenses: [row, ...(state.expenses || [])] };
-    const saved = await saveShopState(supabase, next, writeSeq);
-    return {
-      expense: row,
-      expenses_total: money((saved.expenses || []).reduce((sum, e) => sum + expenseAmount(e), 0)),
-      __audit: { beforeState: null, afterState: row },
-    };
-  }
-
-  if (toolName === "change_shift") {
-    const toWorker = String(input.to_worker || input.toWorker || "").trim();
-    if (!toWorker) throw new Error("to_worker is required.");
-    const at = new Date().toISOString();
-    const previousWorker = input.from_worker || state.dayMeta?.currentWorker || "";
-    const nextSessions = closeOpenSessions(state.workerSessions || [], previousWorker, at);
-    nextSessions.unshift({
-      id: `mcp_session_${Date.now()}`,
-      name: toWorker,
-      signInAt: at,
-      createdAt: at,
-      updatedAt: at,
-      source: "mcp",
-      syncStatus: "pending",
-      lastModifiedDeviceId: "mcp",
-    });
-    const nextDayMeta = {
-      ...(state.dayMeta || {}),
-      currentWorker: toWorker,
-      startedBy: state.dayMeta?.startedBy || toWorker,
-      startedAt: state.dayMeta?.startedAt || at,
-      endedAt: null,
-      active: true,
-      updatedAt: at,
-      shiftChanges: [
-        ...(state.dayMeta?.shiftChanges || []),
-        { at, fromWorker: previousWorker, toWorker, source: "mcp" },
-      ],
-    };
-    const saved = await saveShopState(supabase, { ...state, dayMeta: nextDayMeta, workerSessions: nextSessions }, writeSeq);
-    return {
-      dayMeta: saved.dayMeta,
-      workerSessions: saved.workerSessions,
-      __audit: {
-        beforeState: { dayMeta: state.dayMeta || {}, workerSessions: state.workerSessions || [] },
-        afterState: { dayMeta: saved.dayMeta, workerSessions: saved.workerSessions },
-      },
-    };
-  }
-
+const TOOL_SCOPES = Object.fromEntries([...READ_TOOL_NAMES].map((t)=>[t,"read:reports"]).concat([...WRITE_TOOL_NAMES].map((t)=>[t,"write"])));
+for (const t of ["get_recent_orders","get_order_board","get_order_by_number"]) TOOL_SCOPES[t] = "read:orders";
+for (const t of ["create_order","update_order","add_item_to_order","remove_item_from_order","mark_order_done","void_order","print_customer_receipt","print_kitchen_ticket"]) TOOL_SCOPES[t] = "write:orders";
+for (const t of ["get_inventory_status","get_inventory_lock_status","get_inventory_usage","get_inventory_movements","get_menu_items"]) TOOL_SCOPES[t] = "read:inventory";
+for (const t of ["add_inventory_restock","adjust_inventory_quantity","lock_inventory","unlock_inventory","update_inventory_usage","add_inventory_item","update_inventory_item","delete_inventory_item","disable_inventory_item","set_low_stock_threshold"]) TOOL_SCOPES[t] = "write:inventory";
+for (const t of ["update_item_price","update_extra_price","add_menu_item","update_menu_item","delete_menu_item","disable_menu_item","add_extra","update_extra","delete_extra","disable_extra","add_beverage","update_beverage","delete_beverage","disable_beverage","update_item_category","update_item_name","update_item_description","update_item_image","update_item_consumption_usage"]) TOOL_SCOPES[t] = "write:prices";
+for (const t of ["add_expense","update_expense","void_expense","delete_expense","add_bank_transaction","withdraw_from_bank","deposit_to_bank","adjust_bank_total"]) TOOL_SCOPES[t] = "write:expenses";
+for (const t of ["update_worker_list","add_worker","update_worker","disable_worker","update_payment_methods","update_order_types","update_default_delivery_fee","update_shop_settings","revoke_mcp_token","change_shift","start_day","end_day","start_shift","end_shift"]) TOOL_SCOPES[t] = "write:shift";
+TOOL_SCOPES.get_connection_info = "read:reports";
+
+function getEnv(...names){ for(const n of names){ if(process.env[n]) return process.env[n]; } return ""; }
+function publicAppUrl(){ return (process.env.TUX_PUBLIC_APP_URL || DEFAULT_APP_URL).replace(/\/+$/, ""); }
+function json(res, code, body){ res.statusCode=code; res.setHeader("Content-Type","application/json; charset=utf-8"); res.end(JSON.stringify(body)); }
+function applyCors(req,res){ const allowed=process.env.TUX_MCP_ALLOWED_ORIGIN||""; const origin=req.headers.origin||""; if(allowed==="*"||(allowed&&origin===allowed)) res.setHeader("Access-Control-Allow-Origin",allowed==="*"?"*":origin); else if(!allowed&&origin) res.setHeader("Access-Control-Allow-Origin",origin); res.setHeader("Access-Control-Allow-Credentials","true"); res.setHeader("Access-Control-Allow-Headers","authorization, content-type"); res.setHeader("Access-Control-Allow-Methods","GET, POST, OPTIONS"); }
+function handleOptions(req,res){ applyCors(req,res); if(req.method==="OPTIONS"){ res.statusCode=204; res.end(); return true; } return false; }
+async function readBody(req){ if(req.body&&typeof req.body==="object") return req.body; if(typeof req.body==="string"){ try{return JSON.parse(req.body);}catch{return{};} } return new Promise(resolve=>{ let raw=""; req.on("data",c=>raw+=c); req.on("end",()=>{ try{resolve(raw?JSON.parse(raw):{});}catch{resolve({});} }); }); }
+function supabaseAdmin(){ const url=getEnv("SUPABASE_URL","VITE_SUPABASE_URL","REACT_APP_SUPABASE_URL"); const key=process.env.SUPABASE_SERVICE_ROLE_KEY||""; if(!url||!key) throw new Error("Server Supabase credentials are not configured."); return createClient(url,key,{auth:{persistSession:false,autoRefreshToken:false}}); }
+function requirePepper(){ const p=process.env.TUX_MCP_TOKEN_PEPPER||""; if(!p||p.length<16) throw new Error("TUX_MCP_TOKEN_PEPPER must be configured server-side."); return p; }
+function hashToken(token){ return crypto.createHash("sha256").update(String(token||"")).update(":").update(requirePepper()).digest("hex"); }
+function generateToken(){ return `${TOKEN_PREFIX}${crypto.randomBytes(32).toString("base64url")}`; }
+function displayPrefix(token){ const raw=String(token||""); return `${raw.slice(0,TOKEN_PREFIX.length+8)}...`; }
+function normalizeScopes(scopes){ const arr=Array.isArray(scopes)?scopes:DEFAULT_ADMIN_SCOPES; const clean=arr.map(s=>String(s||"").trim().toLowerCase()).filter(s=>VALID_SCOPES.includes(s)); return clean.length?Array.from(new Set(clean)):DEFAULT_ADMIN_SCOPES; }
+function hasAnyScope(set,prefix){ for(const s of set){ if(s.startsWith(prefix)) return true; } return false; }
+function hasScope(scopes,required){ const set=new Set(normalizeScopes(scopes)); if(!required) return true; if(set.has("admin")) return true; if(required.startsWith("read:")) return set.has(required)||set.has("read")||set.has("write"); if(required.startsWith("write:")) return set.has(required)||set.has("write"); if(required==="read") return set.has("read")||set.has("write")||hasAnyScope(set,"read:"); if(required==="write") return set.has("write")||hasAnyScope(set,"write:"); return set.has(required); }
+function hashAdminPasscode(adminId,passcode,pepper=process.env.TUX_ADMIN_PASSCODE_PEPPER||DEFAULT_ADMIN_PASSCODE_PEPPER){ return crypto.createHash("sha256").update(String(adminId||"")).update(":").update(String(passcode||"")).update(":").update(String(pepper||"")).digest("hex"); }
+function safeAdminDefinition(adminId){ const id=String(adminId||"").trim().toLowerCase().replace(/^admin(\d+)$/, "admin_$1"); return ADMIN_DEFINITIONS[id]||null; }
+function verifyAdminPasscode(adminId,passcode){ const admin=safeAdminDefinition(adminId); if(!admin){ const e=new Error("Unknown admin."); e.statusCode=400; throw e; } const expected=Buffer.from(String(process.env[admin.hashEnv]||admin.defaultPasscodeHash||""),"hex"); const actual=Buffer.from(hashAdminPasscode(admin.id,passcode),"hex"); if(!expected.length||expected.length!==actual.length||!crypto.timingSafeEqual(expected,actual)){ const e=new Error("Invalid admin passcode."); e.statusCode=401; throw e; } return admin; }
+function adminFromBody(body={}){ const passcode=body.admin_passcode||body.adminPasscode||body.passcode; if(!passcode){ const e=new Error("admin_passcode is required."); e.statusCode=401; throw e; } return verifyAdminPasscode(body.admin_id||body.adminId||body.admin||"admin_1", passcode); }
+function tokenFromReq(req){ const auth=req.headers.authorization||req.headers.Authorization||""; const m=String(auth).match(/^Bearer\s+(.+)$/i); if(m) return m[1].trim(); if(req.query&&req.query.token) return Array.isArray(req.query.token)?req.query.token[0]:req.query.token; try{ return new URL(req.url, publicAppUrl()).searchParams.get("token")||""; }catch{return"";} }
+async function requireMcpAuth(req, options={}){ const token=tokenFromReq(req); if(!token){ const e=new Error("Missing MCP connection token."); e.statusCode=401; throw e; } const supabase=supabaseAdmin(); const {data,error}=await supabase.from("mcp_connection_tokens").select("id, shop_id, admin_id, admin_name, scopes, active, revoked_at, expires_at").eq("token_hash",hashToken(token)).eq("shop_id",SHOP_ID).maybeSingle(); if(error) throw error; if(!data||data.active===false||data.revoked_at){ const e=new Error("Invalid or revoked MCP connection token."); e.statusCode=401; throw e; } if(data.expires_at&&new Date(data.expires_at).getTime()<=Date.now()){ const e=new Error("Expired MCP connection token."); e.statusCode=401; throw e; } const required=options.requiredScope||"read"; if(!hasScope(data.scopes,required)){ const e=new Error(`MCP token is missing required ${required} scope.`); e.statusCode=403; throw e; } await supabase.from("mcp_connection_tokens").update({last_used_at:new Date().toISOString()}).eq("id",data.id); const mcpContext={adminId:data.admin_id||"unknown_admin", adminName:data.admin_name||"Unknown Admin", scopes:normalizeScopes(data.scopes)}; req.mcpContext=mcpContext; return {supabase, tokenRecord:data, shopId:data.shop_id||SHOP_ID, mcpContext}; }
+
+function num(v,d=0){ const n=Number(v); return Number.isFinite(n)?n:d; }
+function money(v){ return Number((num(v,0)).toFixed(2)); }
+function nonNeg(v,field){ const n=Number(v); if(!Number.isFinite(n)||n<0) throw new Error(`${field} must be greater than or equal to 0.`); return n; }
+function pos(v,field){ const n=Number(v); if(!Number.isFinite(n)||n<=0) throw new Error(`${field} must be greater than 0.`); return n; }
+function posInt(v,field){ const n=Number(v); if(!Number.isInteger(n)||n<=0) throw new Error(`${field} must be a positive integer.`); return n; }
+function nowIso(){ return new Date().toISOString(); }
+function safeArray(v){ if(Array.isArray(v)) return v.filter(x=>x&&typeof x==="object"); if(typeof v==="string"&&v.trim()){ try{ const p=JSON.parse(v); return Array.isArray(p)?p.filter(x=>x&&typeof x==="object"):[]; }catch{return [];} } return []; }
+function asId(v){ return String(v||"").trim().toLowerCase(); }
+function compactText(v){ return String(v||"").trim(); }
+function omitSecrets(value){ if(value==null) return value; if(Array.isArray(value)) return value.slice(0,50).map(omitSecrets); if(typeof value==="object"){ const out={}; for(const [k,v] of Object.entries(value)){ if(/token|secret|passcode|password|pin|hash/i.test(k)) continue; out[k]=omitSecrets(v); } return out; } return value; }
+function safeInput(input={}){ return omitSecrets(input); }
+
+async function loadShopState(supabase){ const {data,error}=await supabase.from("pos_state").select("state, write_seq").eq("id",POS_STATE_ID).eq("shop_id",SHOP_ID).maybeSingle(); if(error) throw error; return {state:data&&data.state&&typeof data.state==="object"?data.state:{}, writeSeq:num(data?.write_seq,0)}; }
+async function saveShopState(supabase,state,writeSeq=0){ const nextSeq=num(writeSeq,0)+1; const payload={id:POS_STATE_ID,shop_id:SHOP_ID,state:{...(state||{}),updatedAt:nowIso()},writer_id:"mcp",last_modified_device_id:"mcp",write_seq:nextSeq,client_time:Date.now()}; const {error}=await supabase.from("pos_state").upsert(payload,{onConflict:"id"}); if(error) throw error; return payload.state; }
+async function audit(supabase,auth,tool,input,success,errorMessage,beforeState,afterState){ if(!WRITE_TOOL_NAMES.has(tool)) return; try{ await supabase.from("mcp_audit_logs").insert({shop_id:auth?.shopId||SHOP_ID,token_id:auth?.tokenRecord?.id||null,admin_id:auth?.mcpContext?.adminId||null,admin_name:auth?.mcpContext?.adminName||null,tool_name:tool,action_type:"write",input_summary:safeInput(input),payload:safeInput(input),before_state:omitSecrets(beforeState),after_state:omitSecrets(afterState),success:Boolean(success),error:errorMessage||null}); }catch(err){ console.warn("MCP audit log failed:",err.message||err); } }
+
+function normalizeOrderRow(row={}){ const cart=safeArray(row.cart); const itemsTotal=money(row.items_total??row.itemsTotal??cart.reduce((s,l)=>s+lineTotal(l),0)); const deliveryFee=money(row.delivery_fee??row.deliveryFee); const total=money(row.total??row.finalTotal??itemsTotal+deliveryFee); return { id:row.id||row.cloudId||null, cloudId:row.id||row.cloudId||null, orderNo:row.order_no??row.orderNo, order_no:row.order_no??row.orderNo, dayId:row.day_id||row.dayId||"", time:row.date||row.created_at||row.createdAt||null, date:row.date||row.created_at||row.createdAt||null, createdAt:row.created_at||row.createdAt||null, updatedAt:row.updated_at||row.updatedAt||null, worker:row.worker||"", payment:row.payment||row.paymentMethod||"", paymentMethod:row.payment||row.paymentMethod||"", paymentParts:safeArray(row.payment_parts??row.paymentParts), orderType:row.order_type||row.orderType||"", deliveryFee, itemsTotal, finalTotal:total, total, done:Boolean(row.done), voided:Boolean(row.voided), voidReason:row.void_reason||row.voidReason||"", note:row.note||"", cart, items:cart, extras:collectExtras(cart), syncStatus:row.sync_status||row.syncStatus||"", lastModifiedDeviceId:row.last_modified_device_id||row.lastModifiedDeviceId||"" }; }
+function compactOrder(o){ return { id:o.id, order_no:o.orderNo, orderNo:o.orderNo, time:o.time, worker:o.worker||"", payment:o.payment||"", order_type:o.orderType||"", items_total:o.itemsTotal, delivery_fee:o.deliveryFee, total:o.total, done:Boolean(o.done), voided:Boolean(o.voided), void_reason:o.voidReason||"", note:o.note||"", items:safeArray(o.cart).map(l=>({ id:l.id||l.itemId||l.item_id||null, name:l.name||l.title||"Unknown item", qty:num(l.qty??l.quantity,1), price:money(l.price), extras:safeArray(l.extras).map(e=>({id:e.id||e.extraId||e.extra_id||null,name:e.name||e.title||"Extra",qty:num(e.qty??e.quantity,1),price:money(e.price)})), note:l.note||"", total:lineTotal(l) })) }; }
+function lineTotal(l={}){ const q=num(l.qty??l.quantity,1); const base=num(l.price,0); const extras=safeArray(l.extras).reduce((s,e)=>s+num(e.price,0)*num(e.qty??e.quantity,1),0); return money(q*(base+extras)); }
+function collectExtras(cart=[]){ const out=[]; for(const l of safeArray(cart)){ if(l.itemType==="extra"||l.extraId||l.extra_id) out.push(l); out.push(...safeArray(l.extras)); } return out; }
+function orderDateMs(o){ const ms=+new Date(o.date||o.createdAt||o.time||0); return Number.isFinite(ms)?ms:0; }
+async function fetchOrders(supabase,options={}){ const limit=Math.max(1,Math.min(num(options.limit,200),500)); let q=supabase.from("orders").select("*").eq("shop_id",SHOP_ID).order("created_at",{ascending:false}).limit(limit); if(options.orderNo!=null) q=q.eq("order_no",Number(options.orderNo)).limit(1); if(options.fromIso) q=q.gte("date",options.fromIso); if(options.toIso) q=q.lte("date",options.toIso); const {data,error}=await q; if(error) throw error; return (data||[]).map(r=>{ try{return normalizeOrderRow(r);}catch(err){ return {id:r?.id||null,orderNo:r?.order_no??r?.orderNo??null,order_no:r?.order_no??r?.orderNo??null,time:r?.date||r?.created_at||null,worker:r?.worker||"",payment:r?.payment||"",cart:[],items:[],done:Boolean(r?.done),voided:Boolean(r?.voided),malformed:true,error:err.message||"Malformed order row"}; }}).sort((a,b)=>orderDateMs(b)-orderDateMs(a)); }
+function filterStatus(orders,status="all"){ if(status==="active") return orders.filter(o=>!o.done&&!o.voided); if(status==="done") return orders.filter(o=>o.done&&!o.voided); if(status==="voided") return orders.filter(o=>o.voided); return orders; }
+async function getBoard(supabase,input={}){ const limit=Math.max(1,Math.min(num(input.limit,50),150)); const orders=filterStatus(await fetchOrders(supabase,{limit:Math.max(limit,100)}), input.status||"all").slice(0,limit); return { total_returned:orders.length, active_count:orders.filter(o=>!o.done&&!o.voided).length, done_count:orders.filter(o=>o.done&&!o.voided).length, voided_count:orders.filter(o=>o.voided).length, orders:orders.map(compactOrder) }; }
+
+function dateWindowFor(state={},date){ if(date){ const start=new Date(`${date}T00:00:00.000Z`); const end=new Date(`${date}T23:59:59.999Z`); if(Number.isNaN(+start)) throw new Error("Invalid date. Use YYYY-MM-DD."); return {fromIso:start.toISOString(),toIso:end.toISOString(),key:date}; } const d=new Date(); return dateWindowFor(state,d.toISOString().slice(0,10)); }
+function monthWindow(month){ const raw=month||new Date().toISOString().slice(0,7); if(!/^\d{4}-\d{2}$/.test(raw)) throw new Error("month must be YYYY-MM."); const [y,m]=raw.split("-").map(Number); const start=new Date(Date.UTC(y,m-1,1)); const end=new Date(Date.UTC(y,m,1)-1); return {fromIso:start.toISOString(),toIso:end.toISOString(),key:raw}; }
+function yearWindow(year){ const y=Number(year||new Date().getUTCFullYear()); if(!Number.isInteger(y)||y<2000||y>2200) throw new Error("year must be valid."); return {fromIso:new Date(Date.UTC(y,0,1)).toISOString(),toIso:new Date(Date.UTC(y+1,0,1)-1).toISOString(),key:String(y)}; }
+function rangeWindow(input){ if(!input.start_date||!input.end_date) throw new Error("start_date and end_date are required."); const start=new Date(`${input.start_date}T00:00:00.000Z`); const end=new Date(`${input.end_date}T23:59:59.999Z`); if(Number.isNaN(+start)||Number.isNaN(+end)||start>end) throw new Error("Invalid date range."); return {fromIso:start.toISOString(),toIso:end.toISOString(),key:`${input.start_date}_${input.end_date}`}; }
+function expenseAmount(e={}){ if(e.voided||e.deleted||e.archived) return 0; if(e.amount!=null) return num(e.amount,0); return num(e.qty,0)*num(e.unitPrice??e.unit_price,0); }
+function expensesForWindow(state={},window){ const from=+new Date(window.fromIso); const to=+new Date(window.toIso); return safeArray(state.expenses).filter(e=>{ if(e.voided||e.deleted) return false; const ms=+new Date(e.date||e.createdAt||0); return Number.isFinite(ms)&&ms>=from&&ms<=to; }); }
+function groupByDay(orders,expenses,window){ const out={}; const start=new Date(window.fromIso); const end=new Date(window.toIso); for(let d=new Date(Date.UTC(start.getUTCFullYear(),start.getUTCMonth(),start.getUTCDate())); d<=end; d.setUTCDate(d.getUTCDate()+1)){ out[d.toISOString().slice(0,10)]={date:d.toISOString().slice(0,10),orders:0,revenue_excluding_delivery:0,delivery_fees_total:0,expenses_total:0,estimated_margin:0}; } for(const o of orders){ const k=new Date(o.date||o.createdAt).toISOString().slice(0,10); if(!out[k]) out[k]={date:k,orders:0,revenue_excluding_delivery:0,delivery_fees_total:0,expenses_total:0,estimated_margin:0}; out[k].orders++; out[k].revenue_excluding_delivery=money(out[k].revenue_excluding_delivery+num(o.itemsTotal,0)); out[k].delivery_fees_total=money(out[k].delivery_fees_total+num(o.deliveryFee,0)); }
+  for(const e of expenses){ const k=new Date(e.date||e.createdAt).toISOString().slice(0,10); if(!out[k]) out[k]={date:k,orders:0,revenue_excluding_delivery:0,delivery_fees_total:0,expenses_total:0,estimated_margin:0}; out[k].expenses_total=money(out[k].expenses_total+expenseAmount(e)); }
+  return Object.values(out).map(r=>({...r,estimated_margin:money(r.revenue_excluding_delivery-r.expenses_total)})); }
+function paymentBreakdown(orders=[]){ const out={}; for(const o of orders){ const total=money(o.total||o.finalTotal); const parts=safeArray(o.paymentParts); if(parts.length){ for(const p of parts){ const m=p.method||p.name||o.payment||"Unknown"; out[m]=money((out[m]||0)+num(p.amount,0)); } } else { const m=o.payment||"Unknown"; out[m]=money((out[m]||0)+total); } } return out; }
+function workerBreakdown(orders=[]){ const map=new Map(); for(const o of orders){ const w=o.worker||"Unknown"; if(!map.has(w)) map.set(w,{worker:w,order_count:0,revenue_excluding_delivery:0,revenue_including_delivery:0,payment_breakdown:{}}); const r=map.get(w); r.order_count++; r.revenue_excluding_delivery=money(r.revenue_excluding_delivery+num(o.itemsTotal,0)); r.revenue_including_delivery=money(r.revenue_including_delivery+num(o.total,0)); const pb=paymentBreakdown([o]); for(const [m,a] of Object.entries(pb)) r.payment_breakdown[m]=money((r.payment_breakdown[m]||0)+a); } return [...map.values()]; }
+function topItems(orders=[]){ const map=new Map(); for(const o of orders){ for(const l of safeArray(o.cart)){ const name=l.name||l.title||l.id||"Unknown item"; const qty=num(l.qty??l.quantity,1); if(!map.has(name)) map.set(name,{name,qty:0,total:0}); const r=map.get(name); r.qty+=qty; r.total=money(r.total+lineTotal(l)); } } return [...map.values()].sort((a,b)=>b.qty-a.qty).slice(0,10); }
+async function salesReport(supabase,state,window){ const all=await fetchOrders(supabase,{...window,limit:500}); const active=all.filter(o=>!o.voided); const expenses=expensesForWindow(state,window); const gross=money(active.reduce((s,o)=>s+num(o.itemsTotal,0),0)); const fees=money(active.reduce((s,o)=>s+num(o.deliveryFee,0),0)); const exp=money(expenses.reduce((s,e)=>s+expenseAmount(e),0)); return { period:window.key||null, start_date:window.fromIso.slice(0,10), end_date:window.toIso.slice(0,10), total_orders:active.length, gross_items_total:gross, delivery_fees_total:fees, revenue_excluding_delivery:gross, revenue_including_delivery:money(gross+fees), expenses_total:exp, estimated_margin:money(gross-exp), voided_orders_count:all.filter(o=>o.voided).length, payment_breakdown:paymentBreakdown(active), worker_breakdown:workerBreakdown(active), top_items:topItems(active), daily_breakdown:groupByDay(active,expenses,window) }; }
+function expensesReport(state,window){ const expenses=expensesForWindow(state,window); return { period:window.key||null, expenses, total_expenses:money(expenses.reduce((s,e)=>s+expenseAmount(e),0)), grouped_totals:expenses.reduce((a,e)=>{ const k=e.name||e.category||"Other"; a[k]=money((a[k]||0)+expenseAmount(e)); return a; },{}) }; }
+function csvReport(report){ const rows=[["date","orders","revenue_excluding_delivery","delivery_fees_total","expenses_total","estimated_margin"],...(report.daily_breakdown||[]).map(r=>[r.date,r.orders,r.revenue_excluding_delivery,r.delivery_fees_total,r.expenses_total,r.estimated_margin])]; return rows.map(r=>r.map(c=>`"${String(c??"").replace(/"/g,'""')}"`).join(",")).join("\n"); }
+
+function invList(state={}){ return Array.isArray(state.inventory)?state.inventory:[]; }
+function findIn(list,id,name){ const i=asId(id); const n=asId(name); return list.find(x=>(i&&asId(x.id)===i)||(n&&asId(x.name)===n)); }
+function findInventory(state,ref){ return findIn(invList(state), ref, ref); }
+function mutateInventory(state,ref,updater){ const wanted=asId(ref); if(!wanted) throw new Error("item is required."); let found=false; const inventory=invList(state).map(item=>{ if(asId(item.id)===wanted||asId(item.name)===wanted){ found=true; return updater(item); } return item; }); if(!found) throw new Error(`Inventory item "${ref}" was not found.`); return {...state,inventory}; }
+function addInvLedger(state,item,qty,unit,auth,note,type="adjustment"){ state.inventoryLedger=[{id:`mcp_inv_${Date.now()}_${Math.random().toString(36).slice(2,7)}`,itemId:item.id,itemName:item.name,qty:money(qty),unit:unit||item.unit||"",type,note:note||"",worker:auth?.mcpContext?.adminName||"",adminId:auth?.mcpContext?.adminId||"",adminName:auth?.mcpContext?.adminName||"",createdAt:nowIso(),updatedAt:nowIso(),source:"mcp",syncStatus:"pending",lastModifiedDeviceId:"mcp"},...safeArray(state.inventoryLedger)]; }
+function usageFromItem(item={}){ return item.uses||item.usage||item.inventoryUsage||item.consumption||{}; }
+function usageRows(state={}){ return (state.menu||[]).map(item=>({item_id:item.id,item_name:item.name,usage:usageFromItem(item)})); }
+function applyOrderInventoryUsage(state,order,sign,auth,note){ const menu=state.menu||[]; const inventory=invList(state).map(x=>({...x})); const invState={...state,inventory}; for(const line of safeArray(order.cart)){ const item=findIn(menu,line.itemId||line.item_id||line.id,line.name); const usage=usageFromItem(item||line); for(const [ref,qtyEach] of Object.entries(usage||{})){ const inv=findInventory(invState,ref); if(!inv) continue; const delta=sign*num(qtyEach,0)*num(line.qty??line.quantity,1); const nextQty=money(num(inv.qty,0)+delta); if(nextQty<0) throw new Error(`Inventory item ${inv.name||ref} would become negative.`); inv.qty=nextQty; addInvLedger(invState,inv,delta,inv.unit,auth,note,sign<0?"order_usage":"void_restock"); } } return invState; }
+function menuKey(state){ return Array.isArray(state.menu)?"menu":"menu"; }
+function extrasKey(state){ return Array.isArray(state.extras)?"extras":"extraList"; }
+function beveragesKey(state){ return Array.isArray(state.beverages)?"beverages":"beverageList"; }
+function patchList(list,id,name,patch,label){ const before=findIn(list,id,name); if(!before) throw new Error(`${label} was not found.`); return list.map(x=>x===before?{...x,...patch,updatedAt:nowIso(),syncStatus:"pending",lastModifiedDeviceId:"mcp"}:x); }
+function addListItem(list,input,prefix){ const name=compactText(input.name); if(!name) throw new Error("name is required."); return {id:input.id||`${prefix}_${Date.now()}`,name,price:money(input.price||0),category:input.category||"",description:input.description||"",image:input.image||input.image_url||"",uses:input.uses||input.usage||input.inventory_usage||{},active:input.active!==false,archived:false,createdAt:nowIso(),updatedAt:nowIso(),source:"mcp",syncStatus:"pending",lastModifiedDeviceId:"mcp"}; }
+
+function buildCartLine(state,input){ const qty=pos(input.qty??input.quantity??1,"qty"); const item=findIn(state.menu||[],input.item_id||input.id,input.item_name||input.name); if(!item) throw new Error(`Menu item not found: ${input.item_name||input.item_id||input.name||input.id}`); const extras=safeArray(input.extras).map(ex=>{ const e=findIn(state[extrasKey(state)]||[],ex.extra_id||ex.id,ex.extra_name||ex.name); if(!e) throw new Error(`Extra not found: ${ex.extra_name||ex.extra_id||ex.name||ex.id}`); return {id:e.id,extraId:e.id,name:e.name,qty:pos(ex.qty??ex.quantity??1,"extra qty"),price:money(e.price)}; }); return {id:`line_${Date.now()}_${Math.random().toString(36).slice(2,7)}`,itemId:item.id,name:item.name,qty,price:money(item.price),category:item.category||"",extras,note:input.note||"",lineTotal:money(qty*(money(item.price)+extras.reduce((s,e)=>s+money(e.price)*num(e.qty,1),0))),uses:usageFromItem(item)}; }
+async function allocateOrderNo(supabase,state){ try{ const {data,error}=await supabase.rpc("allocate_order_no",{p_shop_id:SHOP_ID}); if(!error&&data) return Number(data); }catch{} const recent=await fetchOrders(supabase,{limit:1}).catch(()=>[]); const maxRecent=Math.max(0,...recent.map(o=>num(o.orderNo,0)),...safeArray(state.orders).map(o=>num(o.orderNo??o.order_no,0))); return maxRecent+1; }
+async function createOrder(supabase,state,writeSeq,input,auth){ const lines=safeArray(input.items).map(i=>buildCartLine(state,i)); if(!lines.length) throw new Error("items must contain at least one item."); const deliveryFee=nonNeg(input.delivery_fee??input.deliveryFee??0,"delivery_fee"); const itemsTotal=money(lines.reduce((s,l)=>s+lineTotal(l),0)); const total=money(itemsTotal+deliveryFee); const orderNo=await allocateOrderNo(supabase,state); const at=nowIso(); const order={orderNo,order_no:orderNo,dayId:state.dayMeta?.dayId||"",worker:input.worker_name||input.worker||state.dayMeta?.currentWorker||"",payment:input.payment_method||input.payment||"",paymentParts:input.payment_parts||[],orderType:input.order_type||input.orderType||"Take-Away",deliveryFee,itemsTotal,total,done:false,voided:false,note:input.note||"",date:at,createdAt:at,updatedAt:at,cart:lines,source:"mcp",channel:"chatgpt",lastModifiedDeviceId:"mcp",syncStatus:"pending"}; const payload={shop_id:SHOP_ID,order_no:orderNo,day_id:order.dayId,worker:order.worker,payment:order.payment,payment_parts:order.paymentParts,order_type:order.orderType,delivery_fee:deliveryFee,total,items_total:itemsTotal,done:false,voided:false,note:order.note,date:at,cart:lines,source:"mcp",channel:"chatgpt",last_modified_device_id:"mcp",sync_status:"pending",created_at:at,updated_at:at}; const {data,error}=await supabase.from("orders").insert(payload).select("*").single(); if(error) throw error; const normalized=normalizeOrderRow(data); let next={...state,orders:[normalized,...safeArray(state.orders)],nextOrderNo:Math.max(num(state.nextOrderNo,1),orderNo+1)}; next=applyOrderInventoryUsage(next,normalized,-1,auth,"MCP order usage"); const saved=await saveShopState(supabase,next,writeSeq); return {order:compactOrder(normalized),summary:await getBoard(supabase,{limit:30,status:"all"}),inventory:invList(saved),__audit:{beforeState:null,afterState:normalized}}; }
+async function updateOrder(supabase,state,writeSeq,input,auth){ const orderNo=posInt(input.order_no??input.orderNo,"order_no"); const [before]=await fetchOrders(supabase,{orderNo,limit:1}); if(!before) throw new Error(`Order ${orderNo} was not found.`); let cart=input.items?safeArray(input.items).map(i=>buildCartLine(state,i)):before.cart; const patch={}; if(input.worker_name||input.worker) patch.worker=input.worker_name||input.worker; if(input.payment_method||input.payment) patch.payment=input.payment_method||input.payment; if(input.order_type||input.orderType) patch.order_type=input.order_type||input.orderType; if(input.note!=null) patch.note=String(input.note); if(input.delivery_fee!=null||input.deliveryFee!=null) patch.delivery_fee=nonNeg(input.delivery_fee??input.deliveryFee,"delivery_fee"); if(input.items) patch.cart=cart; const itemsTotal=money(cart.reduce((s,l)=>s+lineTotal(l),0)); patch.items_total=itemsTotal; patch.total=money(itemsTotal+num(patch.delivery_fee??before.deliveryFee,0)); patch.updated_at=nowIso(); patch.sync_status="pending"; patch.last_modified_device_id="mcp"; const {data,error}=await supabase.from("orders").update(patch).eq("shop_id",SHOP_ID).eq("order_no",orderNo).select("*").maybeSingle(); if(error) throw error; if(!data) throw new Error(`Order ${orderNo} was not found.`); const after=normalizeOrderRow(data); const nextOrders=safeArray(state.orders).map(o=>num(o.orderNo??o.order_no,0)===orderNo?after:o); const saved=await saveShopState(supabase,{...state,orders:nextOrders},writeSeq); return {order:compactOrder(after),summary:await getBoard(supabase,{limit:30,status:"all"}),state_updated:Boolean(saved),__audit:{beforeState:before,afterState:after}}; }
+async function addItemToOrder(supabase,state,writeSeq,input,auth){ const orderNo=posInt(input.order_no??input.orderNo,"order_no"); const [order]=await fetchOrders(supabase,{orderNo,limit:1}); if(!order) throw new Error(`Order ${orderNo} was not found.`); const itemInput=input.item||input; return updateOrder(supabase,state,writeSeq,{order_no:orderNo,items:[...safeArray(order.cart),itemInput],delivery_fee:order.deliveryFee,note:order.note,payment:order.payment,worker:order.worker,order_type:order.orderType},auth); }
+async function removeItemFromOrder(supabase,state,writeSeq,input,auth){ const orderNo=posInt(input.order_no??input.orderNo,"order_no"); const idx=Number(input.line_index??input.item_index); const lineId=input.line_id||input.item_id; const [order]=await fetchOrders(supabase,{orderNo,limit:1}); if(!order) throw new Error(`Order ${orderNo} was not found.`); let cart=safeArray(order.cart); if(Number.isInteger(idx)) cart=cart.filter((_,i)=>i!==idx); else if(lineId) cart=cart.filter(l=>String(l.id||l.itemId||"")!==String(lineId)); else throw new Error("line_index or line_id is required."); return updateOrder(supabase,state,writeSeq,{order_no:orderNo,items:cart,delivery_fee:order.deliveryFee,note:order.note,payment:order.payment,worker:order.worker,order_type:order.orderType},auth); }
+async function setOrderDone(supabase,state,writeSeq,input,auth,voiding=false){ const orderNo=posInt(input.order_no??input.orderNo,"order_no"); const [before]=await fetchOrders(supabase,{orderNo,limit:1}); if(!before) throw new Error(`Order ${orderNo} was not found.`); const patch=voiding?{voided:true,void_reason:compactText(input.reason)||"MCP void",sync_status:"pending",last_modified_device_id:"mcp"}:{done:true,sync_status:"pending",last_modified_device_id:"mcp"}; const {data,error}=await supabase.from("orders").update(patch).eq("shop_id",SHOP_ID).eq("order_no",orderNo).select("*").maybeSingle(); if(error) throw error; if(!data) throw new Error(`Order ${orderNo} was not found.`); const after=normalizeOrderRow(data); let next={...state,orders:safeArray(state.orders).map(o=>num(o.orderNo??o.order_no,0)===orderNo?{...o,...patch,voidReason:patch.void_reason||o.voidReason,updatedAt:nowIso()}:o)}; if(voiding&&!before.voided) next=applyOrderInventoryUsage(next,before,1,auth,"MCP void restock"); const saved=await saveShopState(supabase,next,writeSeq); return {order:compactOrder(after),inventory:invList(saved),__audit:{beforeState:before,afterState:after}}; }
+function printablePayload(order,type){ return {supported:false,type,reason:"Server-side MCP cannot access the browser thermal printer directly. Use this payload in the POS UI or browser print flow.",order:compactOrder(order)}; }
+
+function bankTotal(state){ return money(safeArray(state.bankTx).reduce((s,t)=>s+num(t.amount,0),0)); }
+function addBankTx(state,input,auth,forcedType){ const type=forcedType||input.type||"deposit"; let amount=nonNeg(input.amount,"amount"); if(type==="withdraw"||type==="withdrawal") amount=-amount; if(type==="adjust") amount=num(input.amount,0); const before=bankTotal(state); const after=money(before+amount); if(after<0) throw new Error("Bank total cannot become negative."); const row={id:`mcp_bank_${Date.now()}`,type,amount:money(amount),worker:input.worker_name||auth.mcpContext?.adminName||"",note:input.note||"",reason:input.reason||"",date:nowIso(),createdAt:nowIso(),updatedAt:nowIso(),source:"mcp",adminId:auth.mcpContext?.adminId,adminName:auth.mcpContext?.adminName,syncStatus:"pending",lastModifiedDeviceId:"mcp"}; return {...state,bankTx:[row,...safeArray(state.bankTx)]}; }
+function adminSettings(state){ return {workers:state.workers||[],payment_methods:state.paymentMethods||[],order_types:state.orderTypes||[],default_delivery_fee:num(state.defaultDeliveryFee,0),shop_settings:omitSecrets(state.shopSettings||{}),inventory_locked:Boolean(state.inventoryLocked),day_meta:omitSecrets(state.dayMeta||{})}; }
+function dayStatus(state){ const d=state.dayMeta||{}; return {business_day_id:d.dayId||"",current_worker:d.currentWorker||"",started_at:d.startedAt||null,ended_at:d.endedAt||null,active:d.active===false?false:Boolean(d.startedAt&&!d.endedAt),status:d.endedAt?"ended":d.startedAt?"active":"not_started"}; }
+async function listTokens(supabase,auth){ const {data,error}=await supabase.from("mcp_connection_tokens").select("id, name, token_prefix, admin_id, admin_name, scopes, active, created_at, last_used_at, revoked_at, note").eq("shop_id",SHOP_ID).eq("admin_id",auth.mcpContext?.adminId).order("created_at",{ascending:false}); if(error) throw error; return {tokens:data||[]}; }
+
+function tool(name,description,properties={},required=[]){ return {name,description,inputSchema:{type:"object",properties,required}}; }
+function getToolDefinitions(){ const read="Requires a valid MCP connection token with matching read scope."; const write="Requires a valid MCP connection token with matching write scope. Admin identity is resolved from the token."; const defs=[];
+  defs.push(tool("get_connection_info",`${read} Returns connected admin identity and scopes.`));
+  for(const n of ["get_recent_orders","get_order_board"]) defs.push(tool(n,`${read} Returns defensive compact order board data.`,{limit:{type:"number"},status:{type:"string",enum:["active","done","voided","all"]}}));
+  defs.push(tool("get_order_by_number",`${read} Returns one order.`,{order_no:{type:"number"}},["order_no"]));
+  defs.push(tool("create_order",`${write} Creates an order with items, extras, worker, order type, payment, note and delivery fee.`,{worker_name:{type:"string"},order_type:{type:"string"},payment_method:{type:"string"},items:{type:"array"},note:{type:"string"},delivery_fee:{type:"number"}},["items"]));
+  for(const n of ["update_order","add_item_to_order","remove_item_from_order","mark_order_done","void_order","print_customer_receipt","print_kitchen_ticket"]) defs.push(tool(n,`${write} Order board action.`,{order_no:{type:"number"},reason:{type:"string"}},["order_no"]));
+  for(const n of ["get_expenses_report","get_expenses","get_purchases_report"]) defs.push(tool(n,`${read} Returns expenses/purchases.`,{date:{type:"string"}}));
+  defs.push(tool("get_expense_by_id",`${read} Returns one expense.`,{expense_id:{type:"string"}},["expense_id"]));
+  for(const n of ["add_expense","update_expense","void_expense","delete_expense"]) defs.push(tool(n,`${write} Expense action; delete is implemented as safe void/archive.`,{expense_id:{type:"string"},name:{type:"string"},qty:{type:"number"},unit_price:{type:"number"},reason:{type:"string"}}));
+  for(const n of ["get_bank_summary","get_bank_transactions","get_bank_report"]) defs.push(tool(n,`${read} Returns bank totals and transactions.`));
+  for(const n of ["add_bank_transaction","withdraw_from_bank","deposit_to_bank","adjust_bank_total"]) defs.push(tool(n,`${write} Adds a safe bank transaction.`,{amount:{type:"number"},type:{type:"string"},worker_name:{type:"string"},note:{type:"string"},reason:{type:"string"}},["amount"]));
+  for(const n of ["get_today_sales_report","get_month_sales_report","get_year_sales_report","get_date_range_sales_report","get_profit_report","get_worker_report_for_period","get_worker_sales_report","get_month_expenses_report","get_year_expenses_report","generate_daily_pdf_report","generate_monthly_pdf_report","export_report_json","export_report_csv"]) defs.push(tool(n,`${read} Report tool.`,{date:{type:"string"},month:{type:"string"},year:{type:"number"},start_date:{type:"string"},end_date:{type:"string"},worker_name:{type:"string"}}));
+  for(const n of ["get_inventory_status","get_inventory_lock_status","get_inventory_usage","get_inventory_movements"]) defs.push(tool(n,`${read} Inventory read tool.`));
+  for(const n of ["add_inventory_restock","adjust_inventory_quantity","lock_inventory","unlock_inventory","update_inventory_usage","add_inventory_item","update_inventory_item","delete_inventory_item","disable_inventory_item","set_low_stock_threshold"]) defs.push(tool(n,`${write} Inventory write tool.`,{item:{type:"string"},quantity:{type:"number"},new_quantity:{type:"number"},delta:{type:"number"},unit:{type:"string"},reason:{type:"string"},usage:{type:"object"}}));
+  defs.push(tool("get_menu_items",`${read} Returns menu, extras, beverages and usage.`));
+  for(const n of ["update_item_price","update_extra_price","add_menu_item","update_menu_item","delete_menu_item","disable_menu_item","add_extra","update_extra","delete_extra","disable_extra","add_beverage","update_beverage","delete_beverage","disable_beverage","update_item_category","update_item_name","update_item_description","update_item_image","update_item_consumption_usage"]) defs.push(tool(n,`${write} Menu/edit/prices tool.`,{item_id:{type:"string"},item_name:{type:"string"},extra_id:{type:"string"},extra_name:{type:"string"},beverage_id:{type:"string"},beverage_name:{type:"string"},name:{type:"string"},new_price:{type:"number"},price:{type:"number"},category:{type:"string"},description:{type:"string"},image_url:{type:"string"},usage:{type:"object"}}));
+  for(const n of ["get_admin_settings","get_connected_admins","list_mcp_tokens","get_current_shift","get_day_status","get_shift_history"]) defs.push(tool(n,`${read} Safe admin/settings read tool.`));
+  for(const n of ["update_worker_list","add_worker","update_worker","disable_worker","update_payment_methods","update_order_types","update_default_delivery_fee","update_shop_settings","revoke_mcp_token","change_shift","start_day","end_day","start_shift","end_shift"]) defs.push(tool(n,`${write} Safe admin/day/shift write tool.`,{worker_name:{type:"string"},to_worker:{type:"string"},workers:{type:"array"},payment_methods:{type:"array"},order_types:{type:"array"},default_delivery_fee:{type:"number"},token_id:{type:"string"},settings:{type:"object"}}));
+  return defs; }
+
+async function callTool(req,toolName,input={}){ const required=TOOL_SCOPES[toolName] || (WRITE_TOOL_NAMES.has(toolName)?"write":"read"); const auth=await requireMcpAuth(req,{requiredScope:required}); try{ const result=await executeTool(auth.supabase,toolName,input,auth); const auditInfo=result&&result.__audit?result.__audit:{}; if(result&&result.__audit) delete result.__audit; await audit(auth.supabase,auth,toolName,input,true,null,auditInfo.beforeState,auditInfo.afterState); return result; }catch(err){ await audit(auth.supabase,auth,toolName,input,false,err.message||String(err)); throw err; } }
+async function executeTool(supabase,toolName,input={},auth={}){ const {state,writeSeq}=await loadShopState(supabase);
+  if(toolName==="get_connection_info") return {connected:true,admin_id:auth.mcpContext?.adminId,admin_name:auth.mcpContext?.adminName,scopes:auth.mcpContext?.scopes||[],can_write:(auth.mcpContext?.scopes||[]).some(s=>s==="admin"||s==="write"||s.startsWith("write:"))};
+  if(toolName==="get_recent_orders"||toolName==="get_order_board") return getBoard(supabase,input);
+  if(toolName==="get_order_by_number"){ const [o]=await fetchOrders(supabase,{orderNo:posInt(input.order_no??input.orderNo,"order_no"),limit:1}); if(!o) throw new Error("Order was not found."); return compactOrder(o); }
+  if(toolName==="create_order") return createOrder(supabase,state,writeSeq,input,auth);
+  if(toolName==="update_order") return updateOrder(supabase,state,writeSeq,input,auth);
+  if(toolName==="add_item_to_order") return addItemToOrder(supabase,state,writeSeq,input,auth);
+  if(toolName==="remove_item_from_order") return removeItemFromOrder(supabase,state,writeSeq,input,auth);
+  if(toolName==="mark_order_done") return setOrderDone(supabase,state,writeSeq,input,auth,false);
+  if(toolName==="void_order") return setOrderDone(supabase,state,writeSeq,input,auth,true);
+  if(toolName==="print_customer_receipt"||toolName==="print_kitchen_ticket"){ const [o]=await fetchOrders(supabase,{orderNo:posInt(input.order_no??input.orderNo,"order_no"),limit:1}); if(!o) throw new Error("Order was not found."); return printablePayload(o,toolName==="print_customer_receipt"?"customer_receipt":"kitchen_ticket"); }
+  if(toolName==="get_expenses_report"||toolName==="get_expenses") return expensesReport(state,dateWindowFor(state,input.date));
+  if(toolName==="get_purchases_report") return {purchases:safeArray(state.purchases),expenses_report:expensesReport(state,dateWindowFor(state,input.date))};
+  if(toolName==="get_month_expenses_report") return expensesReport(state,monthWindow(input.month));
+  if(toolName==="get_year_expenses_report") return expensesReport(state,yearWindow(input.year));
+  if(toolName==="get_expense_by_id"){ const e=safeArray(state.expenses).find(x=>String(x.id)===String(input.expense_id)); if(!e) throw new Error("Expense was not found."); return e; }
+  if(toolName==="add_expense"){ const row={id:`mcp_expense_${Date.now()}`,name:compactText(input.name),unit:input.unit||"",qty:pos(input.qty??1,"qty"),unitPrice:nonNeg(input.unit_price??input.unitPrice??0,"unit_price"),note:input.note||"",worker:input.worker_name||auth.mcpContext?.adminName||"",date:nowIso(),createdAt:nowIso(),updatedAt:nowIso(),source:"mcp",adminId:auth.mcpContext?.adminId,adminName:auth.mcpContext?.adminName,syncStatus:"pending",lastModifiedDeviceId:"mcp"}; if(!row.name) throw new Error("name is required."); const saved=await saveShopState(supabase,{...state,expenses:[row,...safeArray(state.expenses)]},writeSeq); return {expense:row,expenses_total:money(safeArray(saved.expenses).reduce((s,e)=>s+expenseAmount(e),0)),__audit:{beforeState:null,afterState:row}}; }
+  if(toolName==="update_expense"){ const id=input.expense_id||input.id; const before=safeArray(state.expenses).find(e=>String(e.id)===String(id)); if(!before) throw new Error("Expense was not found."); const expenses=safeArray(state.expenses).map(e=>String(e.id)===String(id)?{...e,name:input.name??e.name,unit:input.unit??e.unit,qty:input.qty!=null?nonNeg(input.qty,"qty"):e.qty,unitPrice:input.unit_price!=null?nonNeg(input.unit_price,"unit_price"):e.unitPrice,note:input.note??e.note,updatedAt:nowIso(),syncStatus:"pending",lastModifiedDeviceId:"mcp"}:e); const saved=await saveShopState(supabase,{...state,expenses},writeSeq); const after=saved.expenses.find(e=>String(e.id)===String(id)); return {expense:after,__audit:{beforeState:before,afterState:after}}; }
+  if(toolName==="void_expense"||toolName==="delete_expense"){ const id=input.expense_id||input.id; const before=safeArray(state.expenses).find(e=>String(e.id)===String(id)); if(!before) throw new Error("Expense was not found."); const expenses=safeArray(state.expenses).map(e=>String(e.id)===String(id)?{...e,voided:true,voidReason:input.reason||"MCP void",updatedAt:nowIso(),syncStatus:"pending",lastModifiedDeviceId:"mcp"}:e); const saved=await saveShopState(supabase,{...state,expenses},writeSeq); return {expense:saved.expenses.find(e=>String(e.id)===String(id)),safe_delete:true,__audit:{beforeState:before,afterState:saved.expenses.find(e=>String(e.id)===String(id))}}; }
+  if(toolName==="get_bank_summary"||toolName==="get_bank_report"||toolName==="get_bank_transactions") return {current_bank_total:bankTotal(state),transactions:safeArray(state.bankTx).slice(0,Number(input.limit||100)),recent_deposits:safeArray(state.bankTx).filter(t=>num(t.amount,0)>0).slice(0,10),recent_withdrawals:safeArray(state.bankTx).filter(t=>num(t.amount,0)<0).slice(0,10)};
+  if(["add_bank_transaction","withdraw_from_bank","deposit_to_bank","adjust_bank_total"].includes(toolName)){ const before={total:bankTotal(state),bankTx:safeArray(state.bankTx).slice(0,5)}; let next; if(toolName==="adjust_bank_total"){ const target=input.new_total!=null?nonNeg(input.new_total,"new_total"):nonNeg(input.amount,"amount"); const delta=money(target-bankTotal(state)); next=addBankTx(state,{...input,amount:delta,type:"adjust",reason:input.reason||"MCP bank total adjustment"},auth,"adjust"); } else next=addBankTx(state,input,auth,toolName==="withdraw_from_bank"?"withdraw":toolName==="deposit_to_bank"?"deposit":input.type); const saved=await saveShopState(supabase,next,writeSeq); return {current_bank_total:bankTotal(saved),transaction:safeArray(saved.bankTx)[0],__audit:{beforeState:before,afterState:{total:bankTotal(saved),transaction:safeArray(saved.bankTx)[0]}}}; }
+  if(toolName==="get_today_sales_report") return salesReport(supabase,state,dateWindowFor(state,input.date));
+  if(toolName==="get_month_sales_report") return salesReport(supabase,state,monthWindow(input.month));
+  if(toolName==="get_year_sales_report") return salesReport(supabase,state,yearWindow(input.year));
+  if(toolName==="get_date_range_sales_report"||toolName==="get_profit_report"||toolName==="get_worker_report_for_period") { const r=await salesReport(supabase,state,input.start_date?rangeWindow(input):input.month?monthWindow(input.month):input.year?yearWindow(input.year):dateWindowFor(state,input.date)); if(input.worker_name) r.worker_breakdown=r.worker_breakdown.filter(w=>asId(w.worker)===asId(input.worker_name)); return r; }
+  if(toolName==="get_worker_sales_report"){ const r=await salesReport(supabase,state,dateWindowFor(state,input.date)); return {workers:input.worker_name?r.worker_breakdown.filter(w=>asId(w.worker)===asId(input.worker_name)):r.worker_breakdown}; }
+  if(toolName==="generate_daily_pdf_report"||toolName==="generate_monthly_pdf_report"){ const r=await salesReport(supabase,state,toolName.includes("monthly")?monthWindow(input.month):dateWindowFor(state,input.date)); return {supported:false,format:"pdf",message:"Server-side PDF binary generation is not enabled in this MCP endpoint. Use export_report_json or export_report_csv, or generate the PDF in the POS UI.",report:r}; }
+  if(toolName==="export_report_json"){ const r=await salesReport(supabase,state,input.start_date?rangeWindow(input):input.month?monthWindow(input.month):input.year?yearWindow(input.year):dateWindowFor(state,input.date)); return {format:"json",report:r,json:JSON.stringify(r,null,2)}; }
+  if(toolName==="export_report_csv"){ const r=await salesReport(supabase,state,input.start_date?rangeWindow(input):input.month?monthWindow(input.month):input.year?yearWindow(input.year):dateWindowFor(state,input.date)); return {format:"csv",csv:csvReport(r),report:r}; }
+  if(toolName==="get_inventory_status") return {inventory:invList(state),low_stock_warnings:invList(state).filter(i=>num(i.qty,0)<=num(i.minQty??i.lowStockThreshold,0)),locked:Boolean(state.inventoryLocked),last_updated:state.updatedAt||null};
+  if(toolName==="get_inventory_lock_status") return {locked:Boolean(state.inventoryLocked),locked_at:state.inventoryLockedAt||null,snapshot:state.inventorySnapshot||[]};
+  if(toolName==="get_inventory_usage") return {usage:usageRows(state)};
+  if(toolName==="get_inventory_movements") return {movements:safeArray(state.inventoryLedger).slice(0,Number(input.limit||100))};
+  if(toolName==="add_inventory_restock"){ const q=pos(input.quantity,"quantity"); const before=findInventory(state,input.item); const next=mutateInventory(state,input.item,item=>({...item,qty:money(num(item.qty,0)+q),unit:input.unit||item.unit,updatedAt:nowIso()})); addInvLedger(next,findInventory(next,input.item),q,input.unit,auth,input.note||"MCP restock","restock"); const saved=await saveShopState(supabase,next,writeSeq); return {inventory:invList(saved),item:findInventory(saved,input.item),__audit:{beforeState:before,afterState:findInventory(saved,input.item)}}; }
+  if(toolName==="adjust_inventory_quantity"){ const before=findInventory(state,input.item); let delta=0; const next=mutateInventory(state,input.item,item=>{ const final=input.new_quantity!=null?nonNeg(input.new_quantity,"new_quantity"):num(item.qty,0)+num(input.delta,0); if(final<0) throw new Error("Final inventory quantity cannot be negative."); delta=money(final-num(item.qty,0)); return {...item,qty:money(final),unit:input.unit||item.unit,updatedAt:nowIso()}; }); addInvLedger(next,findInventory(next,input.item),delta,input.unit,auth,input.reason||"MCP adjustment","adjustment"); const saved=await saveShopState(supabase,next,writeSeq); return {inventory:invList(saved),item:findInventory(saved,input.item),__audit:{beforeState:before,afterState:findInventory(saved,input.item)}}; }
+  if(toolName==="lock_inventory"||toolName==="unlock_inventory"){ const before={locked:state.inventoryLocked,snapshot:state.inventorySnapshot}; const next={...state,inventoryLocked:toolName==="lock_inventory",inventoryLockedAt:toolName==="lock_inventory"?nowIso():state.inventoryLockedAt,inventorySnapshot:toolName==="lock_inventory"?invList(state):state.inventorySnapshot||[]}; const saved=await saveShopState(supabase,next,writeSeq); return {locked:Boolean(saved.inventoryLocked),snapshot:saved.inventorySnapshot||[],__audit:{beforeState:before,afterState:{locked:saved.inventoryLocked,snapshot:saved.inventorySnapshot}}}; }
+  if(toolName==="update_inventory_usage"||toolName==="update_item_consumption_usage"){ const before=findIn(state.menu||[],input.item_id,input.item_name||input.name); if(!before) throw new Error("Menu item was not found."); const usage=input.usage||input.inventory_usage||{[input.inventory_item||input.inventory_item_name||input.item]:nonNeg(input.quantity,"quantity")}; const menu=patchList(state.menu||[],input.item_id,input.item_name||input.name,{uses:usage,inventoryUsage:usage},"item"); const saved=await saveShopState(supabase,{...state,menu},writeSeq); const after=findIn(saved.menu||[],input.item_id,input.item_name||input.name); return {item:after,usage:usageFromItem(after),__audit:{beforeState:before,afterState:after}}; }
+  if(toolName==="add_inventory_item"){ const row={id:input.id||`inv_${Date.now()}`,name:compactText(input.name||input.item),unit:input.unit||"unit",qty:nonNeg(input.quantity??input.qty??0,"quantity"),minQty:nonNeg(input.low_stock_threshold??input.minQty??0,"low_stock_threshold"),active:true,createdAt:nowIso(),updatedAt:nowIso(),source:"mcp",syncStatus:"pending",lastModifiedDeviceId:"mcp"}; if(!row.name) throw new Error("name is required."); const saved=await saveShopState(supabase,{...state,inventory:[row,...invList(state)]},writeSeq); return {item:row,inventory:invList(saved),__audit:{beforeState:null,afterState:row}}; }
+  if(["update_inventory_item","set_low_stock_threshold","delete_inventory_item","disable_inventory_item"].includes(toolName)){ const ref=input.item||input.item_id||input.name; const before=findInventory(state,ref); let patch={}; if(toolName==="set_low_stock_threshold") patch={minQty:nonNeg(input.low_stock_threshold??input.threshold,"low_stock_threshold")}; else if(toolName.includes("delete")||toolName.includes("disable")) patch={active:false,disabled:true,archived:true}; else patch={name:input.name??before?.name,unit:input.unit??before?.unit,qty:input.quantity!=null?nonNeg(input.quantity,"quantity"):before?.qty,minQty:input.low_stock_threshold!=null?nonNeg(input.low_stock_threshold,"low_stock_threshold"):before?.minQty}; const saved=await saveShopState(supabase,mutateInventory(state,ref,item=>({...item,...patch,updatedAt:nowIso(),syncStatus:"pending"})),writeSeq); return {item:findInventory(saved,ref),safe_delete:Boolean(toolName.includes("delete")||toolName.includes("disable")),__audit:{beforeState:before,afterState:findInventory(saved,ref)}}; }
+  if(toolName==="get_menu_items") return {categories:state.purchaseCategories||[],items:state.menu||[],extras:state[extrasKey(state)]||[],beverages:state[beveragesKey(state)]||[],order_types:state.orderTypes||[],default_delivery_fee:num(state.defaultDeliveryFee,0),usage:usageRows(state)};
+  if(["update_item_price","update_extra_price","add_menu_item","update_menu_item","delete_menu_item","disable_menu_item","add_extra","update_extra","delete_extra","disable_extra","add_beverage","update_beverage","delete_beverage","disable_beverage","update_item_category","update_item_name","update_item_description","update_item_image"].includes(toolName)){ const isExtra=toolName.includes("extra"); const isBev=toolName.includes("beverage"); const key=isExtra?extrasKey(state):isBev?beveragesKey(state):menuKey(state); const list=state[key]||[]; let before=null, after=null, nextList=list; if(toolName.startsWith("add_")){ after=addListItem(list,input,isExtra?"extra":isBev?"bev":"item"); nextList=[after,...list]; } else { const id=input.item_id||input.extra_id||input.beverage_id||input.id; const name=input.item_name||input.extra_name||input.beverage_name||input.name; before=findIn(list,id,name); const patch={}; if(input.new_price!=null||input.price!=null) patch.price=nonNeg(input.new_price??input.price,"price"); if(toolName.includes("category")) patch.category=input.category||""; if(toolName.includes("name")||input.name) patch.name=input.new_name||input.name; if(toolName.includes("description")||input.description) patch.description=input.description||""; if(toolName.includes("image")||input.image_url) patch.image=input.image_url||input.image||""; if(toolName.includes("delete")||toolName.includes("disable")) Object.assign(patch,{active:false,disabled:true,archived:true}); nextList=patchList(list,id,name,patch,isExtra?"extra":isBev?"beverage":"item"); after=findIn(nextList,id,name)||findIn(nextList,null,patch.name); } const saved=await saveShopState(supabase,{...state,[key]:nextList},writeSeq); return {changed:after,list:saved[key]||[],safe_delete:Boolean(toolName.includes("delete")||toolName.includes("disable")),__audit:{beforeState:before,afterState:after}}; }
+  if(toolName==="get_admin_settings") return adminSettings(state);
+  if(toolName==="get_current_shift"||toolName==="get_day_status") return dayStatus(state);
+  if(toolName==="get_shift_history") return {shift_changes:safeArray(state.dayMeta?.shiftChanges),worker_sessions:safeArray(state.workerSessions)};
+  if(toolName==="get_connected_admins") return {connected_admin:{admin_id:auth.mcpContext?.adminId,admin_name:auth.mcpContext?.adminName,scopes:auth.mcpContext?.scopes}};
+  if(toolName==="list_mcp_tokens") return listTokens(supabase,auth);
+  if(toolName==="revoke_mcp_token"){ if(!input.token_id) throw new Error("token_id is required."); const {data,error}=await supabase.from("mcp_connection_tokens").update({active:false,revoked_at:nowIso()}).eq("shop_id",SHOP_ID).eq("id",input.token_id).select("id, name, token_prefix, admin_id, admin_name, active, revoked_at").maybeSingle(); if(error) throw error; if(!data) throw new Error("Token was not found."); return {token:data,__audit:{beforeState:{token_id:input.token_id},afterState:data}}; }
+  if(toolName==="update_worker_list"||toolName==="update_payment_methods"||toolName==="update_order_types"||toolName==="update_default_delivery_fee"||toolName==="update_shop_settings"){ const before=adminSettings(state); const next={...state}; if(toolName==="update_worker_list") next.workers=Array.isArray(input.workers)?input.workers:[]; if(toolName==="update_payment_methods") next.paymentMethods=Array.isArray(input.payment_methods)?input.payment_methods:[]; if(toolName==="update_order_types") next.orderTypes=Array.isArray(input.order_types)?input.order_types:[]; if(toolName==="update_default_delivery_fee") next.defaultDeliveryFee=nonNeg(input.default_delivery_fee??input.delivery_fee,"default_delivery_fee"); if(toolName==="update_shop_settings") next.shopSettings={...(state.shopSettings||{}),...(input.settings||{})}; const saved=await saveShopState(supabase,next,writeSeq); return {settings:adminSettings(saved),__audit:{beforeState:before,afterState:adminSettings(saved)}}; }
+  if(toolName==="add_worker"||toolName==="update_worker"||toolName==="disable_worker"){ const before=state.workers||[]; const name=compactText(input.worker_name||input.name); if(!name) throw new Error("worker_name is required."); let workers=[...(state.workers||[])]; const idx=workers.findIndex(w=>asId(typeof w==="string"?w:w.name)===asId(name)); if(toolName==="add_worker"&&idx<0) workers.push(name); if(toolName==="update_worker"&&idx>=0) workers[idx]=input.new_name||input.name||name; if(toolName==="disable_worker"&&idx>=0) workers=workers.map((w,i)=>i===idx&&typeof w==="object"?{...w,active:false,disabled:true}:i===idx?{name:w,active:false,disabled:true}:w); const saved=await saveShopState(supabase,{...state,workers},writeSeq); return {workers:saved.workers,__audit:{beforeState:before,afterState:saved.workers}}; }
+  if(toolName==="change_shift"||toolName==="start_shift"||toolName==="start_day"){ const at=nowIso(); const to=input.to_worker||input.worker_name||input.worker||auth.mcpContext?.adminName||"MCP"; const before={dayMeta:state.dayMeta||{},workerSessions:state.workerSessions||[]}; const sessions=[{id:`mcp_session_${Date.now()}`,name:to,signInAt:at,createdAt:at,updatedAt:at,source:"mcp",adminId:auth.mcpContext?.adminId,adminName:auth.mcpContext?.adminName,syncStatus:"pending",lastModifiedDeviceId:"mcp"},...safeArray(state.workerSessions).map(s=>!s.signOutAt&&!s.endedAt?{...s,signOutAt:at,endedAt:at,updatedAt:at}:s)]; const dayMeta={...(state.dayMeta||{}),dayId:state.dayMeta?.dayId||`day_${at.slice(0,10)}_${Date.now()}`,currentWorker:to,startedBy:state.dayMeta?.startedBy||to,startedAt:state.dayMeta?.startedAt||at,endedAt:null,active:true,updatedAt:at,shiftChanges:[...safeArray(state.dayMeta?.shiftChanges),{at,fromWorker:state.dayMeta?.currentWorker||"",toWorker:to,source:`mcp_${toolName}`,adminId:auth.mcpContext?.adminId,adminName:auth.mcpContext?.adminName}]}; const saved=await saveShopState(supabase,{...state,dayMeta,workerSessions:sessions},writeSeq); return {day_status:dayStatus(saved),workerSessions:saved.workerSessions,__audit:{beforeState:before,afterState:{dayMeta:saved.dayMeta,workerSessions:saved.workerSessions}}}; }
+  if(toolName==="end_shift"||toolName==="end_day"){ const at=nowIso(); const before={dayMeta:state.dayMeta||{},workerSessions:state.workerSessions||[]}; const worker=input.worker_name||state.dayMeta?.currentWorker||""; const sessions=safeArray(state.workerSessions).map(s=>(!s.signOutAt&&!s.endedAt&&(!worker||s.name===worker))?{...s,signOutAt:at,endedAt:at,updatedAt:at,syncStatus:"pending"}:s); const dayMeta={...(state.dayMeta||{}),currentWorker:toolName==="end_shift"?"":state.dayMeta?.currentWorker,endedAt:toolName==="end_day"?at:state.dayMeta?.endedAt,endedBy:toolName==="end_day"?(worker||auth.mcpContext?.adminName):state.dayMeta?.endedBy,active:toolName==="end_day"?false:state.dayMeta?.active,updatedAt:at,shiftChanges:[...safeArray(state.dayMeta?.shiftChanges),{at,fromWorker:worker,toWorker:"",source:`mcp_${toolName}`,adminId:auth.mcpContext?.adminId,adminName:auth.mcpContext?.adminName}]}; const report=toolName==="end_day"?await salesReport(supabase,state,state.dayMeta?.startedAt?{fromIso:new Date(state.dayMeta.startedAt).toISOString(),toIso:at,key:"business_day"}:dateWindowFor(state)):null; if(report) dayMeta.lastReport=report; const saved=await saveShopState(supabase,{...state,dayMeta,workerSessions:sessions},writeSeq); return {day_status:dayStatus(saved),report,cleared_historical_data:false,reset_database:false,__audit:{beforeState:before,afterState:{dayMeta:saved.dayMeta,workerSessions:saved.workerSessions}}}; }
   throw new Error(`Unsupported MCP tool: ${toolName}`);
 }
 
-function expensesForDate(state = {}, date) {
-  const expenses = Array.isArray(state.expenses) ? state.expenses : [];
-  if (date) return expenses.filter((e) => sameDate(e.date || e.createdAt, date));
-  const dayMeta = state.dayMeta || {};
-  if (dayMeta.startedAt && !dayMeta.endedAt) {
-    const start = +new Date(dayMeta.startedAt);
-    return expenses.filter((e) => {
-      const ms = +new Date(e.date || e.createdAt);
-      return Number.isFinite(ms) && ms >= start;
-    });
-  }
-  const today = new Date().toISOString().slice(0, 10);
-  return expenses.filter((e) => sameDate(e.date || e.createdAt, today));
-}
-
-function expenseAmount(expense = {}) {
-  if (expense.amount != null) return Number(expense.amount || 0) || 0;
-  return (Number(expense.qty || 0) || 0) * (Number(expense.unitPrice ?? expense.unit_price ?? 0) || 0);
-}
-
-function groupExpenses(expenses = []) {
-  const out = {};
-  for (const expense of expenses) {
-    const key = expense.name || expense.category || "Other";
-    out[key] = money((out[key] || 0) + expenseAmount(expense));
-  }
-  return out;
-}
-
-function positiveNumber(value, field) {
-  const n = Number(value);
-  if (!Number.isFinite(n) || n <= 0) throw new Error(`${field} must be greater than 0.`);
-  return n;
-}
-
-function nonNegativeNumber(value, field) {
-  const n = Number(value);
-  if (!Number.isFinite(n) || n < 0) throw new Error(`${field} must be greater than or equal to 0.`);
-  return n;
-}
-
-function positiveInteger(value, field) {
-  const n = Number(value);
-  if (!Number.isInteger(n) || n <= 0) throw new Error(`${field} must be a positive integer.`);
-  return n;
-}
-
-function findInventoryItem(state = {}, itemRef) {
-  const wanted = String(itemRef || "").trim().toLowerCase();
-  return inventoryRows(state).find((item) => {
-    return String(item.id || "").toLowerCase() === wanted || String(item.name || "").toLowerCase() === wanted;
-  });
-}
-
-function mutateInventory(state = {}, itemRef, updater) {
-  const wanted = String(itemRef || "").trim().toLowerCase();
-  if (!wanted) throw new Error("item is required.");
-  let found = false;
-  const nextInventory = (state.inventory || []).map((item) => {
-    const match =
-      String(item.id || "").toLowerCase() === wanted ||
-      String(item.name || "").toLowerCase() === wanted;
-    if (!match) return item;
-    found = true;
-    return updater(item);
-  });
-  if (!found) throw new Error(`Inventory item "${itemRef}" was not found.`);
-  return { ...state, inventory: nextInventory };
-}
-
-function addInventoryLedger(state, itemRef, qty, unit, workerName, note) {
-  const item = findInventoryItem(state, itemRef);
-  if (!item) return;
-  const now = new Date().toISOString();
-  state.inventoryLedger = [
-    {
-      id: `mcp_inv_${Date.now()}`,
-      itemId: item.id,
-      itemName: item.name,
-      qty,
-      unit: unit || item.unit || "",
-      worker: workerName || "",
-      note: note || "",
-      createdAt: now,
-      updatedAt: now,
-      source: "mcp",
-      syncStatus: "pending",
-      lastModifiedDeviceId: "mcp",
-    },
-    ...(state.inventoryLedger || []),
-  ];
-}
-
-function findPricedItem(list = [], id, name) {
-  const wantedId = String(id || "").trim().toLowerCase();
-  const wantedName = String(name || "").trim().toLowerCase();
-  return list.find((item) => {
-    return (
-      (wantedId && String(item.id || "").toLowerCase() === wantedId) ||
-      (wantedName && String(item.name || "").toLowerCase() === wantedName)
-    );
-  });
-}
-
-function updatePricedList(list = [], id, name, price, label) {
-  if (!id && !name) throw new Error(`${label}_id or ${label}_name is required.`);
-  let found = false;
-  const next = list.map((item) => {
-    const match = findPricedItem([item], id, name);
-    if (!match) return item;
-    found = true;
-    return { ...item, price, updatedAt: new Date().toISOString(), syncStatus: "pending" };
-  });
-  if (!found) throw new Error(`${label} was not found.`);
-  return next;
-}
-
-async function mirrorStateOrderDone(supabase, state, writeSeq, orderNo, patch) {
-  if (!Array.isArray(state.orders)) return;
-  let changed = false;
-  const nextOrders = state.orders.map((order) => {
-    const current = normalizeStateOrder(order);
-    if (Number(current.orderNo) !== Number(orderNo)) return order;
-    changed = true;
-    return {
-      ...order,
-      ...patch,
-      updatedAt: new Date().toISOString(),
-      syncStatus: "pending",
-      lastModifiedDeviceId: "mcp",
-    };
-  });
-  if (changed) await saveShopState(supabase, { ...state, orders: nextOrders }, writeSeq);
-}
-
-function closeOpenSessions(sessions = [], worker, at) {
-  return sessions.map((session) => {
-    const isOpen = !session.signOutAt && !session.endedAt && !session.endAt;
-    const isWorker = !worker || session.name === worker;
-    if (!isOpen || !isWorker) return session;
-    return {
-      ...session,
-      signOutAt: at,
-      endedAt: at,
-      updatedAt: at,
-      syncStatus: "pending",
-      lastModifiedDeviceId: "mcp",
-    };
-  });
-}
-
-async function handleTokenCreate(req, res) {
-  applyCors(req, res);
-  if (handleOptions(req, res)) return;
-  if (req.method !== "POST") return json(res, 405, { success: false, error: "Method not allowed." });
-
-  try {
-    const body = await readBody(req);
-    const admin = adminFromBody(body);
-    const token = generateToken();
-    const scopes = normalizeScopes(body.scopes || admin.defaultScopes);
-    const supabase = supabaseAdmin();
-    const { data, error } = await supabase
-      .from("mcp_connection_tokens")
-      .insert({
-        shop_id: SHOP_ID,
-        token_hash: hashToken(token),
-        token_prefix: displayPrefix(token),
-        name: body.name || `${admin.name} ChatGPT Connector`,
-        admin_id: admin.id,
-        admin_name: admin.name,
-        scopes,
-        active: true,
-        created_by: admin.id,
-        note: body.note || null,
-      })
-      .select("id, name, token_prefix, admin_id, admin_name, scopes, active, created_at, last_used_at, revoked_at")
-      .single();
-    if (error) throw error;
-    return json(res, 200, {
-      success: true,
-      token,
-      token_metadata: data,
-      connector_url: `${publicAppUrl()}/api/mcp?token=${encodeURIComponent(token)}`,
-      mcp_url: `${publicAppUrl()}/api/mcp`,
-      warning: "Copy this token now. It will not be shown again.",
-    });
-  } catch (err) {
-    return json(res, err.statusCode || 500, { success: false, error: err.message || String(err) });
-  }
-}
-
-async function handleTokenList(req, res) {
-  applyCors(req, res);
-  if (handleOptions(req, res)) return;
-  if (!["GET", "POST"].includes(req.method)) {
-    return json(res, 405, { success: false, error: "Method not allowed." });
-  }
-
-  try {
-    const body = req.method === "POST" ? await readBody(req) : {};
-    const admin = adminFromBody({
-      ...body,
-      admin_id: body.admin_id || req.headers["x-tux-admin-id"] || (req.query && req.query.admin_id),
-      admin_passcode:
-        body.admin_passcode ||
-        req.headers["x-tux-admin-passcode"] ||
-        (req.query && req.query.admin_passcode),
-    });
-    const supabase = supabaseAdmin();
-    const { data, error } = await supabase
-      .from("mcp_connection_tokens")
-      .select("id, name, token_prefix, admin_id, admin_name, scopes, active, created_at, last_used_at, revoked_at, created_by, note")
-      .eq("shop_id", SHOP_ID)
-      .eq("admin_id", admin.id)
-      .order("created_at", { ascending: false });
-    if (error) throw error;
-    return json(res, 200, { success: true, tokens: data || [] });
-  } catch (err) {
-    return json(res, err.statusCode || 500, { success: false, error: err.message || String(err) });
-  }
-}
-
-async function handleTokenRevoke(req, res) {
-  applyCors(req, res);
-  if (handleOptions(req, res)) return;
-  if (req.method !== "POST") return json(res, 405, { success: false, error: "Method not allowed." });
-
-  try {
-    const body = await readBody(req);
-    const admin = adminFromBody(body);
-    if (!body.token_id) throw new Error("token_id is required.");
-    const supabase = supabaseAdmin();
-    const { data, error } = await supabase
-      .from("mcp_connection_tokens")
-      .update({ active: false, revoked_at: new Date().toISOString() })
-      .eq("shop_id", SHOP_ID)
-      .eq("admin_id", admin.id)
-      .eq("id", body.token_id)
-      .select("id, name, token_prefix, admin_id, admin_name, scopes, active, created_at, last_used_at, revoked_at")
-      .maybeSingle();
-    if (error) throw error;
-    if (!data) throw new Error("Token was not found.");
-    return json(res, 200, { success: true, token: data });
-  } catch (err) {
-    return json(res, err.statusCode || 500, { success: false, error: err.message || String(err) });
-  }
-}
-
-function mcpResult(id, result) {
-  return { jsonrpc: "2.0", id, result };
-}
-
-function mcpError(id, code, message) {
-  return { jsonrpc: "2.0", id: id ?? null, error: { code, message } };
-}
-
-async function handleMcp(req, res) {
-  applyCors(req, res);
-  if (handleOptions(req, res)) return;
-
-  try {
-    if (req.method === "GET") {
-      await requireMcpAuth(req, { requiredScope: "read" });
-      return json(res, 200, {
-        name: "Tux Cashier MCP",
-        version: "1.0.0",
-        mcp_url: `${publicAppUrl()}/api/mcp`,
-        tools: getToolDefinitions(),
-      });
-    }
-
-    if (req.method !== "POST") {
-      return json(res, 405, { success: false, error: "Method not allowed." });
-    }
-
-    const body = await readBody(req);
-    const method = body.method || body.action;
-    const id = body.id ?? null;
-
-    if (method === "initialize") {
-      await requireMcpAuth(req, { requiredScope: "read" });
-      return json(
-        res,
-        200,
-        mcpResult(id, {
-          protocolVersion: body.params?.protocolVersion || "2024-11-05",
-          capabilities: { tools: {} },
-          serverInfo: { name: "Tux Cashier", version: "1.0.0" },
-        })
-      );
-    }
-
-    if (method === "notifications/initialized") {
-      res.statusCode = 204;
-      return res.end();
-    }
-
-    if (method === "tools/list" || method === "list_tools") {
-      await requireMcpAuth(req, { requiredScope: "read" });
-      return json(res, 200, mcpResult(id, { tools: getToolDefinitions() }));
-    }
-
-    if (method === "tools/call" || method === "call_tool") {
-      const params = body.params || body;
-      const name = params.name || params.tool_name;
-      if (!name) return json(res, 400, mcpError(id, -32602, "Tool name is required."));
-      const args = params.arguments || params.input || {};
-      if (!READ_TOOL_NAMES.has(name) && !WRITE_TOOL_NAMES.has(name)) {
-        return json(res, 400, mcpError(id, -32602, `Unknown tool: ${name}`));
-      }
-      const result = await callTool(req, name, args);
-      return json(
-        res,
-        200,
-        mcpResult(id, {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-          structuredContent: result,
-        })
-      );
-    }
-
-    return json(res, 400, mcpError(id, -32601, `Unsupported MCP method: ${method || "missing"}`));
-  } catch (err) {
-    return json(
-      res,
-      err.statusCode || 500,
-      req.body && req.body.jsonrpc
-        ? mcpError(req.body.id, err.statusCode === 401 ? -32001 : -32000, err.message || String(err))
-        : { success: false, error: err.message || String(err) }
-    );
-  }
-}
-
-module.exports = {
-  handleMcp,
-  handleTokenCreate,
-  handleTokenList,
-  handleTokenRevoke,
-  getToolDefinitions,
-  hashToken,
-};
+async function handleTokenCreate(req,res){ applyCors(req,res); if(handleOptions(req,res)) return; if(req.method!=="POST") return json(res,405,{success:false,error:"Method not allowed."}); try{ const body=await readBody(req); const admin=adminFromBody(body); const token=generateToken(); const scopes=normalizeScopes(body.scopes||admin.defaultScopes); const supabase=supabaseAdmin(); const {data,error}=await supabase.from("mcp_connection_tokens").insert({shop_id:SHOP_ID,token_hash:hashToken(token),token_prefix:displayPrefix(token),name:body.name||`${admin.name} ChatGPT Connector`,admin_id:admin.id,admin_name:admin.name,scopes,active:true,created_by:admin.id,note:body.note||null}).select("id, name, token_prefix, admin_id, admin_name, scopes, active, created_at, last_used_at, revoked_at").single(); if(error) throw error; return json(res,200,{success:true,token,token_metadata:data,connector_url:`${publicAppUrl()}/api/mcp?token=${encodeURIComponent(token)}`,mcp_url:`${publicAppUrl()}/api/mcp`,warning:"Copy this token now. It will not be shown again."}); }catch(err){ return json(res,err.statusCode||500,{success:false,error:err.message||String(err)}); } }
+async function handleTokenList(req,res){ applyCors(req,res); if(handleOptions(req,res)) return; if(!["GET","POST"].includes(req.method)) return json(res,405,{success:false,error:"Method not allowed."}); try{ const body=req.method==="POST"?await readBody(req):{}; const admin=adminFromBody({...body,admin_id:body.admin_id||req.headers["x-tux-admin-id"]||(req.query&&req.query.admin_id),admin_passcode:body.admin_passcode||req.headers["x-tux-admin-passcode"]||(req.query&&req.query.admin_passcode)}); const supabase=supabaseAdmin(); const {data,error}=await supabase.from("mcp_connection_tokens").select("id, name, token_prefix, admin_id, admin_name, scopes, active, created_at, last_used_at, revoked_at, created_by, note").eq("shop_id",SHOP_ID).eq("admin_id",admin.id).order("created_at",{ascending:false}); if(error) throw error; return json(res,200,{success:true,tokens:data||[]}); }catch(err){ return json(res,err.statusCode||500,{success:false,error:err.message||String(err)}); } }
+async function handleTokenRevoke(req,res){ applyCors(req,res); if(handleOptions(req,res)) return; if(req.method!=="POST") return json(res,405,{success:false,error:"Method not allowed."}); try{ const body=await readBody(req); const admin=adminFromBody(body); if(!body.token_id) throw new Error("token_id is required."); const supabase=supabaseAdmin(); const {data,error}=await supabase.from("mcp_connection_tokens").update({active:false,revoked_at:nowIso()}).eq("shop_id",SHOP_ID).eq("admin_id",admin.id).eq("id",body.token_id).select("id, name, token_prefix, admin_id, admin_name, scopes, active, created_at, last_used_at, revoked_at").maybeSingle(); if(error) throw error; if(!data) throw new Error("Token was not found."); return json(res,200,{success:true,token:data}); }catch(err){ return json(res,err.statusCode||500,{success:false,error:err.message||String(err)}); } }
+function mcpResult(id,result){ return {jsonrpc:"2.0",id,result}; }
+function mcpError(id,code,message){ return {jsonrpc:"2.0",id:id??null,error:{code,message}}; }
+async function handleMcp(req,res){ applyCors(req,res); if(handleOptions(req,res)) return; try{ if(req.method==="GET"){ await requireMcpAuth(req,{requiredScope:"read"}); return json(res,200,{name:"Tux Cashier MCP",version:"1.1.0",mcp_url:`${publicAppUrl()}/api/mcp`,tools:getToolDefinitions()}); } if(req.method!=="POST") return json(res,405,{success:false,error:"Method not allowed."}); const body=await readBody(req); const method=body.method||body.action; const id=body.id??null; if(method==="initialize"){ await requireMcpAuth(req,{requiredScope:"read"}); return json(res,200,mcpResult(id,{protocolVersion:body.params?.protocolVersion||"2024-11-05",capabilities:{tools:{}},serverInfo:{name:"Tux Cashier",version:"1.1.0"}})); } if(method==="notifications/initialized"){ res.statusCode=204; return res.end(); } if(method==="tools/list"||method==="list_tools"){ await requireMcpAuth(req,{requiredScope:"read"}); return json(res,200,mcpResult(id,{tools:getToolDefinitions()})); } if(method==="tools/call"||method==="call_tool"){ const params=body.params||body; const name=params.name||params.tool_name; if(!name) return json(res,400,mcpError(id,-32602,"Tool name is required.")); if(!READ_TOOL_NAMES.has(name)&&!WRITE_TOOL_NAMES.has(name)) return json(res,400,mcpError(id,-32602,`Unknown tool: ${name}`)); const result=await callTool(req,name,params.arguments||params.input||{}); return json(res,200,mcpResult(id,{content:[{type:"text",text:JSON.stringify(result,null,2)}],structuredContent:result})); } return json(res,400,mcpError(id,-32601,`Unsupported MCP method: ${method||"missing"}`)); }catch(err){ return json(res,err.statusCode||500,(req.body&&req.body.jsonrpc)?mcpError(req.body.id,err.statusCode===401?-32001:-32000,err.message||String(err)):{success:false,error:err.message||String(err)}); } }
+module.exports={handleMcp,handleTokenCreate,handleTokenList,handleTokenRevoke,getToolDefinitions,hashToken};
