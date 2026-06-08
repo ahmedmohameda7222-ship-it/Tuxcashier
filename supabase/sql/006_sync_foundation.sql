@@ -130,8 +130,10 @@ drop policy if exists "anon can insert devices" on public.devices;
 create policy "anon can insert devices" on public.devices for insert to anon with check (true);
 drop policy if exists "anon can update devices" on public.devices;
 create policy "anon can update devices" on public.devices for update to anon using (true) with check (true);
+drop policy if exists "anon can delete devices" on public.devices;
+create policy "anon can delete devices" on public.devices for delete to anon using (true);
 
-grant select, insert, update on public.devices to anon;
+grant select, insert, update, delete on public.devices to anon;
 
 do $$
 begin

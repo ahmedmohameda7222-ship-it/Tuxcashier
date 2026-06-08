@@ -186,3 +186,22 @@ export async function getLocalDbStatus() {
     pendingCount: (events || []).filter((event) => event.status === "pending").length,
   };
 }
+
+export async function deleteLocalDatabase() {
+  const db = await openLocalDb();
+  if (!db) return false;
+  const storeNames = [ORDER_STORE, OUTBOX_STORE, META_STORE].filter((store) =>
+    db.objectStoreNames.contains(store)
+  );
+  if (!storeNames.length) {
+    db.close();
+    return true;
+  }
+  const tx = db.transaction(storeNames, "readwrite");
+  for (const storeName of storeNames) {
+    tx.objectStore(storeName).clear();
+  }
+  await txDone(tx);
+  db.close();
+  return true;
+}

@@ -97,11 +97,17 @@ to anon
 using (true)
 with check (true);
 
+drop policy if exists "anon can delete devices" on public.devices;
+create policy "anon can delete devices"
+on public.devices for delete
+to anon
+using (true);
+
 grant usage on schema public to anon;
 grant select, insert, update, delete on public.pos_state to anon;
 grant select, insert, update, delete on public.orders to anon;
 grant select, insert, update, delete on public.counters to anon;
-grant select, insert, update on public.devices to anon;
+grant select, insert, update, delete on public.devices to anon;
 grant execute on function public.allocate_order_no(text) to anon;
 grant execute on function public.reset_order_counter(text, integer) to anon;
 

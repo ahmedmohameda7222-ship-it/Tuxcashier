@@ -4,6 +4,7 @@ import autoTable from "jspdf-autotable";
 import { isSupabaseConfigured, supabase } from "./supabaseClient";
 import { getDeviceId } from "./services/deviceId";
 import {
+  deleteLocalDatabase,
   getLocalDbStatus,
   loadLocalOrdersFromDb,
   markLocalOrderSynced,
@@ -5696,7 +5697,12 @@ useEffect(() => {
 useEffect(() => {
   if (localHydrated) return;
   const l = loadLocal();
-  if (l.menu) setMenu(normalizeMenuList(l.menu));
+  if (Array.isArray(l.menu)) {
+    const localMenu = normalizeMenuList(l.menu);
+    setMenu(localMenu.length ? localMenu : normalizeMenuList(BASE_MENU));
+  } else if (l.menu) {
+    setMenu(normalizeMenuList(l.menu));
+  }
   if (l.extraList) setExtraList(normalizeExtraList(l.extraList));
   if (l.beverageList) setBeverageList(normalizeBeverageList(l.beverageList));
   if (l.workers) setWorkers(l.workers);
@@ -6442,7 +6448,9 @@ const applyRemoteState = useCallback(
       (!adminHasUnsavedChanges &&
         canUseRemoteSection(ADMIN_SETTINGS_SECTION));
     if (canApplyAdminSettings) {
-      if (unpacked.menu) setMenu(unpacked.menu);
+      if (Array.isArray(unpacked.menu)) {
+        setMenu(unpacked.menu.length ? unpacked.menu : normalizeMenuList(BASE_MENU));
+      }
       if (unpacked.extraList) setExtraList(unpacked.extraList);
       if (unpacked.beverageList) setBeverageList(unpacked.beverageList);
       if (unpacked.utilityBills) setUtilityBills(normalizeUtilityBills(unpacked.utilityBills));
@@ -8164,6 +8172,174 @@ const workerMonthlyTotalPay = useMemo(
     setBulkInventoryHistory([]);
     setBulkRefillItemId("");
     setBulkHistoryItemId("all");
+  };
+
+  const restoreBaseBurgerItems = async () => {
+    const adminNum = await promptAdminAndPin();
+    if (!adminNum) return;
+    if (
+      !window.confirm(
+        `Admin ${adminNum}: restore the original burger/items and extras list? Current menu and extras will be replaced.`
+      )
+    ) {
+      return;
+    }
+
+    const defaultMenu = normalizeMenuList(BASE_MENU);
+    const defaultExtras = normalizeExtraList(BASE_EXTRAS);
+    const defaultBeverages = normalizeBeverageList(BASE_BEVERAGES);
+    const stamp = nowIso();
+    const sectionUpdatedAt = addSectionUpdatedAt(
+      loadLocal()?.[SECTION_UPDATED_AT_KEY],
+      [ADMIN_SETTINGS_SECTION],
+      stamp
+    );
+    const adminPatch = {
+      menu: defaultMenu,
+      extraList: defaultExtras,
+      beverageList: defaultBeverages,
+      [SECTION_UPDATED_AT_KEY]: sectionUpdatedAt,
+      adminSettingsUpdatedAt: stamp,
+    };
+
+    setMenu(defaultMenu);
+    setExtraList(defaultExtras);
+    setBeverageList(defaultBeverages);
+    setSelectedItems({});
+    setSelectedExtras({});
+    setSelectedBeverages({});
+    setComboBeverageSelections({});
+    saveLocalPartial(adminPatch, {
+      sections: [ADMIN_SETTINGS_SECTION],
+      updatedAt: stamp,
+    });
+    setAdminSavedSnapshot(buildAdminSettingsSnapshot(adminPatch));
+
+    if (cloudEnabled && stateDocRef && fbUser && currentDeviceCanWrite) {
+      try {
+        const remoteState = await loadPosState().catch(() => null);
+        const currentSeq = Number(remoteState?.writeSeq || writeSeqRef.current || 0);
+        const restoredState = {
+          ...buildFullStateForCloud({}, { useCurrentAdminDraft: true }),
+          ...adminPatch,
+          updatedAt: stamp,
+          writerId: clientIdRef.current,
+          deviceId: clientIdRef.current,
+          lastModifiedDeviceId: clientIdRef.current,
+          syncStatus: SYNC_STATUS.synced,
+          pendingSync: false,
+        };
+        const body = {
+          ...packStateForCloud(restoredState),
+          writerId: clientIdRef.current,
+          deviceId: clientIdRef.current,
+          lastModifiedDeviceId: clientIdRef.current,
+          writeSeq: currentSeq + 1,
+          clientTime: Date.now(),
+          syncStatus: SYNC_STATUS.synced,
+          pendingSync: false,
+        };
+        const saved = await savePosStateOptimistic(body, currentSeq);
+        if (!saved) throw new Error("Cloud changed while restoring. Press Sync to Cloud after reviewing the menu.");
+        writeSeqRef.current = currentSeq + 1;
+        setCloudStatus((s) => ({ ...s, lastSaveAt: new Date(), error: null }));
+        alert("Original burger/items and extras restored locally and in Supabase.");
+        return;
+      } catch (err) {
+        const message = String(err?.message || err);
+        setCloudStatus((s) => ({ ...s, error: message }));
+        alert("Restored locally. Cloud restore failed: " + message);
+        return;
+      }
+    }
+
+    alert("Original burger/items and extras restored locally. Use Sync to Cloud when ready.");
+  };
+
+  const deleteCurrentLocalBaseData = async () => {
+    const adminNum = await promptAdminAndPin();
+    if (!adminNum) return;
+    const typed = await promptText(
+      `Admin ${adminNum}: type DELETE LOCAL DATA to clear this device's saved local POS data.`,
+      ""
+    );
+    if (norm(typed) !== "DELETE LOCAL DATA") {
+      alert("Local data delete cancelled.");
+      return;
+    }
+
+    try {
+      if (typeof localStorage !== "undefined") {
+        localStorage.removeItem(LS_KEY);
+      }
+      await deleteLocalDatabase();
+      setLocalDbStatus({ available: true, orderCount: 0, pendingCount: 0 });
+      alert("Local data deleted. The app will reload now.");
+      window.location.reload();
+    } catch (err) {
+      const message = String(err?.message || err);
+      console.warn("Delete local data failed:", err);
+      alert("Delete local data failed: " + message);
+    }
+  };
+
+  const resetSupabaseDatabase = async () => {
+    const adminNum = await promptAdminAndPin();
+    if (!adminNum) return;
+    if (!supabase) return alert("Supabase is not configured.");
+    if (!currentDeviceCanAdmin) {
+      return alert("This device is not allowed to fully reset Supabase.");
+    }
+    const typed = await promptText(
+      `Admin ${adminNum}: type RESET SUPABASE DATABASE to delete all POS cloud data for this shop.`,
+      ""
+    );
+    if (norm(typed) !== "RESET SUPABASE DATABASE") {
+      alert("Supabase reset cancelled.");
+      return;
+    }
+
+    const failures = [];
+    const deleteShopRows = async (table) => {
+      const { error } = await supabase.from(table).delete().eq("shop_id", SHOP_ID);
+      if (error) failures.push(`${table}: ${error.message || error}`);
+    };
+
+    await deleteShopRows("orders");
+    await deleteShopRows("pos_state");
+    await deleteShopRows("counters");
+    await deleteShopRows("devices");
+
+    if (failures.length) {
+      const message = failures.join(" | ");
+      setCloudStatus((s) => ({ ...s, error: message }));
+      alert("Supabase reset partly failed: " + message);
+      return;
+    }
+
+    try {
+      if (typeof localStorage !== "undefined") {
+        localStorage.removeItem(LS_KEY);
+      }
+      await deleteLocalDatabase();
+    } catch (err) {
+      console.warn("Local cleanup after Supabase reset failed:", err);
+    }
+
+    setOrders([]);
+    setExpenses([]);
+    setPurchases([]);
+    setCustomers([]);
+    setBankTx([]);
+    setReconHistory([]);
+    setWorkerSessions([]);
+    setNextOrderNo(1);
+    setMenu(normalizeMenuList(BASE_MENU));
+    setExtraList(normalizeExtraList(BASE_EXTRAS));
+    setBeverageList(normalizeBeverageList(BASE_BEVERAGES));
+    setCloudStatus((s) => ({ ...s, lastSaveAt: null, lastLoadAt: null, error: null }));
+    alert("Supabase POS data reset. The app will reload now.");
+    window.location.reload();
   };
 
   const resetAllCustomerContacts = async () => {
@@ -17000,6 +17176,22 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
       {activeTab === "admin" && adminSubTab === "edit" && (
         <div>
           <h2>Edit</h2>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
+            <button
+              onClick={restoreBaseBurgerItems}
+              style={{
+                background: "#2e7d32",
+                color: "#fff",
+                border: "none",
+                borderRadius: 6,
+                padding: "8px 12px",
+                cursor: "pointer",
+                fontWeight: 700,
+              }}
+            >
+              Restore Original Burger/Items
+            </button>
+          </div>
           {/* Items editor */}
           <h3>Menu Items</h3>
           <table style={{ width: "100%", borderCollapse: "collapse", marginBottom: 12 }}>
@@ -18269,6 +18461,62 @@ setExtraList((arr) => [
   )}
 </div>
 
+            </div>
+            <div style={{ padding: 10, borderRadius: 6, border: `1px solid ${cardBorder}` }}>
+              <h4 style={{ marginTop: 0 }}>Reset / Recovery</h4>
+              <div style={{ display: "grid", gap: 8 }}>
+                <button
+                  onClick={restoreBaseBurgerItems}
+                  style={{
+                    background: "#2e7d32",
+                    color: "#fff",
+                    border: "none",
+                    borderRadius: 6,
+                    padding: "8px 12px",
+                    cursor: "pointer",
+                    fontWeight: 700,
+                    textAlign: "left",
+                  }}
+                >
+                  Restore Original Burger/Items
+                </button>
+                <button
+                  onClick={deleteCurrentLocalBaseData}
+                  style={{
+                    background: "#ef6c00",
+                    color: "#fff",
+                    border: "none",
+                    borderRadius: 6,
+                    padding: "8px 12px",
+                    cursor: "pointer",
+                    fontWeight: 700,
+                    textAlign: "left",
+                  }}
+                >
+                  Delete Current Local Data
+                </button>
+                <button
+                  onClick={resetSupabaseDatabase}
+                  disabled={!isSupabaseConfigured || !currentDeviceCanAdmin}
+                  style={{
+                    background:
+                      !isSupabaseConfigured || !currentDeviceCanAdmin ? "#9e9e9e" : "#b71c1c",
+                    color: "#fff",
+                    border: "none",
+                    borderRadius: 6,
+                    padding: "8px 12px",
+                    cursor:
+                      !isSupabaseConfigured || !currentDeviceCanAdmin ? "not-allowed" : "pointer",
+                    fontWeight: 700,
+                    textAlign: "left",
+                  }}
+                >
+                  Fully Reset Supabase Database
+                </button>
+                <small style={{ opacity: 0.8 }}>
+                  Reset actions require an Admin PIN and typed confirmation.
+                </small>
+              </div>
             </div>
           </div>
         </div>
