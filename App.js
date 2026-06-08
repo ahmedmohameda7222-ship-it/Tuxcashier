@@ -8195,88 +8195,6 @@ const workerMonthlyTotalPay = useMemo(
     setBulkHistoryItemId("all");
   };
 
-  const restoreBaseBurgerItems = async () => {
-    const adminNum = await promptAdminAndPin();
-    if (!adminNum) return;
-    if (
-      !window.confirm(
-        `Admin ${adminNum}: restore the original burger/items and extras list? Current menu and extras will be replaced.`
-      )
-    ) {
-      return;
-    }
-
-    const defaultMenu = normalizeMenuList(BASE_MENU);
-    const defaultExtras = normalizeExtraList(BASE_EXTRAS);
-    const defaultBeverages = normalizeBeverageList(BASE_BEVERAGES);
-    const stamp = nowIso();
-    const sectionUpdatedAt = addSectionUpdatedAt(
-      loadLocal()?.[SECTION_UPDATED_AT_KEY],
-      [ADMIN_SETTINGS_SECTION],
-      stamp
-    );
-    const adminPatch = {
-      menu: defaultMenu,
-      extraList: defaultExtras,
-      beverageList: defaultBeverages,
-      [SECTION_UPDATED_AT_KEY]: sectionUpdatedAt,
-      adminSettingsUpdatedAt: stamp,
-    };
-
-    setMenu(defaultMenu);
-    setExtraList(defaultExtras);
-    setBeverageList(defaultBeverages);
-    setSelectedItems({});
-    setSelectedExtras({});
-    setSelectedBeverages({});
-    setComboBeverageSelections({});
-    saveLocalPartial(adminPatch, {
-      sections: [ADMIN_SETTINGS_SECTION],
-      updatedAt: stamp,
-    });
-    setAdminSavedSnapshot(buildAdminSettingsSnapshot(adminPatch));
-
-    if (cloudEnabled && stateDocRef && fbUser && currentDeviceCanWrite) {
-      try {
-        const remoteState = await loadPosState().catch(() => null);
-        const currentSeq = Number(remoteState?.writeSeq || writeSeqRef.current || 0);
-        const restoredState = {
-          ...buildFullStateForCloud({}, { useCurrentAdminDraft: true }),
-          ...adminPatch,
-          updatedAt: stamp,
-          writerId: clientIdRef.current,
-          deviceId: clientIdRef.current,
-          lastModifiedDeviceId: clientIdRef.current,
-          syncStatus: SYNC_STATUS.synced,
-          pendingSync: false,
-        };
-        const body = {
-          ...packStateForCloud(restoredState),
-          writerId: clientIdRef.current,
-          deviceId: clientIdRef.current,
-          lastModifiedDeviceId: clientIdRef.current,
-          writeSeq: currentSeq + 1,
-          clientTime: Date.now(),
-          syncStatus: SYNC_STATUS.synced,
-          pendingSync: false,
-        };
-        const saved = await savePosStateOptimistic(body, currentSeq);
-        if (!saved) throw new Error("Cloud changed while restoring. Press Sync to Cloud after reviewing the menu.");
-        writeSeqRef.current = currentSeq + 1;
-        setCloudStatus((s) => ({ ...s, lastSaveAt: new Date(), error: null }));
-        alert("Original burger/items and extras restored locally and in Supabase.");
-        return;
-      } catch (err) {
-        const message = String(err?.message || err);
-        setCloudStatus((s) => ({ ...s, error: message }));
-        alert("Restored locally. Cloud restore failed: " + message);
-        return;
-      }
-    }
-
-    alert("Original burger/items and extras restored locally. Use Sync to Cloud when ready.");
-  };
-
   const deleteCurrentLocalBaseData = async () => {
     const adminNum = await promptAdminAndPin();
     if (!adminNum) return;
@@ -17199,22 +17117,6 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
       {activeTab === "admin" && adminSubTab === "edit" && (
         <div>
           <h2>Edit</h2>
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
-            <button
-              onClick={restoreBaseBurgerItems}
-              style={{
-                background: "#2e7d32",
-                color: "#fff",
-                border: "none",
-                borderRadius: 6,
-                padding: "8px 12px",
-                cursor: "pointer",
-                fontWeight: 700,
-              }}
-            >
-              Restore Original Burger/Items
-            </button>
-          </div>
           {/* Items editor */}
           <h3>Menu Items</h3>
           <table style={{ width: "100%", borderCollapse: "collapse", marginBottom: 12 }}>
@@ -18488,21 +18390,6 @@ setExtraList((arr) => [
             <div style={{ padding: 10, borderRadius: 6, border: `1px solid ${cardBorder}` }}>
               <h4 style={{ marginTop: 0 }}>Reset / Recovery</h4>
               <div style={{ display: "grid", gap: 8 }}>
-                <button
-                  onClick={restoreBaseBurgerItems}
-                  style={{
-                    background: "#2e7d32",
-                    color: "#fff",
-                    border: "none",
-                    borderRadius: 6,
-                    padding: "8px 12px",
-                    cursor: "pointer",
-                    fontWeight: 700,
-                    textAlign: "left",
-                  }}
-                >
-                  Restore Original Burger/Items
-                </button>
                 <button
                   onClick={deleteCurrentLocalBaseData}
                   style={{
