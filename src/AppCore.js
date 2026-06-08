@@ -3318,7 +3318,7 @@ function findInventoryIdForPurchase(row, inventory, purchaseCategories) {
   return byItem ? byItem.id : null;
 }
 const DEFAULT_ADMIN_PINS = {
-  1: "1111",
+  1: "3011",
   2: "2222",
   3: "3333",
   4: "4444",
@@ -5425,6 +5425,7 @@ useEffect(() => {
   const [newExpUnitPrice, setNewExpUnitPrice] = useState(0);
   const [newExpNote, setNewExpNote] = useState("");
 const [adminUnlocked, setAdminUnlocked] = useState(false);
+const [activeAdminIdentity, setActiveAdminIdentity] = useState(null);
 const removeBankTx = (id) => {
   setBankTx(arr => {
     const row = arr.find(t => t.id === id);
@@ -10972,9 +10973,14 @@ const endedStr   = m.endedAt   ? fmtDateTime(m.endedAt)   : "—";
 const handleTabClick = async (key) => {
   if (key === "admin") {
     if (!adminUnlocked) {
-      const ok = !!(await promptAdminAndPin()); // uses your existing Admin PINs (1..6)
-      if (!ok) return;                  // stay on current tab if PIN fails/cancelled
+      const adminNum = await promptAdminAndPin(); // uses your existing Admin PINs (1..6)
+      if (!adminNum) return;                  // stay on current tab if PIN fails/cancelled
       setAdminUnlocked(true);
+      setActiveAdminIdentity({
+        adminId: `admin_${adminNum}`,
+        adminName: `Admin ${adminNum}`,
+        adminNumber: adminNum,
+      });
     }
   }
   setActiveTab(key);
@@ -11470,7 +11476,7 @@ const generatePurchasesPDF = () => {
         Save Admin Settings
       </button>
       <button
-        onClick={() => { setAdminUnlocked(false); setActiveTab("orders"); }} // optional: kick out of Admin
+        onClick={() => { setAdminUnlocked(false); setActiveAdminIdentity(null); setActiveTab("orders"); }} // optional: kick out of Admin
         style={{ padding: "6px 10px", borderRadius: 6, border: `1px solid ${btnBorder}` }}
       >
         Lock Admin
@@ -11485,10 +11491,18 @@ const generatePurchasesPDF = () => {
     btnBorder={btnBorder}
     softBg={softBg}
     adminUnlocked={adminUnlocked}
+    activeAdmin={activeAdminIdentity}
     ensureAdminUnlocked={async () => {
-      const ok = !!(await promptAdminAndPin());
-      if (ok) setAdminUnlocked(true);
-      return ok;
+      const adminNum = await promptAdminAndPin();
+      if (!adminNum) return null;
+      const identity = {
+        adminId: `admin_${adminNum}`,
+        adminName: `Admin ${adminNum}`,
+        adminNumber: adminNum,
+      };
+      setAdminUnlocked(true);
+      setActiveAdminIdentity(identity);
+      return identity;
     }}
   />
 )}

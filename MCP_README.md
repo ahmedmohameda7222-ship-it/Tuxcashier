@@ -14,7 +14,7 @@ Tux Cashier now has server-side MCP endpoints for ChatGPT connectors:
   - `GET /api/mcp/token/list`
   - `POST /api/mcp/token/revoke`
 
-The Admin tab now includes a `ChatGPT Connection` subsection. It lets an unlocked admin generate a connection token, copy the MCP URL, copy the token once, copy the full connector URL, list token metadata, and revoke existing tokens.
+The Admin tab now includes a `ChatGPT Connection` subsection. It lets an unlocked admin create a token bound to that admin identity, copy the MCP URL once, see created/last-used dates, and revoke that admin's token.
 
 The website cannot automatically install a connector into your ChatGPT account. It generates the secure URL that you paste into ChatGPT manually.
 
@@ -23,16 +23,18 @@ The website cannot automatically install a connector into your ChatGPT account. 
 - Raw tokens use this format: `tux_mcp_live_xxxxxxxxxxxxxxxxxxxxxxxxxxxxx`
 - Raw tokens are shown only once after creation.
 - Raw tokens are not stored in Supabase.
-- Supabase stores only `token_hash`, `token_prefix`, scopes, status, and timestamps.
+- Supabase stores only `token_hash`, `token_prefix`, `admin_id`, `admin_name`, scopes, status, and timestamps.
 - Token hashing is done server-side with `sha256(token + ":" + TUX_MCP_TOKEN_PEPPER)`.
+- Admin 1's MCP passcode is verified server-side with a hash. The default Admin 1 passcode is `3011`; override the hash and pepper in Vercel for production.
 - `TUX_MCP_TOKEN_PEPPER` must be a server-only Vercel environment variable.
-- `SUPABASE_SERVICE_ROLE_KEY`, `TUX_MCP_ADMIN_SECRET`, and `TUX_MCP_TOKEN_PEPPER` must never use `REACT_APP_`.
+- `SUPABASE_SERVICE_ROLE_KEY`, `TUX_MCP_TOKEN_PEPPER`, `TUX_ADMIN_PASSCODE_PEPPER`, and `TUX_ADMIN_1_PASSCODE_HASH` must never use `REACT_APP_`.
 - Revoking a token marks it inactive and sets `revoked_at`; it does not physically delete the row.
 
 ## MCP Tools
 
 Read tools require a valid MCP token with read scope:
 
+- `get_connection_info`
 - `get_today_sales_report`
 - `get_inventory_status`
 - `get_recent_orders`
@@ -43,7 +45,7 @@ Read tools require a valid MCP token with read scope:
 - `get_bank_summary`
 - `get_current_shift`
 
-Write/admin tools require a valid MCP token with write scope and `admin_secret`:
+Write/admin tools require a valid MCP token with the matching write scope. ChatGPT does not pass an admin passcode or `admin_secret`; the backend resolves the token to `admin_id`, `admin_name`, and scopes.
 
 - `add_inventory_restock`
 - `adjust_inventory_quantity`
@@ -81,15 +83,24 @@ SUPABASE_URL=
 SUPABASE_ANON_KEY=
 SUPABASE_SERVICE_ROLE_KEY=
 TUX_SHOP_ID=tux
-TUX_MCP_ADMIN_SECRET=
 TUX_MCP_TOKEN_PEPPER=
+TUX_ADMIN_PASSCODE_PEPPER=
+TUX_ADMIN_1_PASSCODE_HASH=
 TUX_MCP_ALLOWED_ORIGIN=https://tuxcashier.vercel.app
 TUX_PUBLIC_APP_URL=https://tuxcashier.vercel.app
 ```
 
-Only `REACT_APP_SUPABASE_URL` and `REACT_APP_SUPABASE_ANON_KEY` are browser-safe. Keep the service role key, admin secret, and token pepper server-only.
+Only `REACT_APP_SUPABASE_URL` and `REACT_APP_SUPABASE_ANON_KEY` are browser-safe. Keep the service role key, token pepper, admin passcode pepper, and admin passcode hash server-only.
 
-Use a long random value for `TUX_MCP_ADMIN_SECRET`, and a different long random value for `TUX_MCP_TOKEN_PEPPER`.
+Use long random values for `TUX_MCP_TOKEN_PEPPER` and `TUX_ADMIN_PASSCODE_PEPPER`.
+
+Generate an Admin 1 passcode hash for passcode `3011` with the same pepper you put in Vercel:
+
+```bash
+node -e "const crypto=require('crypto'); const pepper=process.env.TUX_ADMIN_PASSCODE_PEPPER; console.log(crypto.createHash('sha256').update('admin_1:3011:'+pepper).digest('hex'))"
+```
+
+Set that output as `TUX_ADMIN_1_PASSCODE_HASH`. If you do not set it, the server has a built-in hash for Admin 1 passcode `3011` using the default pepper, but production should use your own pepper and hash.
 
 ## Deploy On Vercel
 
@@ -98,10 +109,10 @@ Use a long random value for `TUX_MCP_ADMIN_SECRET`, and a different long random 
 3. In Vercel, add the environment variables listed above.
 4. Redeploy the project.
 5. Open `https://tuxcashier.vercel.app/`.
-6. Sign in to the app and unlock Admin.
+6. Sign in to the app and unlock Admin 1 with passcode `3011`.
 7. Open `Admin -> ChatGPT Connection`.
-8. Enter the MCP admin secret and generate a token.
-9. Copy the full connector URL.
+8. Enter the Admin 1 passcode and click `Connect this admin to ChatGPT`.
+9. Copy the ChatGPT MCP URL.
 
 `vercel.json` keeps `/api/*` routed to Vercel functions and everything else routed to the CRA app.
 
@@ -150,6 +161,14 @@ curl -X POST "https://tuxcashier.vercel.app/api/mcp?token=YOUR_TOKEN" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_today_sales_report","arguments":{}}}'
 ```
 
+Check which admin the connector is using:
+
+```bash
+curl -X POST "https://tuxcashier.vercel.app/api/mcp?token=YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_connection_info","arguments":{}}}'
+```
+
 Verify these cases:
 
 - missing token is rejected
@@ -157,8 +176,9 @@ Verify these cases:
 - revoked token is rejected
 - valid token can list tools
 - valid token can call read tools
-- write tools reject missing `admin_secret`
-- write tools work only with valid `admin_secret` and write scope
+- `get_connection_info` returns `admin_1`, `Admin 1`, scopes, and `can_write`
+- write tools work without `admin_secret` when the token has the matching write scope
+- write tools record `admin_id` and `admin_name` in `mcp_audit_logs`
 - raw token never appears in `mcp_connection_tokens`
 - `last_used_at` updates after valid MCP calls
 

@@ -5,8 +5,30 @@ const SHOP_ID = process.env.TUX_SHOP_ID || "tux";
 const POS_STATE_ID = "pos";
 const DEFAULT_APP_URL = "https://tuxcashier.vercel.app";
 const TOKEN_PREFIX = "tux_mcp_live_";
+const DEFAULT_ADMIN_PASSCODE_PEPPER = "tux_mcp_admin_passcode_v1";
+const DEFAULT_ADMIN_SCOPES = [
+  "read:orders",
+  "read:inventory",
+  "read:reports",
+  "write:inventory",
+  "write:orders",
+  "write:expenses",
+  "write:prices",
+  "write:shift",
+];
+const ADMIN_DEFINITIONS = {
+  admin_1: {
+    id: "admin_1",
+    name: "Admin 1",
+    hashEnv: "TUX_ADMIN_1_PASSCODE_HASH",
+    defaultPasscodeHash:
+      "6e1411ae870ac31e280bce1db84b87e03c9c44a92d10c396c7b5ac8fd063a635",
+    defaultScopes: DEFAULT_ADMIN_SCOPES,
+  },
+};
 
 const READ_TOOL_NAMES = new Set([
+  "get_connection_info",
   "get_today_sales_report",
   "get_inventory_status",
   "get_recent_orders",
@@ -28,6 +50,27 @@ const WRITE_TOOL_NAMES = new Set([
   "add_expense",
   "change_shift",
 ]);
+
+const TOOL_SCOPES = {
+  get_connection_info: "read:reports",
+  get_today_sales_report: "read:reports",
+  get_inventory_status: "read:inventory",
+  get_recent_orders: "read:orders",
+  get_order_by_number: "read:orders",
+  get_menu_items: "read:inventory",
+  get_worker_sales_report: "read:reports",
+  get_expenses_report: "read:reports",
+  get_bank_summary: "read:reports",
+  get_current_shift: "read:reports",
+  add_inventory_restock: "write:inventory",
+  adjust_inventory_quantity: "write:inventory",
+  update_item_price: "write:prices",
+  update_extra_price: "write:prices",
+  mark_order_done: "write:orders",
+  void_order: "write:orders",
+  add_expense: "write:expenses",
+  change_shift: "write:shift",
+};
 
 function getEnv(...names) {
   for (const name of names) {
@@ -132,28 +175,93 @@ function displayPrefix(token) {
 }
 
 function normalizeScopes(scopes) {
-  const arr = Array.isArray(scopes) ? scopes : ["read"];
+  const arr = Array.isArray(scopes) ? scopes : DEFAULT_ADMIN_SCOPES;
   const clean = arr
     .map((scope) => String(scope || "").trim().toLowerCase())
-    .filter((scope) => ["read", "write", "admin"].includes(scope));
-  return clean.length ? Array.from(new Set(clean)) : ["read"];
+    .filter((scope) =>
+      [
+        "read",
+        "write",
+        "admin",
+        "read:orders",
+        "read:inventory",
+        "read:reports",
+        "write:inventory",
+        "write:orders",
+        "write:expenses",
+        "write:prices",
+        "write:shift",
+      ].includes(scope)
+    );
+  return clean.length ? Array.from(new Set(clean)) : DEFAULT_ADMIN_SCOPES;
 }
 
 function hasScope(scopes, required) {
   const set = new Set(normalizeScopes(scopes));
-  if (required === "read") return set.has("read") || set.has("write") || set.has("admin");
-  if (required === "write") return set.has("write") || set.has("admin");
+  if (!required) return true;
+  if (set.has("admin")) return true;
+  if (required.startsWith("read:")) return set.has(required) || set.has("read") || set.has("write");
+  if (required.startsWith("write:")) return set.has(required) || set.has("write");
+  if (required === "read") return set.has("read") || set.has("write") || hasAnyScope(set, "read:");
+  if (required === "write") return set.has("write") || hasAnyScope(set, "write:");
   return set.has(required);
 }
 
-function requireAdminSecret(value) {
-  const expected = process.env.TUX_MCP_ADMIN_SECRET || "";
-  if (!expected) throw new Error("TUX_MCP_ADMIN_SECRET is not configured server-side.");
-  if (!value || String(value) !== expected) {
-    const err = new Error("Invalid admin secret.");
+function hasAnyScope(scopeSet, prefix) {
+  for (const scope of scopeSet) {
+    if (scope.startsWith(prefix)) return true;
+  }
+  return false;
+}
+
+function adminPasscodePepper() {
+  return process.env.TUX_ADMIN_PASSCODE_PEPPER || DEFAULT_ADMIN_PASSCODE_PEPPER;
+}
+
+function hashAdminPasscode(adminId, passcode, pepper = adminPasscodePepper()) {
+  return crypto
+    .createHash("sha256")
+    .update(String(adminId || ""))
+    .update(":")
+    .update(String(passcode || ""))
+    .update(":")
+    .update(String(pepper || ""))
+    .digest("hex");
+}
+
+function safeAdminDefinition(adminId) {
+  const normalized = String(adminId || "").trim().toLowerCase().replace(/^admin(\d+)$/, "admin_$1");
+  return ADMIN_DEFINITIONS[normalized] || null;
+}
+
+function verifyAdminPasscode(adminId, passcode) {
+  const admin = safeAdminDefinition(adminId);
+  if (!admin) {
+    const err = new Error("Unknown admin.");
+    err.statusCode = 400;
+    throw err;
+  }
+  const expectedHash = process.env[admin.hashEnv] || admin.defaultPasscodeHash;
+  const actualHash = hashAdminPasscode(admin.id, passcode);
+  const expected = Buffer.from(String(expectedHash || ""), "hex");
+  const actual = Buffer.from(String(actualHash || ""), "hex");
+  if (!expected.length || expected.length !== actual.length || !crypto.timingSafeEqual(expected, actual)) {
+    const err = new Error("Invalid admin passcode.");
     err.statusCode = 401;
     throw err;
   }
+  return admin;
+}
+
+function adminFromBody(body = {}) {
+  const adminId = body.admin_id || body.adminId || body.admin || "admin_1";
+  const passcode = body.admin_passcode || body.adminPasscode || body.passcode;
+  if (!passcode) {
+    const err = new Error("admin_passcode is required.");
+    err.statusCode = 401;
+    throw err;
+  }
+  return verifyAdminPasscode(adminId, passcode);
 }
 
 function tokenFromReq(req) {
@@ -185,7 +293,7 @@ async function requireMcpAuth(req, options = {}) {
   const tokenHash = hashToken(token);
   const { data, error } = await supabase
     .from("mcp_connection_tokens")
-    .select("id, shop_id, scopes, active, revoked_at")
+    .select("id, shop_id, admin_id, admin_name, scopes, active, revoked_at, expires_at")
     .eq("token_hash", tokenHash)
     .eq("shop_id", SHOP_ID)
     .maybeSingle();
@@ -193,6 +301,11 @@ async function requireMcpAuth(req, options = {}) {
   if (error) throw error;
   if (!data || data.active === false || data.revoked_at) {
     const err = new Error("Invalid or revoked MCP connection token.");
+    err.statusCode = 401;
+    throw err;
+  }
+  if (data.expires_at && new Date(data.expires_at).getTime() <= Date.now()) {
+    const err = new Error("Expired MCP connection token.");
     err.statusCode = 401;
     throw err;
   }
@@ -209,7 +322,19 @@ async function requireMcpAuth(req, options = {}) {
     .update({ last_used_at: new Date().toISOString() })
     .eq("id", data.id);
 
-  return { supabase, tokenRecord: data, shopId: data.shop_id || SHOP_ID };
+  const context = {
+    adminId: data.admin_id || "unknown_admin",
+    adminName: data.admin_name || "Unknown Admin",
+    scopes: normalizeScopes(data.scopes),
+  };
+  req.mcpContext = context;
+
+  return {
+    supabase,
+    tokenRecord: data,
+    shopId: data.shop_id || SHOP_ID,
+    mcpContext: context,
+  };
 }
 
 async function loadShopState(supabase) {
@@ -264,11 +389,33 @@ async function fetchOrders(supabase, options = {}) {
 
   const { data, error } = await query;
   if (error) throw error;
-  return (data || []).map(normalizeOrderRow);
+  return (data || []).map((row) => {
+    try {
+      return normalizeOrderRow(row);
+    } catch (err) {
+      return {
+        id: row?.id || null,
+        orderNo: row?.order_no ?? row?.orderNo ?? null,
+        order_no: row?.order_no ?? row?.orderNo ?? null,
+        time: row?.date || row?.created_at || null,
+        worker: row?.worker || "",
+        payment: row?.payment || "",
+        orderType: row?.order_type || row?.orderType || "",
+        items: [],
+        cart: [],
+        extras: [],
+        done: Boolean(row?.done),
+        voided: Boolean(row?.voided),
+        malformed: true,
+        error: err.message || "Order row could not be normalized.",
+      };
+    }
+  });
 }
 
 function normalizeOrderRow(row = {}) {
-  const cart = Array.isArray(row.cart) ? row.cart : [];
+  const cart = safeArray(row.cart);
+  const paymentParts = safeArray(row.payment_parts ?? row.paymentParts);
   return {
     id: row.id,
     orderNo: row.order_no ?? row.orderNo,
@@ -280,17 +427,17 @@ function normalizeOrderRow(row = {}) {
     worker: row.worker || "",
     payment: row.payment || "",
     paymentMethod: row.payment || "",
-    paymentParts: Array.isArray(row.payment_parts) ? row.payment_parts : row.paymentParts || [],
+    paymentParts,
     orderType: row.order_type || row.orderType || "",
-    deliveryFee: Number(row.delivery_fee ?? row.deliveryFee ?? 0) || 0,
+    deliveryFee: safeNumber(row.delivery_fee ?? row.deliveryFee),
     deliveryName: row.delivery_name || row.deliveryName || "",
     deliveryPhone: row.delivery_phone || row.deliveryPhone || "",
     deliveryAddress: row.delivery_address || row.deliveryAddress || "",
-    itemsTotal: Number(row.items_total ?? row.itemsTotal ?? 0) || 0,
-    finalTotal: Number(row.total ?? row.finalTotal ?? 0) || 0,
-    total: Number(row.total ?? row.finalTotal ?? 0) || 0,
-    discountPercentage: Number(row.discount_percentage ?? row.discountPercentage ?? 0) || 0,
-    discountAmount: Number(row.discount_amount ?? row.discountAmount ?? 0) || 0,
+    itemsTotal: safeNumber(row.items_total ?? row.itemsTotal),
+    finalTotal: safeNumber(row.total ?? row.finalTotal),
+    total: safeNumber(row.total ?? row.finalTotal),
+    discountPercentage: safeNumber(row.discount_percentage ?? row.discountPercentage),
+    discountAmount: safeNumber(row.discount_amount ?? row.discountAmount),
     done: Boolean(row.done),
     voided: Boolean(row.voided),
     voidReason: row.void_reason || row.voidReason || "",
@@ -321,13 +468,34 @@ function normalizeStateOrder(order = {}) {
   });
 }
 
+function safeArray(value) {
+  if (Array.isArray(value)) return value.filter((item) => item && typeof item === "object");
+  if (typeof value === "string" && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed.filter((item) => item && typeof item === "object") : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function safeNumber(value) {
+  const n = Number(value ?? 0);
+  return Number.isFinite(n) ? n : 0;
+}
+
 function collectExtras(cart = []) {
   const extras = [];
   for (const line of cart || []) {
+    if (!line || typeof line !== "object") continue;
     if (line?.itemType === "extra" || line?.extraId || line?.extra_id) {
       extras.push(line);
     }
-    if (Array.isArray(line?.extras)) extras.push(...line.extras);
+    if (Array.isArray(line?.extras)) {
+      extras.push(...line.extras.filter((extra) => extra && typeof extra === "object"));
+    }
   }
   return extras;
 }
@@ -413,6 +581,7 @@ function topItems(orders = []) {
   const map = new Map();
   for (const order of orders) {
     for (const line of order.cart || []) {
+      if (!line || typeof line !== "object") continue;
       const name = line.name || line.title || line.id || "Unknown item";
       const qty = Number(line.qty || line.quantity || 1) || 1;
       const price = Number(line.price || 0) || 0;
@@ -445,18 +614,26 @@ function safeInput(input = {}) {
   const copy = { ...(input || {}) };
   delete copy.admin_secret;
   delete copy.adminSecret;
+  delete copy.admin_passcode;
+  delete copy.adminPasscode;
+  delete copy.passcode;
   delete copy.token;
   return copy;
 }
 
-async function audit(supabase, auth, toolName, actionType, input, success, errorMessage) {
+async function audit(supabase, auth, toolName, actionType, input, success, errorMessage, beforeState, afterState) {
   try {
     await supabase.from("mcp_audit_logs").insert({
       shop_id: auth?.shopId || SHOP_ID,
       token_id: auth?.tokenRecord?.id || null,
+      admin_id: auth?.mcpContext?.adminId || null,
+      admin_name: auth?.mcpContext?.adminName || null,
       tool_name: toolName,
       action_type: actionType,
       input_summary: safeInput(input),
+      payload: safeInput(input),
+      before_state: sanitizeAuditState(beforeState),
+      after_state: sanitizeAuditState(afterState),
       success: Boolean(success),
       error: errorMessage || null,
     });
@@ -465,10 +642,34 @@ async function audit(supabase, auth, toolName, actionType, input, success, error
   }
 }
 
+function sanitizeAuditState(value) {
+  if (value === undefined) return null;
+  return sanitizeForAudit(value);
+}
+
+function sanitizeForAudit(value) {
+  if (value == null) return value;
+  if (Array.isArray(value)) return value.slice(0, 25).map(sanitizeForAudit);
+  if (typeof value === "object") {
+    const out = {};
+    for (const [key, inner] of Object.entries(value)) {
+      if (/token|secret|passcode|password|pin/i.test(key)) continue;
+      out[key] = sanitizeForAudit(inner);
+    }
+    return out;
+  }
+  return value;
+}
+
 function getToolDefinitions() {
-  const readOnly = "Requires a valid MCP connection token with read scope.";
-  const write = "Requires a valid MCP connection token with write scope and admin_secret.";
+  const readOnly = "Requires a valid MCP connection token with the matching read scope.";
+  const write = "Requires a valid MCP connection token with the matching write scope. The admin identity is resolved from the token.";
   return [
+    {
+      name: "get_connection_info",
+      description: "Returns the connected MCP admin identity and scopes for this token.",
+      inputSchema: { type: "object", properties: {} },
+    },
     {
       name: "get_today_sales_report",
       description: `${readOnly} Returns current business day or selected date sales totals.`,
@@ -541,14 +742,13 @@ function getToolDefinitions() {
       description: `${write} Adds a positive restock amount to an inventory item.`,
       inputSchema: {
         type: "object",
-        required: ["item", "quantity", "unit", "admin_secret"],
+        required: ["item", "quantity", "unit"],
         properties: {
           item: { type: "string" },
           quantity: { type: "number" },
           unit: { type: "string" },
           worker_name: { type: "string" },
           note: { type: "string" },
-          admin_secret: { type: "string" },
         },
       },
     },
@@ -557,14 +757,13 @@ function getToolDefinitions() {
       description: `${write} Sets or adjusts inventory quantity while preventing invalid negative final stock.`,
       inputSchema: {
         type: "object",
-        required: ["item", "unit", "reason", "admin_secret"],
+        required: ["item", "unit", "reason"],
         properties: {
           item: { type: "string" },
           new_quantity: { type: "number" },
           delta: { type: "number" },
           unit: { type: "string" },
           reason: { type: "string" },
-          admin_secret: { type: "string" },
         },
       },
     },
@@ -573,12 +772,11 @@ function getToolDefinitions() {
       description: `${write} Updates a menu item price.`,
       inputSchema: {
         type: "object",
-        required: ["new_price", "admin_secret"],
+        required: ["new_price"],
         properties: {
           item_id: { type: "string" },
           item_name: { type: "string" },
           new_price: { type: "number" },
-          admin_secret: { type: "string" },
         },
       },
     },
@@ -587,12 +785,11 @@ function getToolDefinitions() {
       description: `${write} Updates an extra price.`,
       inputSchema: {
         type: "object",
-        required: ["new_price", "admin_secret"],
+        required: ["new_price"],
         properties: {
           extra_id: { type: "string" },
           extra_name: { type: "string" },
           new_price: { type: "number" },
-          admin_secret: { type: "string" },
         },
       },
     },
@@ -601,8 +798,8 @@ function getToolDefinitions() {
       description: `${write} Marks an order as done.`,
       inputSchema: {
         type: "object",
-        required: ["order_no", "admin_secret"],
-        properties: { order_no: { type: "number" }, admin_secret: { type: "string" } },
+        required: ["order_no"],
+        properties: { order_no: { type: "number" } },
       },
     },
     {
@@ -610,11 +807,10 @@ function getToolDefinitions() {
       description: `${write} Voids an order with a reason. Dangerous reset/delete tools are not provided.`,
       inputSchema: {
         type: "object",
-        required: ["order_no", "reason", "admin_secret"],
+        required: ["order_no", "reason"],
         properties: {
           order_no: { type: "number" },
           reason: { type: "string" },
-          admin_secret: { type: "string" },
         },
       },
     },
@@ -623,7 +819,7 @@ function getToolDefinitions() {
       description: `${write} Adds an expense row to POS state.`,
       inputSchema: {
         type: "object",
-        required: ["name", "qty", "unit_price", "admin_secret"],
+        required: ["name", "qty", "unit_price"],
         properties: {
           name: { type: "string" },
           unit: { type: "string" },
@@ -631,7 +827,6 @@ function getToolDefinitions() {
           unit_price: { type: "number" },
           note: { type: "string" },
           worker_name: { type: "string" },
-          admin_secret: { type: "string" },
         },
       },
     },
@@ -640,11 +835,10 @@ function getToolDefinitions() {
       description: `${write} Closes open worker sessions and starts a new worker shift in day metadata.`,
       inputSchema: {
         type: "object",
-        required: ["to_worker", "admin_secret"],
+        required: ["to_worker"],
         properties: {
           from_worker: { type: "string" },
           to_worker: { type: "string" },
-          admin_secret: { type: "string" },
         },
       },
     },
@@ -652,18 +846,26 @@ function getToolDefinitions() {
 }
 
 async function callTool(req, toolName, input = {}) {
-  const requiredScope = WRITE_TOOL_NAMES.has(toolName) ? "write" : "read";
+  const requiredScope = TOOL_SCOPES[toolName] || (WRITE_TOOL_NAMES.has(toolName) ? "write" : "read");
   const auth = await requireMcpAuth(req, { requiredScope });
   const { supabase } = auth;
 
-  if (WRITE_TOOL_NAMES.has(toolName)) {
-    requireAdminSecret(input.admin_secret || input.adminSecret);
-  }
-
   try {
-    const result = await executeTool(supabase, toolName, input);
+    const result = await executeTool(supabase, toolName, input, auth);
+    const auditInfo = result && result.__audit ? result.__audit : {};
+    if (result && result.__audit) delete result.__audit;
     if (WRITE_TOOL_NAMES.has(toolName)) {
-      await audit(supabase, auth, toolName, "write", input, true, null);
+      await audit(
+        supabase,
+        auth,
+        toolName,
+        "write",
+        input,
+        true,
+        null,
+        auditInfo.beforeState,
+        auditInfo.afterState
+      );
     }
     return result;
   } catch (err) {
@@ -674,8 +876,19 @@ async function callTool(req, toolName, input = {}) {
   }
 }
 
-async function executeTool(supabase, toolName, input = {}) {
+async function executeTool(supabase, toolName, input = {}, auth = {}) {
   const { state, writeSeq } = await loadShopState(supabase);
+
+  if (toolName === "get_connection_info") {
+    const scopes = auth.mcpContext?.scopes || [];
+    return {
+      connected: true,
+      admin_id: auth.mcpContext?.adminId || "unknown_admin",
+      admin_name: auth.mcpContext?.adminName || "Unknown Admin",
+      scopes,
+      can_write: scopes.some((scope) => scope === "write" || scope === "admin" || scope.startsWith("write:")),
+    };
+  }
 
   if (toolName === "get_today_sales_report") {
     const window = dateWindowFor(state, input.date);
@@ -787,14 +1000,29 @@ async function executeTool(supabase, toolName, input = {}) {
 
   if (toolName === "add_inventory_restock") {
     const quantity = positiveNumber(input.quantity, "quantity");
+    const beforeItem = findInventoryItem(state, input.item);
     const next = mutateInventory(state, input.item, (item) => ({
       ...item,
       qty: money(Number(item.qty || 0) + quantity),
       unit: input.unit || item.unit,
     }));
-    addInventoryLedger(next, input.item, quantity, input.unit, input.worker_name, input.note || "MCP restock");
+    addInventoryLedger(
+      next,
+      input.item,
+      quantity,
+      input.unit,
+      input.worker_name || auth.mcpContext?.adminName || "",
+      input.note || "MCP restock"
+    );
     const saved = await saveShopState(supabase, next, writeSeq);
-    return { inventory: inventoryRows(saved), item: findInventoryItem(saved, input.item) };
+    const afterItem = findInventoryItem(saved, input.item);
+    return {
+      inventory: inventoryRows(saved),
+      item: afterItem,
+      admin_id: auth.mcpContext?.adminId,
+      admin_name: auth.mcpContext?.adminName,
+      __audit: { beforeState: beforeItem, afterState: afterItem },
+    };
   }
 
   if (toolName === "adjust_inventory_quantity") {
@@ -802,35 +1030,48 @@ async function executeTool(supabase, toolName, input = {}) {
     const hasNewQuantity = input.new_quantity !== undefined && input.new_quantity !== null;
     const hasDelta = input.delta !== undefined && input.delta !== null;
     if (!hasNewQuantity && !hasDelta) throw new Error("Provide new_quantity or delta.");
+    const beforeItem = findInventoryItem(state, input.item);
     const next = mutateInventory(state, input.item, (item) => {
       const current = Number(item.qty || 0);
       const finalQty = hasNewQuantity ? nonNegativeNumber(input.new_quantity, "new_quantity") : current + Number(input.delta || 0);
       if (!Number.isFinite(finalQty) || finalQty < 0) throw new Error("Final inventory quantity cannot be negative.");
       return { ...item, qty: money(finalQty), unit: input.unit || item.unit };
     });
-    addInventoryLedger(next, input.item, Number(input.delta || 0), input.unit, "", input.reason);
+    addInventoryLedger(next, input.item, Number(input.delta || 0), input.unit, auth.mcpContext?.adminName || "", input.reason);
     const saved = await saveShopState(supabase, next, writeSeq);
-    return { inventory: inventoryRows(saved), item: findInventoryItem(saved, input.item) };
+    const afterItem = findInventoryItem(saved, input.item);
+    return {
+      inventory: inventoryRows(saved),
+      item: afterItem,
+      admin_id: auth.mcpContext?.adminId,
+      admin_name: auth.mcpContext?.adminName,
+      __audit: { beforeState: beforeItem, afterState: afterItem },
+    };
   }
 
   if (toolName === "update_item_price") {
     const price = positiveNumber(input.new_price, "new_price");
+    const beforeItem = findPricedItem(state.menu || [], input.item_id, input.item_name);
     const next = { ...state };
     next.menu = updatePricedList(next.menu || [], input.item_id, input.item_name, price, "item");
     const saved = await saveShopState(supabase, next, writeSeq);
-    return { item: findPricedItem(saved.menu || [], input.item_id, input.item_name) };
+    const afterItem = findPricedItem(saved.menu || [], input.item_id, input.item_name);
+    return { item: afterItem, __audit: { beforeState: beforeItem, afterState: afterItem } };
   }
 
   if (toolName === "update_extra_price") {
     const price = nonNegativeNumber(input.new_price, "new_price");
     const key = state.extras ? "extras" : "extraList";
+    const beforeExtra = findPricedItem(state[key] || [], input.extra_id, input.extra_name);
     const next = { ...state, [key]: updatePricedList(state[key] || [], input.extra_id, input.extra_name, price, "extra") };
     const saved = await saveShopState(supabase, next, writeSeq);
-    return { extra: findPricedItem(saved[key] || [], input.extra_id, input.extra_name) };
+    const afterExtra = findPricedItem(saved[key] || [], input.extra_id, input.extra_name);
+    return { extra: afterExtra, __audit: { beforeState: beforeExtra, afterState: afterExtra } };
   }
 
   if (toolName === "mark_order_done") {
     const orderNo = positiveInteger(input.order_no ?? input.orderNo, "order_no");
+    const [beforeOrder] = await fetchOrders(supabase, { orderNo, limit: 1 });
     const { data, error } = await supabase
       .from("orders")
       .update({ done: true, sync_status: "pending", last_modified_device_id: "mcp" })
@@ -841,12 +1082,14 @@ async function executeTool(supabase, toolName, input = {}) {
     if (error) throw error;
     if (!data) throw new Error(`Order ${orderNo} was not found.`);
     await mirrorStateOrderDone(supabase, state, writeSeq, orderNo, { done: true });
-    return normalizeOrderRow(data);
+    const afterOrder = normalizeOrderRow(data);
+    return { ...afterOrder, __audit: { beforeState: beforeOrder, afterState: afterOrder } };
   }
 
   if (toolName === "void_order") {
     const orderNo = positiveInteger(input.order_no ?? input.orderNo, "order_no");
     if (!String(input.reason || "").trim()) throw new Error("reason is required.");
+    const [beforeOrder] = await fetchOrders(supabase, { orderNo, limit: 1 });
     const { data, error } = await supabase
       .from("orders")
       .update({
@@ -865,7 +1108,8 @@ async function executeTool(supabase, toolName, input = {}) {
       voided: true,
       voidReason: String(input.reason).trim(),
     });
-    return normalizeOrderRow(data);
+    const afterOrder = normalizeOrderRow(data);
+    return { ...afterOrder, __audit: { beforeState: beforeOrder, afterState: afterOrder } };
   }
 
   if (toolName === "add_expense") {
@@ -892,6 +1136,7 @@ async function executeTool(supabase, toolName, input = {}) {
     return {
       expense: row,
       expenses_total: money((saved.expenses || []).reduce((sum, e) => sum + expenseAmount(e), 0)),
+      __audit: { beforeState: null, afterState: row },
     };
   }
 
@@ -925,7 +1170,14 @@ async function executeTool(supabase, toolName, input = {}) {
       ],
     };
     const saved = await saveShopState(supabase, { ...state, dayMeta: nextDayMeta, workerSessions: nextSessions }, writeSeq);
-    return { dayMeta: saved.dayMeta, workerSessions: saved.workerSessions };
+    return {
+      dayMeta: saved.dayMeta,
+      workerSessions: saved.workerSessions,
+      __audit: {
+        beforeState: { dayMeta: state.dayMeta || {}, workerSessions: state.workerSessions || [] },
+        afterState: { dayMeta: saved.dayMeta, workerSessions: saved.workerSessions },
+      },
+    };
   }
 
   throw new Error(`Unsupported MCP tool: ${toolName}`);
@@ -1089,9 +1341,9 @@ async function handleTokenCreate(req, res) {
 
   try {
     const body = await readBody(req);
-    requireAdminSecret(body.admin_secret || body.adminSecret);
+    const admin = adminFromBody(body);
     const token = generateToken();
-    const scopes = normalizeScopes(body.scopes || ["read"]);
+    const scopes = normalizeScopes(body.scopes || admin.defaultScopes);
     const supabase = supabaseAdmin();
     const { data, error } = await supabase
       .from("mcp_connection_tokens")
@@ -1099,13 +1351,15 @@ async function handleTokenCreate(req, res) {
         shop_id: SHOP_ID,
         token_hash: hashToken(token),
         token_prefix: displayPrefix(token),
-        name: body.name || "Main ChatGPT Connector",
+        name: body.name || `${admin.name} ChatGPT Connector`,
+        admin_id: admin.id,
+        admin_name: admin.name,
         scopes,
         active: true,
-        created_by: body.created_by || "admin",
+        created_by: admin.id,
         note: body.note || null,
       })
-      .select("id, name, token_prefix, scopes, active, created_at, last_used_at, revoked_at")
+      .select("id, name, token_prefix, admin_id, admin_name, scopes, active, created_at, last_used_at, revoked_at")
       .single();
     if (error) throw error;
     return json(res, 200, {
@@ -1130,17 +1384,20 @@ async function handleTokenList(req, res) {
 
   try {
     const body = req.method === "POST" ? await readBody(req) : {};
-    const adminSecret =
-      body.admin_secret ||
-      body.adminSecret ||
-      req.headers["x-tux-mcp-admin-secret"] ||
-      (req.query && req.query.admin_secret);
-    requireAdminSecret(adminSecret);
+    const admin = adminFromBody({
+      ...body,
+      admin_id: body.admin_id || req.headers["x-tux-admin-id"] || (req.query && req.query.admin_id),
+      admin_passcode:
+        body.admin_passcode ||
+        req.headers["x-tux-admin-passcode"] ||
+        (req.query && req.query.admin_passcode),
+    });
     const supabase = supabaseAdmin();
     const { data, error } = await supabase
       .from("mcp_connection_tokens")
-      .select("id, name, token_prefix, scopes, active, created_at, last_used_at, revoked_at, created_by, note")
+      .select("id, name, token_prefix, admin_id, admin_name, scopes, active, created_at, last_used_at, revoked_at, created_by, note")
       .eq("shop_id", SHOP_ID)
+      .eq("admin_id", admin.id)
       .order("created_at", { ascending: false });
     if (error) throw error;
     return json(res, 200, { success: true, tokens: data || [] });
@@ -1156,15 +1413,16 @@ async function handleTokenRevoke(req, res) {
 
   try {
     const body = await readBody(req);
-    requireAdminSecret(body.admin_secret || body.adminSecret);
+    const admin = adminFromBody(body);
     if (!body.token_id) throw new Error("token_id is required.");
     const supabase = supabaseAdmin();
     const { data, error } = await supabase
       .from("mcp_connection_tokens")
       .update({ active: false, revoked_at: new Date().toISOString() })
       .eq("shop_id", SHOP_ID)
+      .eq("admin_id", admin.id)
       .eq("id", body.token_id)
-      .select("id, name, token_prefix, scopes, active, created_at, last_used_at, revoked_at")
+      .select("id, name, token_prefix, admin_id, admin_name, scopes, active, created_at, last_used_at, revoked_at")
       .maybeSingle();
     if (error) throw error;
     if (!data) throw new Error("Token was not found.");

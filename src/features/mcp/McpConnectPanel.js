@@ -1,8 +1,18 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useMemo, useState } from "react";
 
 const DEFAULT_MCP_URL = "https://tuxcashier.vercel.app/api/mcp";
+const DEFAULT_SCOPES = [
+  "read:orders",
+  "read:inventory",
+  "read:reports",
+  "write:inventory",
+  "write:orders",
+  "write:expenses",
+  "write:prices",
+  "write:shift",
+];
 const TOKEN_WARNING =
-  "Copy this token now. For security, it will only be shown once. If you lose it, revoke it and generate a new one.";
+  "Anyone with this link can access the allowed TUC tools. Keep it private.";
 
 function CopyButton({ value, children, btnBorder }) {
   const [copied, setCopied] = useState(false);
@@ -35,36 +45,45 @@ function CopyButton({ value, children, btnBorder }) {
   );
 }
 
+function formatDate(value) {
+  return value ? new Date(value).toLocaleString() : "-";
+}
+
 export default function McpConnectPanel({
   dark,
   cardBorder,
   btnBorder,
   softBg,
   adminUnlocked,
+  activeAdmin,
   ensureAdminUnlocked,
 }) {
-  const [tokenName, setTokenName] = useState("Main ChatGPT Connector");
-  const [allowWrite, setAllowWrite] = useState(false);
-  const [adminSecret, setAdminSecret] = useState("");
+  const [adminPasscode, setAdminPasscode] = useState("");
   const [tokens, setTokens] = useState([]);
   const [createdToken, setCreatedToken] = useState(null);
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
+  const currentAdmin = useMemo(
+    () =>
+      activeAdmin || {
+        adminId: "admin_1",
+        adminName: "Admin 1",
+        adminNumber: 1,
+      },
+    [activeAdmin]
+  );
   const mcpUrl = DEFAULT_MCP_URL;
   const connectorUrl = useMemo(() => {
     if (!createdToken?.token) return "";
     return `${mcpUrl}?token=${encodeURIComponent(createdToken.token)}`;
   }, [createdToken, mcpUrl]);
-
-  const requireAdminSecret = useCallback(() => {
-    if (adminSecret) return adminSecret;
-    const entered = window.prompt("Enter the MCP admin secret from Vercel:", "");
-    if (!entered) throw new Error("MCP admin secret is required.");
-    setAdminSecret(entered);
-    return entered;
-  }, [adminSecret]);
+  const latestToken =
+    tokens.find((token) => token.active && !token.revoked_at) ||
+    createdToken?.token_metadata ||
+    tokens[0] ||
+    null;
 
   const postJson = async (url, body) => {
     const res = await fetch(url, {
@@ -79,47 +98,68 @@ export default function McpConnectPanel({
     return json;
   };
 
+  const requireAdminPasscode = useCallback(() => {
+    if (adminPasscode) return adminPasscode;
+    const entered = window.prompt(`Enter ${currentAdmin.adminName} passcode:`, "");
+    if (!entered) throw new Error(`${currentAdmin.adminName} passcode is required.`);
+    setAdminPasscode(entered);
+    return entered;
+  }, [adminPasscode, currentAdmin.adminName]);
+
+  const adminPayload = useCallback(
+    (passcodeOverride) => ({
+      admin_id: currentAdmin.adminId,
+      admin_passcode: passcodeOverride || requireAdminPasscode(),
+    }),
+    [currentAdmin.adminId, requireAdminPasscode]
+  );
+
+  const ensureIdentity = async () => {
+    if (adminUnlocked && activeAdmin) return activeAdmin;
+    if (!ensureAdminUnlocked) return currentAdmin;
+    const identity = await ensureAdminUnlocked();
+    if (!identity) throw new Error("Admin unlock is required.");
+    return identity;
+  };
+
   const loadTokens = useCallback(
-    async (secretOverride) => {
-      const secret = secretOverride || requireAdminSecret();
+    async (passcodeOverride, adminOverride) => {
+      const adminForRequest = adminOverride || currentAdmin;
+      const passcode = passcodeOverride || requireAdminPasscode();
       setLoading(true);
       setError("");
       try {
-        const data = await postJson("/api/mcp/token/list", { admin_secret: secret });
+        const data = await postJson("/api/mcp/token/list", {
+          admin_id: adminForRequest.adminId,
+          admin_passcode: passcode,
+        });
         setTokens(Array.isArray(data.tokens) ? data.tokens : []);
-        setStatus("Token list refreshed.");
+        setStatus("Connection status refreshed.");
       } catch (err) {
         setError(err.message || String(err));
       } finally {
         setLoading(false);
       }
     },
-    [requireAdminSecret]
+    [currentAdmin, requireAdminPasscode]
   );
-
-  useEffect(() => {
-    if (!adminUnlocked || !adminSecret) return;
-    loadTokens(adminSecret);
-  }, [adminUnlocked, adminSecret, loadTokens]);
 
   const generateToken = async () => {
     setLoading(true);
     setError("");
     setStatus("");
     try {
-      if (!adminUnlocked && ensureAdminUnlocked) {
-        const ok = await ensureAdminUnlocked();
-        if (!ok) throw new Error("Admin unlock is required.");
-      }
-      const secret = requireAdminSecret();
+      const identity = await ensureIdentity();
+      const passcode = requireAdminPasscode();
       const data = await postJson("/api/mcp/token/create", {
-        name: tokenName || "Main ChatGPT Connector",
-        scopes: allowWrite ? ["read", "write"] : ["read"],
-        admin_secret: secret,
+        admin_id: identity.adminId || currentAdmin.adminId,
+        admin_passcode: passcode,
+        name: `${identity.adminName || currentAdmin.adminName} ChatGPT Connector`,
+        scopes: DEFAULT_SCOPES,
       });
       setCreatedToken(data);
-      setStatus(data.warning || TOKEN_WARNING);
-      await loadTokens(secret);
+      setStatus("ChatGPT MCP URL created. Copy it now; the token will not be shown again.");
+      await loadTokens(passcode, identity);
     } catch (err) {
       setError(err.message || String(err));
     } finally {
@@ -128,14 +168,18 @@ export default function McpConnectPanel({
   };
 
   const revokeToken = async (tokenId) => {
-    if (!window.confirm("Revoke this ChatGPT connection token?")) return;
+    if (!window.confirm(`Revoke ChatGPT access for ${currentAdmin.adminName}?`)) return;
     setLoading(true);
     setError("");
     try {
-      const secret = requireAdminSecret();
-      await postJson("/api/mcp/token/revoke", { token_id: tokenId, admin_secret: secret });
-      setStatus("Token revoked.");
-      await loadTokens(secret);
+      const passcode = requireAdminPasscode();
+      await postJson("/api/mcp/token/revoke", {
+        ...adminPayload(passcode),
+        token_id: tokenId,
+      });
+      setCreatedToken(null);
+      setStatus("ChatGPT access revoked.");
+      await loadTokens(passcode);
     } catch (err) {
       setError(err.message || String(err));
     } finally {
@@ -165,40 +209,36 @@ export default function McpConnectPanel({
       >
         <h2 style={{ margin: "0 0 8px", fontSize: 22 }}>Connect to ChatGPT</h2>
         <p style={{ margin: "0 0 12px", color: muted }}>
-          Generate a secure MCP connection token for this Tux Cashier shop. The raw token is shown once.
+          Create a private MCP connection for the currently unlocked admin. MCP tool calls will use this admin identity automatically.
         </p>
 
-        <div style={{ display: "grid", gap: 10, maxWidth: 760 }}>
+        <div style={{ display: "grid", gap: 8, maxWidth: 760 }}>
+          <div>
+            <b>Connection status:</b>{" "}
+            {latestToken && latestToken.active && !latestToken.revoked_at ? "Active" : "Not connected"}
+          </div>
+          <div>
+            <b>Connected admin:</b> {currentAdmin.adminName} ({currentAdmin.adminId})
+          </div>
+          <div>
+            <b>Token created:</b> {formatDate(latestToken?.created_at)}
+          </div>
+          <div>
+            <b>Last used:</b> {formatDate(latestToken?.last_used_at)}
+          </div>
+
           <label style={{ display: "grid", gap: 4, fontWeight: 700 }}>
             MCP Server URL
             <input readOnly value={mcpUrl} style={inputStyle} />
           </label>
 
           <label style={{ display: "grid", gap: 4, fontWeight: 700 }}>
-            Token name
-            <input
-              value={tokenName}
-              onChange={(e) => setTokenName(e.target.value)}
-              style={inputStyle}
-            />
-          </label>
-
-          <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <input
-              type="checkbox"
-              checked={allowWrite}
-              onChange={(e) => setAllowWrite(e.target.checked)}
-            />
-            Allow approved write/admin MCP tools
-          </label>
-
-          <label style={{ display: "grid", gap: 4, fontWeight: 700 }}>
-            MCP admin secret
+            {currentAdmin.adminName} passcode
             <input
               type="password"
-              value={adminSecret}
-              onChange={(e) => setAdminSecret(e.target.value)}
-              placeholder="Server-only secret from Vercel"
+              value={adminPasscode}
+              onChange={(e) => setAdminPasscode(e.target.value)}
+              placeholder="Admin passcode"
               style={inputStyle}
             />
           </label>
@@ -218,8 +258,11 @@ export default function McpConnectPanel({
                 fontWeight: 800,
               }}
             >
-              Generate ChatGPT Connection Token
+              Connect this admin to ChatGPT
             </button>
+            <CopyButton value={connectorUrl} btnBorder={btnBorder}>
+              Copy ChatGPT MCP URL
+            </CopyButton>
             <button
               type="button"
               onClick={() => loadTokens()}
@@ -231,14 +274,32 @@ export default function McpConnectPanel({
                 cursor: loading ? "not-allowed" : "pointer",
               }}
             >
-              Refresh Token List
+              Refresh Status
             </button>
-            <CopyButton value={mcpUrl} btnBorder={btnBorder}>
-              Copy MCP Server URL
-            </CopyButton>
+            {latestToken?.active && !latestToken.revoked_at && (
+              <button
+                type="button"
+                onClick={() => revokeToken(latestToken.id)}
+                disabled={loading}
+                style={{
+                  padding: "8px 12px",
+                  borderRadius: 6,
+                  border: "none",
+                  background: "#c62828",
+                  color: "#fff",
+                  cursor: loading ? "not-allowed" : "pointer",
+                  fontWeight: 800,
+                }}
+              >
+                Revoke this admin's ChatGPT access
+              </button>
+            )}
           </div>
         </div>
 
+        <div style={{ marginTop: 12, color: dark ? "#ffecb3" : "#8a5a00", fontWeight: 800 }}>
+          {TOKEN_WARNING}
+        </div>
         {status && (
           <div style={{ marginTop: 12, color: dark ? "#c8e6c9" : "#1b5e20", fontWeight: 700 }}>
             {status}
@@ -260,25 +321,18 @@ export default function McpConnectPanel({
             background: dark ? "#1b2a1b" : "#eef8ee",
           }}
         >
-          <h3 style={{ marginTop: 0 }}>New Token</h3>
-          <p style={{ marginTop: 0, fontWeight: 800 }}>{TOKEN_WARNING}</p>
-          <div style={{ display: "grid", gap: 8 }}>
-            <label style={{ display: "grid", gap: 4 }}>
-              Raw token
-              <input readOnly value={createdToken.token} style={inputStyle} />
-            </label>
-            <label style={{ display: "grid", gap: 4 }}>
-              Full connector URL
-              <input readOnly value={connectorUrl} style={inputStyle} />
-            </label>
-            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-              <CopyButton value={createdToken.token} btnBorder={btnBorder}>
-                Copy Token
-              </CopyButton>
-              <CopyButton value={connectorUrl} btnBorder={btnBorder}>
-                Copy Full Connector URL
-              </CopyButton>
-            </div>
+          <h3 style={{ marginTop: 0 }}>New Admin Connection</h3>
+          <p style={{ marginTop: 0, fontWeight: 800 }}>
+            Copy this URL now. For security, the raw token is only available immediately after creation.
+          </p>
+          <label style={{ display: "grid", gap: 4 }}>
+            ChatGPT MCP URL
+            <input readOnly value={connectorUrl} style={inputStyle} />
+          </label>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+            <CopyButton value={connectorUrl} btnBorder={btnBorder}>
+              Copy ChatGPT MCP URL
+            </CopyButton>
           </div>
         </section>
       )}
@@ -291,66 +345,21 @@ export default function McpConnectPanel({
           background: dark ? "#151515" : "#fff",
         }}
       >
-        <h3 style={{ marginTop: 0 }}>Existing Tokens</h3>
-        <div style={{ overflowX: "auto" }}>
-          <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 760 }}>
-            <thead>
-              <tr>
-                {["Name", "Prefix", "Scopes", "Status", "Created", "Last used", "Action"].map((h) => (
-                  <th key={h} style={{ textAlign: "left", padding: 8, borderBottom: `1px solid ${cardBorder}` }}>
-                    {h}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {tokens.map((token) => (
-                <tr key={token.id}>
-                  <td style={{ padding: 8, borderBottom: `1px solid ${cardBorder}` }}>{token.name || "-"}</td>
-                  <td style={{ padding: 8, borderBottom: `1px solid ${cardBorder}` }}>{token.token_prefix}</td>
-                  <td style={{ padding: 8, borderBottom: `1px solid ${cardBorder}` }}>
-                    {(token.scopes || []).join(", ")}
-                  </td>
-                  <td style={{ padding: 8, borderBottom: `1px solid ${cardBorder}` }}>
-                    {token.revoked_at ? "Revoked" : token.active ? "Active" : "Inactive"}
-                  </td>
-                  <td style={{ padding: 8, borderBottom: `1px solid ${cardBorder}` }}>
-                    {token.created_at ? new Date(token.created_at).toLocaleString() : "-"}
-                  </td>
-                  <td style={{ padding: 8, borderBottom: `1px solid ${cardBorder}` }}>
-                    {token.last_used_at ? new Date(token.last_used_at).toLocaleString() : "-"}
-                  </td>
-                  <td style={{ padding: 8, borderBottom: `1px solid ${cardBorder}` }}>
-                    {token.active && !token.revoked_at ? (
-                      <button
-                        type="button"
-                        onClick={() => revokeToken(token.id)}
-                        style={{
-                          padding: "6px 10px",
-                          borderRadius: 6,
-                          border: "none",
-                          background: "#c62828",
-                          color: "#fff",
-                          cursor: "pointer",
-                        }}
-                      >
-                        Revoke
-                      </button>
-                    ) : (
-                      <span style={{ color: muted }}>No action</span>
-                    )}
-                  </td>
-                </tr>
-              ))}
-              {!tokens.length && (
-                <tr>
-                  <td colSpan={7} style={{ padding: 10, color: muted }}>
-                    No tokens loaded yet.
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
+        <h3 style={{ marginTop: 0 }}>Allowed Scopes</h3>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {DEFAULT_SCOPES.map((scope) => (
+            <span
+              key={scope}
+              style={{
+                border: `1px solid ${cardBorder}`,
+                borderRadius: 6,
+                padding: "4px 8px",
+                background: dark ? "#222" : "#f7f7f7",
+              }}
+            >
+              {scope}
+            </span>
+          ))}
         </div>
       </section>
 
@@ -375,18 +384,16 @@ export default function McpConnectPanel({
             Description: ChatGPT can read Tux Cashier reports, inventory, orders, menu,
             expenses, bank summaries, and perform approved admin actions.
           </li>
-          <li>Connector URL: paste the full tokenized URL shown above.</li>
+          <li>Connector URL: paste the ChatGPT MCP URL shown above.</li>
           <li>Click Create.</li>
           <li>Open a new ChatGPT chat and select the Tux Cashier connector.</li>
         </ol>
 
         <h4 style={{ marginBottom: 8 }}>Example prompts</h4>
         <ul style={{ lineHeight: 1.7, marginTop: 0 }}>
+          <li>Which admin am I connected as?</li>
           <li>Show me today's sales report.</li>
           <li>What items are low stock?</li>
-          <li>How much did each worker sell today?</li>
-          <li>Show me order number 15.</li>
-          <li>Show today's expenses and net revenue.</li>
           <li>Add 5kg meat to inventory.</li>
           <li>Change Double Smash Burger price to 150.</li>
           <li>Void order 12 because the customer cancelled.</li>
