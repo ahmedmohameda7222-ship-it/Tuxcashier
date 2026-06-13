@@ -30,6 +30,79 @@ function toMillis(value) {
   return Number.isNaN(+parsed) ? undefined : parsed.getTime();
 }
 
+function toValidDate(value) {
+  if (!value) return null;
+  if (value instanceof Date) return Number.isNaN(+value) ? null : value;
+  if (value && typeof value.toDate === "function") {
+    const d = value.toDate();
+    return d instanceof Date && !Number.isNaN(+d) ? d : null;
+  }
+  if (typeof value === "string") {
+    const dateOnly = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (dateOnly) {
+      const [, y, m, d] = dateOnly;
+      const localDate = new Date(Number(y), Number(m) - 1, Number(d), 0, 0, 0, 0);
+      return Number.isNaN(+localDate) ? null : localDate;
+    }
+  }
+  const d = new Date(value);
+  return Number.isNaN(+d) ? null : d;
+}
+
+function isOrderInReportPeriod(order, start, end) {
+  const when = toValidDate(order?.date);
+  return Boolean(when && start && end && when >= start && when <= end);
+}
+
+function isOrderInCurrentReportShift(order, dayMetaValue, activeDayId) {
+  if (!order || order.voided) return false;
+  const shiftDayIds = new Set(
+    [activeDayId, dayMetaValue?.dayId].filter(Boolean).map((value) => String(value))
+  );
+  if (shiftDayIds.size && order.dayId) return shiftDayIds.has(String(order.dayId));
+
+  const start = toValidDate(dayMetaValue?.startedAt);
+  if (!start) return false;
+  const end = toValidDate(dayMetaValue?.endedAt) || new Date();
+  return isOrderInReportPeriod(order, start, end);
+}
+
+function getReportOrderKey(order = {}, index = 0) {
+  const when = toValidDate(order.date);
+  const localDateKey = when
+    ? [
+        when.getFullYear(),
+        String(when.getMonth() + 1).padStart(2, "0"),
+        String(when.getDate()).padStart(2, "0"),
+      ].join("-")
+    : "";
+  const candidates = [
+    order.cloudId ? `cloud_${order.cloudId}` : "",
+    order.idemKey ? `idem_${order.idemKey}` : "",
+    order.onlineOrderKey ? `online_key_${order.onlineOrderKey}` : "",
+    order.onlineOrderId ? `online_id_${order.onlineOrderId}` : "",
+    order.dayId && order.orderNo != null ? `day_order_${order.dayId}_${order.orderNo}` : "",
+    order.orderNo != null && localDateKey ? `date_order_${localDateKey}_${order.orderNo}` : "",
+    order.id ? `id_${order.id}` : "",
+  ];
+  return String(candidates.find(Boolean) || `report_order_${index}`);
+}
+
+function dedupeReportOrders(rows = []) {
+  const byKey = new Map();
+  for (const [index, order] of (rows || []).entries()) {
+    if (!order) continue;
+    const key = getReportOrderKey(order, index);
+    const prev = byKey.get(key);
+    const currentUpdated =
+      toMillis(order.updatedAt) || toMillis(order.savedAt) || toMillis(order.date) || 0;
+    const previousUpdated =
+      toMillis(prev?.updatedAt) || toMillis(prev?.savedAt) || toMillis(prev?.date) || 0;
+    if (!prev || currentUpdated >= previousUpdated) byKey.set(key, order);
+  }
+  return Array.from(byKey.values());
+}
+
 export function sanitizeForSupabase(value) {
   if (value === undefined) return undefined;
   if (value === null) return null;
@@ -5051,57 +5124,6 @@ const handleReconCountChange = useCallback((method, rawValue) => {
   });
 }, []);const [reconSavedBy, setReconSavedBy] = useState("");
 const [reconHistory, setReconHistory] = useState([]);
-const accountedOnlineOrders = useMemo(() => {
-  const seen = new Set();
-  for (const ord of orders || []) {
-    if (!ord) continue;
-    if (ord.onlineOrderKey) seen.add(ord.onlineOrderKey);
-    if (ord.onlineOrderId) seen.add(`id:${ord.onlineOrderId}`);
-    if (ord.onlineSourceCollection && ord.onlineSourceDocId) {
-      seen.add(`${ord.onlineSourceCollection}/${ord.onlineSourceDocId}`);
-    }
-  }
-
-  const startMs = dayMeta?.startedAt ? new Date(dayMeta.startedAt).getTime() : null;
-  const endMs = dayMeta?.endedAt ? new Date(dayMeta.endedAt).getTime() : null;
-  const shouldSkipStatus = (status) => {
-    const key = normalizeNameKey(status);
-    if (!key) return false;
-    return (
-      key.includes("cancel") ||
-      key.includes("void") ||
-      key.includes("reject") ||
-      key.includes("fail") ||
-      key.includes("refund") ||
-      key.includes("return")
-    );
-  };
-
-  const eligible = [];
-  for (const ord of onlineOrdersRaw || []) {
-    if (!ord) continue;
-    if (shouldSkipStatus(ord.status)) continue;
-    const ts = Number(ord.createdAtMs || (ord.createdAt ? +new Date(ord.createdAt) : NaN));
-    if (startMs && (!Number.isFinite(ts) || ts < startMs)) continue;
-    if (endMs && (!Number.isFinite(ts) || ts > endMs)) continue;
-
-    const candidates = [
-      getOnlineOrderDedupeKey(ord),
-      ord.id ? `id:${ord.id}` : null,
-      ord.sourceCollection && ord.sourceDocId
-        ? `${ord.sourceCollection}/${ord.sourceDocId}`
-        : null,
-    ].filter(Boolean);
-    if (candidates.some((key) => seen.has(key))) continue;
-
-    const total = Number(ord.total || 0);
-    if (!Number.isFinite(total) || total <= 0) continue;
-
-    eligible.push(ord);
-  }
-
-  return eligible;
-}, [onlineOrdersRaw, orders, dayMeta]);
 const rawInflowByMethod = useMemo(() => {
  
   return sumPaymentsByMethod(orders);
@@ -5440,7 +5462,6 @@ const removeBankTx = (id) => {
     return arr.filter(t => t.id !== id);
   });
 };
-  const sortBy = "date-desc";
   const [newExtraName, setNewExtraName] = useState("");
   const [newExtraPrice, setNewExtraPrice] = useState(0);
   const [newBeverageName, setNewBeverageName] = useState("");
@@ -7787,6 +7808,7 @@ function getPeriodRange(kind, dayMeta, dayStr, monthStr, weekStr) {
   const end   = new Date(now.getFullYear(), 11, 31, 23, 59, 59, 999);
   return [start, end];
 }
+
 // === Worker helpers ===
 const normPin = (p) => String(p || "").trim();
 const findWorkerByPin = (pin) => {
@@ -9890,15 +9912,6 @@ const voidOrderToExpense = async (orderNo) => {
 
 
   // --------------------------- REPORT TOTALS ---------------------------
- const getSortedOrders = () => {
-    const arr = [...orders];
-    if (sortBy === "date-desc") arr.sort((a, b) => b.date - a.date);
-    if (sortBy === "date-asc") arr.sort((a, b) => a.date - b.date);
-    if (sortBy === "worker") arr.sort((a, b) => a.worker.localeCompare(b.worker));
-    if (sortBy === "payment") arr.sort((a, b) => a.payment.localeCompare(b.payment));
-    return arr;
-  };
-
   const [reportStart, reportEnd] = useMemo(() => {
     const [start, end] = getPeriodRange(reportFilter, dayMeta, reportDay, reportMonth, undefined);
     return [start, end];
@@ -10015,7 +10028,7 @@ const computeProfitBuckets = useCallback(
 
       // FIX: This calculation should only use processed orders from the main `orders` state
       // and historical orders, NOT pending online orders.
-      const allOrders = mergeRows(orders, historicalOrders);
+      const allOrders = dedupeReportOrders(mergeRows(orders, historicalOrders));
       
       for (const order of allOrders) {
         if (!order || order.voided) continue;
@@ -10089,51 +10102,33 @@ const computeProfitBuckets = useCallback(
 
   const reportOrders = useMemo(() => {
     if (!reportStart || !reportEnd) return [];
-    const startMs = +reportStart;
-    const endMs = +reportEnd;
-    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return [];
+    if (reportFilter === "shift" && (!dayMeta?.startedAt || dayMeta?.endedAt)) return [];
+    const start = toValidDate(reportStart);
+    const end = toValidDate(reportEnd);
+    if (!start || !end) return [];
 
-    const start = new Date(startMs);
-    const end = new Date(endMs);
+    const mergedOrders = dedupeReportOrders([
+      ...(historicalOrders || []),
+      ...(orders || []),
+    ]);
 
-    const toDate = (value) => {
-      if (!value) return null;
-      if (value instanceof Date) return value;
-      const d = new Date(value);
-      return Number.isNaN(+d) ? null : d;
-    };
-
-    const shiftStart = dayMeta?.startedAt ? new Date(dayMeta.startedAt) : null;
-    const shiftEndRaw = dayMeta?.endedAt ? new Date(dayMeta.endedAt) : null;
-    const now = new Date();
-    const shiftEnd = shiftEndRaw || now;
-    const includeHistorical =
-      !shiftStart || start < shiftStart || end > shiftEnd;
-
-  const sourceOrders = includeHistorical
-      ? [...(historicalOrders || []), ...(orders || [])]
-      : orders || [];
-
-    const onsite = sourceOrders.filter((order) => {
+    const filteredOrders = mergedOrders.filter((order) => {
       if (!order || order.voided) return false;
-      const when = toDate(order.date);
-      return when && when >= start && when <= end;
+      if (reportFilter === "shift") {
+        return isOrderInCurrentReportShift(order, dayMeta, currentDayId);
+      }
+      return isOrderInReportPeriod(order, start, end);
     });
 
-    const online = accountedOnlineOrders.filter((order) => {
-      if (!order) return false;
-      const when = toDate(order.date);
-      return when && when >= start && when <= end;
-    });
-
- return [...onsite, ...online].map(enrichOrderWithChannel);
+    return filteredOrders.map(enrichOrderWithChannel);
   }, [
     orders,
     historicalOrders,
-    accountedOnlineOrders,
+    reportFilter,
     reportStart,
     reportEnd,
     dayMeta,
+    currentDayId,
   ]);
 
   const reportOrdersDetailed = useMemo(() => {
@@ -10205,14 +10200,10 @@ const totals = useMemo(() => {
         ? [...(historicalRows || []), ...(liveRows || [])]
         : liveRows || [];
 
-    // FIX: This calculation should only use processed orders.
-    // By removing `accountedOnlineOrders`, the totals will be accurate
-    // for reconciliation and shift reports.
-    const filteredOrders = mergeRows(orders, historicalOrders).filter((order) => {
-      if (!order || order.voided) return false;
-      const when = toDate(order.date);
-      return when && when >= start && when <= end;
-    });
+    const filteredOrders = reportOrders.map((order) => ({
+      ...order,
+      itemsTotal: getOrderNetItemsAmount(order),
+    }));
 
     const revenueTotal = filteredOrders.reduce(
       (sum, order) =>
@@ -10304,8 +10295,7 @@ const totals = useMemo(() => {
   }, [
     reportStart,
     reportEnd,
-    orders,
-    historicalOrders,
+    reportOrders,
     purchases,
     historicalPurchases,
     expenses,
@@ -10733,7 +10723,7 @@ const endedStr   = m.endedAt   ? fmtDateTime(m.endedAt)   : "—";
       doc.text("Orders", 14, y);
       autoTable(doc, {
    head: [["#", "Date", "Worker", "Payment", "Discount (E£)", "Type", "Delivery (E£)", "Total (E£)", "Status", "Reason"]],
-   body: getSortedOrders().map((o) => [
+   body: reportOrdersDetailed.map((o) => [
   o.orderNo,
   fmtDateTime(o.date),
   o.worker,
