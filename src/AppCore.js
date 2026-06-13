@@ -13,95 +13,38 @@ import {
 import { loadLocalState, saveLocalState } from "./services/localStore";
 import { shouldAttemptOnlineSync, SYNC_STATUS } from "./services/syncManager";
 import McpConnectPanel from "./features/mcp/McpConnectPanel";
+import ReportsTab from "./features/reports/ReportsTab";
+import { buildReportOrderRows } from "./features/reports/reportPdf";
+import { parseDateMaybe, toIso, toMillis, toMs, toValidDate } from "./shared/utils/dateUtils";
+import {
+  getOrderDiscountAmount,
+  getOrderDiscountPercentage,
+  getOrderNetItemsAmount,
+  normalizeFixedDiscountAmount,
+  roundMoney,
+} from "./shared/utils/moneyUtils";
+import {
+  dedupeOrders,
+  getStableRecordKey,
+  orderDedupeKey,
+  recordUpdatedMs,
+} from "./shared/utils/idUtils";
+import {
+  buildCustomerContactRows,
+  dedupeCustomers,
+  extractLocalPhoneDigits,
+  formatPhoneForDisplay,
+  normalizePhone,
+  toCanonicalLocalPhone,
+  upsertCustomer,
+} from "./shared/utils/phoneUtils";
+import {
+  dedupeReportOrders,
+  isOrderInCurrentReportShift,
+  isOrderInReportPeriod,
+} from "./features/reports/reportUtils";
 
-export const toIso = (v) => {
-  if (!v) return null;
-  if (v instanceof Date) return v.toISOString();
-  if (v && typeof v.toDate === "function") return v.toDate().toISOString();
-  const d = new Date(v);
-  return isNaN(d) ? null : d.toISOString();
-};
-
-function toMillis(value) {
-  if (!value) return undefined;
-  if (value instanceof Date) return value.getTime();
-  if (value && typeof value.toMillis === "function") return value.toMillis();
-  const parsed = new Date(value);
-  return Number.isNaN(+parsed) ? undefined : parsed.getTime();
-}
-
-function toValidDate(value) {
-  if (!value) return null;
-  if (value instanceof Date) return Number.isNaN(+value) ? null : value;
-  if (value && typeof value.toDate === "function") {
-    const d = value.toDate();
-    return d instanceof Date && !Number.isNaN(+d) ? d : null;
-  }
-  if (typeof value === "string") {
-    const dateOnly = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-    if (dateOnly) {
-      const [, y, m, d] = dateOnly;
-      const localDate = new Date(Number(y), Number(m) - 1, Number(d), 0, 0, 0, 0);
-      return Number.isNaN(+localDate) ? null : localDate;
-    }
-  }
-  const d = new Date(value);
-  return Number.isNaN(+d) ? null : d;
-}
-
-function isOrderInReportPeriod(order, start, end) {
-  const when = toValidDate(order?.date);
-  return Boolean(when && start && end && when >= start && when <= end);
-}
-
-function isOrderInCurrentReportShift(order, dayMetaValue, activeDayId) {
-  if (!order || order.voided) return false;
-  const shiftDayIds = new Set(
-    [activeDayId, dayMetaValue?.dayId].filter(Boolean).map((value) => String(value))
-  );
-  if (shiftDayIds.size && order.dayId) return shiftDayIds.has(String(order.dayId));
-
-  const start = toValidDate(dayMetaValue?.startedAt);
-  if (!start) return false;
-  const end = toValidDate(dayMetaValue?.endedAt) || new Date();
-  return isOrderInReportPeriod(order, start, end);
-}
-
-function getReportOrderKey(order = {}, index = 0) {
-  const when = toValidDate(order.date);
-  const localDateKey = when
-    ? [
-        when.getFullYear(),
-        String(when.getMonth() + 1).padStart(2, "0"),
-        String(when.getDate()).padStart(2, "0"),
-      ].join("-")
-    : "";
-  const candidates = [
-    order.cloudId ? `cloud_${order.cloudId}` : "",
-    order.idemKey ? `idem_${order.idemKey}` : "",
-    order.onlineOrderKey ? `online_key_${order.onlineOrderKey}` : "",
-    order.onlineOrderId ? `online_id_${order.onlineOrderId}` : "",
-    order.dayId && order.orderNo != null ? `day_order_${order.dayId}_${order.orderNo}` : "",
-    order.orderNo != null && localDateKey ? `date_order_${localDateKey}_${order.orderNo}` : "",
-    order.id ? `id_${order.id}` : "",
-  ];
-  return String(candidates.find(Boolean) || `report_order_${index}`);
-}
-
-function dedupeReportOrders(rows = []) {
-  const byKey = new Map();
-  for (const [index, order] of (rows || []).entries()) {
-    if (!order) continue;
-    const key = getReportOrderKey(order, index);
-    const prev = byKey.get(key);
-    const currentUpdated =
-      toMillis(order.updatedAt) || toMillis(order.savedAt) || toMillis(order.date) || 0;
-    const previousUpdated =
-      toMillis(prev?.updatedAt) || toMillis(prev?.savedAt) || toMillis(prev?.date) || 0;
-    if (!prev || currentUpdated >= previousUpdated) byKey.set(key, order);
-  }
-  return Array.from(byKey.values());
-}
+export { toIso };
 
 export function sanitizeForSupabase(value) {
   if (value === undefined) return undefined;
@@ -726,69 +669,6 @@ function sectionForKey(key) {
     if (keys.includes(key)) return section;
   }
   return key;
-}
-
-function toMs(value) {
-  if (!value) return 0;
-  const ms = value instanceof Date ? value.getTime() : new Date(value).getTime();
-  return Number.isFinite(ms) ? ms : 0;
-}
-
-function getStableRecordKey(record, fallbackPrefix = "row", index = 0) {
-  if (!record || typeof record !== "object") return `${fallbackPrefix}_${index}`;
-
-  const isOrderLike =
-    fallbackPrefix === "order" ||
-    record.orderNo != null ||
-    record.cloudId ||
-    record.idemKey ||
-    record.onlineOrderId ||
-    record.onlineOrderKey;
-
-  const candidates = isOrderLike
-    ? [
-        record.cloudId ? `cloud_${record.cloudId}` : "",
-        record.idemKey ? `idem_${record.idemKey}` : "",
-        record.onlineOrderKey ? `online_key_${record.onlineOrderKey}` : "",
-        record.onlineOrderId ? `online_id_${record.onlineOrderId}` : "",
-        record.id,
-        record.orderNo != null
-          ? `order_${record.dayId || orderDayBucket(record)}_${record.orderNo}`
-          : "",
-        record.channelOrderNo
-          ? `channel_${record.dayId || orderDayBucket(record)}_${record.channelOrderNo}`
-          : "",
-      ]
-    : [
-        record.id,
-        record.sessionId,
-        record.dayId,
-        record.name && (record.signInAt || record.date || record.at)
-          ? `${record.name}_${record.signInAt || record.date || record.at}`
-          : "",
-      ];
-
-  return String(
-    candidates.find((v) => v !== undefined && v !== null && String(v) !== "") ||
-      `${fallbackPrefix}_${index}`
-  );
-}
-
-function recordUpdatedMs(record) {
-  if (!record || typeof record !== "object") return 0;
-  const candidates = [
-    record.updatedAt,
-    record.savedAt,
-    record.reconciledAt,
-    record.endedAt,
-    record.endAt,
-    record.signOutAt,
-    record.createdAt,
-    record.date,
-    record.at,
-    record.signInAt,
-  ];
-  return candidates.reduce((max, value) => Math.max(max, toMs(value)), 0);
 }
 
 function stampRecord(record, stamp = nowIso(), fallbackPrefix = "row", index = 0) {
@@ -2829,47 +2709,6 @@ function getOnlineOrderDedupeKey(order) {
       .join(":");
   return key;
 }
-function orderDayBucket(order = {}) {
-  const dt = order.date ? new Date(order.date) : null;
-  if (!dt || Number.isNaN(+dt)) return "unknown_day";
-  return dt.toISOString().slice(0, 10);
-}
-
-function orderDedupeKey(order = {}) {
-  const firstStrongKey = [
-    order.cloudId ? `cloud_${order.cloudId}` : "",
-    order.id ? `id_${order.id}` : "",
-    order.idemKey ? `idem_${order.idemKey}` : "",
-    order.onlineOrderId ? `online_id_${order.onlineOrderId}` : "",
-    order.onlineOrderKey ? `online_key_${order.onlineOrderKey}` : "",
-  ].find(Boolean);
-  if (firstStrongKey) return firstStrongKey;
-
-  const dayKey = order.dayId || orderDayBucket(order);
-  if (order.channelOrderNo) return `channel_${dayKey}_${order.channelOrderNo}`;
-  if (order.orderNo != null) return `order_${dayKey}_${order.orderNo}`;
-  return [
-    "fallback",
-    dayKey,
-    toMillis(order.date) || toMillis(order.createdAt) || "",
-    order.worker || "",
-    order.total || "",
-  ].join("_");
-}
-
-function dedupeOrders(list) {
-  const byKey = new Map();
-  for (const o of list || []) {
-    const key = orderDedupeKey(o);
-    const prev = byKey.get(key);
-    const currentUpdated = recordUpdatedMs(o) || toMillis(o.date) || 0;
-    const previousUpdated = recordUpdatedMs(prev) || toMillis(prev?.date) || 0;
-    if (!prev || currentUpdated >= previousUpdated) byKey.set(key, o);
-  }
-  return Array.from(byKey.values()).sort(
-    (a, b) => +(new Date(b.date || b.createdAt || 0)) - +(new Date(a.date || a.createdAt || 0))
-  );
-}
 const BASE_MENU = [
   {
     id: 1,
@@ -3160,39 +2999,6 @@ const BASE_WORKERS = ["Hassan","Andiel", "Warda", "Ahmed", "Hazem",];
 const DEFAULT_PAYMENT_METHODS = ["Cash", "Card", "Instapay"];
 const DEFAULT_ORDER_TYPES = ["Take-Away", "Dine-in", "Delivery"];
 const DEFAULT_DELIVERY_FEE = 20;
-const roundMoney = (value) => {
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? Number(numeric.toFixed(2)) : 0;
-};
-function normalizeFixedDiscountAmount(value, subtotal = Infinity) {
-  const numeric = Number(value || 0);
-  if (!Number.isFinite(numeric) || numeric <= 0) return 0;
-  const max = Number.isFinite(Number(subtotal))
-    ? Math.max(0, Number(subtotal))
-    : Infinity;
-  return roundMoney(Math.min(numeric, max));
-}
-function getOrderDiscountAmount(order = {}) {
-  const raw = Number(order?.discountAmount ?? order?.discount ?? 0);
-  return Number.isFinite(raw) ? Math.abs(roundMoney(raw)) : 0;
-}
-function getOrderDiscountPercentage(order = {}) {
-  return 0;
-}
-function getOrderNetItemsAmount(order = {}) {
-  const delivery = Math.max(0, Number(order?.deliveryFee || 0));
-  const rawDiscount = Number(order?.discountAmount ?? order?.discount ?? 0);
-  if (order?.itemsTotal != null) {
-    const storedItems = Number(order.itemsTotal || 0);
-    const netItems =
-      Number.isFinite(rawDiscount) && rawDiscount < 0
-        ? storedItems + rawDiscount
-        : storedItems;
-    return roundMoney(Math.max(0, Number.isFinite(netItems) ? netItems : 0));
-  }
-  const net = Number(order?.total || 0) - delivery;
-  return roundMoney(Math.max(0, Number.isFinite(net) ? net : 0));
-}
 const UTILITY_UNIT_LABELS = {
   electricity: { amount: "Bill amount (E£)", units: "Usage on bill (kWh)", per: "E£ / kWh" },
   gas: { amount: "Bill amount (E£)", units: "Usage on bill (m³)", per: "E£ / m³" },
@@ -4411,176 +4217,6 @@ async function previewReceiptHTML(order, widthMm = 80, copy = "Preview", images)
   }
   return { success: openReceiptPreviewWindow(html) };
 }
-const normalizePhone = (s) => {
-  let digits = String(s || "").replace(/\D/g, "");
-  if (digits.startsWith("00")) {
-    digits = digits.slice(2);
-  }
-  if (digits.startsWith("20")) {
-    return digits.slice(0, 12);
-  }
-  if (digits.startsWith("2") && digits.length > 11) {
-    return digits.slice(0, 12);
-  }
-  return digits.slice(0, 11);
-};
-const extractLocalPhoneDigits = (raw) => {
-  const digits = normalizePhone(raw);
-  if (!digits) return "";
-  if (digits.startsWith("20")) return digits.slice(2, 12);
-  if (digits.startsWith("0")) return digits.slice(1, 11);
-  return digits.slice(0, 10);
-};
-const toCanonicalLocalPhone = (raw) => {
-  const local = extractLocalPhoneDigits(raw);
-  if (!local) return "";
-  return `0${local}`.slice(0, 11);
-};
-const formatPhoneForDisplay = (raw) => {
-  const digits = normalizePhone(raw);
-  if (!digits) return "";
-  if (digits.startsWith("0") && digits.length >= 2) {
-    return `+20${digits.slice(1)}`;
-  }
-  if (digits.startsWith("20")) return `+${digits}`;
-  if (digits.startsWith("2")) return `+${digits}`;
-  return `+20${digits}`;
-};
-const upsertCustomer = (list, rec) => {
-  const phone = normalizePhone(rec.phone);
-  const existing = (list || []).find((c) => normalizePhone(c.phone) === phone) || {};
-  const without = (list || []).filter((c) => normalizePhone(c.phone) !== phone);
-  return [{ ...existing, ...rec, phone }, ...without];
-};
-const parseDateMaybe = (value) => {
-  if (!value) return null;
-  if (value instanceof Date) return value;
-  const d = new Date(value);
-  return Number.isNaN(+d) ? null : d;
-};
-function dedupeCustomers(list = []) {
-  const seen = new Set();
-  const out = [];
-  for (const c of list || []) {
-    const p = normalizePhone(c.phone);
-    if (seen.has(p)) continue;
-    seen.add(p);
-    out.push({
-      ...c,
-      phone: p,
-      lastOrderAt: parseDateMaybe(c.lastOrderAt),
-      firstOrderAt: parseDateMaybe(c.firstOrderAt),
-      updatedAt: parseDateMaybe(c.updatedAt),
-    });
-  }
-  return out;
-}
-const calculateCustomerLifetimeSpend = (phone, orders = []) => {
-  const target = normalizePhone(phone);
-  if (!target) return 0;
-  const total = (orders || []).reduce((sum, order) => {
-    if (!order || order.voided) return sum;
-    const orderPhone = normalizePhone(order.deliveryPhone);
-    if (!orderPhone || orderPhone !== target) return sum;
-    const amount = Number(order.total || 0);
-    return Number.isFinite(amount) ? sum + amount : sum;
-  }, 0);
-  return Number(total.toFixed(2));
-};
-const categorizeCustomerActivity = (contact = {}, now = new Date()) => {
-  const last = parseDateMaybe(contact.lastOrderAt || contact.lastOrderDate);
-  const count = Number(contact.orderCount || contact.ordersCount || 0);
-  if (!count) {
-    return last ? "dormant" : "new";
-  }
-  if (!last) return "dormant";
-  const diffDays = Math.floor((now - last) / (1000 * 60 * 60 * 24));
-  if (count <= 1) {
-    return diffDays <= 30 ? "new" : "dormant";
-  }
-  if (diffDays <= 45) return "regular";
-  if (count >= 4 && diffDays <= 90) return "regular";
-  return "dormant";
-};
-const buildCustomerContactRows = (
-  contacts = [],
-  liveOrders = [],
-  historicalOrders = [],
-  deliveryZones = []
-) => {
-  const zoneMap = new Map((deliveryZones || []).map((z) => [z.id, z]));
-  const allOrders = [...(historicalOrders || []), ...(liveOrders || [])];
-  return (contacts || [])
-    .map((contact, idx) => {
-      const phone = normalizePhone(contact.phone);
-      const ordersForContact = allOrders.filter(
-        (order) => normalizePhone(order?.deliveryPhone) === phone && !order?.voided
-      );
-      const latestOrder = ordersForContact.reduce(
-        (acc, order) => {
-          const when = parseDateMaybe(order?.date);
-          if (!when) return acc;
-          if (!acc || when > acc.when) return { when, order };
-          return acc;
-        },
-        null
-      );
-      const firstOrder = ordersForContact.reduce(
-        (acc, order) => {
-          const when = parseDateMaybe(order?.date);
-          if (!when) return acc;
-          if (!acc || when < acc) return when;
-          return acc;
-        },
-        parseDateMaybe(contact.firstOrderAt)
-      );
-      const totalSpend =
-        contact.totalSpend != null
-          ? Number(contact.totalSpend || 0)
-          : calculateCustomerLifetimeSpend(phone, allOrders);
-      const orderCount =
-        contact.orderCount != null
-          ? Number(contact.orderCount || 0)
-          : ordersForContact.length;
-      const lastOrderAt =
-        parseDateMaybe(contact.lastOrderAt) || latestOrder?.when || null;
-      const zoneId = contact.zoneId || latestOrder?.order?.deliveryZoneId || "";
-      const zoneName = zoneId ? zoneMap.get(zoneId)?.name || zoneId : "";
-      const tags = Array.isArray(contact.tags) ? contact.tags.map(String) : [];
-      const activity = categorizeCustomerActivity(
-        { ...contact, orderCount, lastOrderAt },
-        new Date()
-      );
-      if (activity) {
-        const label = activity.charAt(0).toUpperCase() + activity.slice(1);
-        if (!tags.includes(label)) tags.push(label);
-      }
-      return {
-        id: phone || contact.id || `contact_${idx}`,
-        displayName:
-          contact.name || latestOrder?.order?.deliveryName || "Unknown customer",
-        phone,
-        address: contact.address || latestOrder?.order?.deliveryAddress || "",
-        zoneId,
-        zoneName,
-        tags,
-        lastOrderAt,
-        lastOrderTotal:
-          latestOrder?.order?.total != null
-            ? Number(latestOrder.order.total || 0)
-            : contact.lastOrderTotal != null
-            ? Number(contact.lastOrderTotal || 0)
-            : 0,
-        lastOrderNo:
-          latestOrder?.order?.orderNo ?? contact.lastOrderNo ?? null,
-        totalSpend: Number(totalSpend.toFixed(2)),
-        orderCount,
-        firstOrderAt: firstOrder,
-      };
-    })
-    .filter(Boolean)
-    .sort((a, b) => b.totalSpend - a.totalSpend || (b.lastOrderAt || 0) - (a.lastOrderAt || 0));
-};
 const searchCustomersByQuery = (rows = [], query = "") => {
   const q = String(query || "").trim();
   if (!q) return rows;
@@ -10723,18 +10359,7 @@ const endedStr   = m.endedAt   ? fmtDateTime(m.endedAt)   : "—";
       doc.text("Orders", 14, y);
       autoTable(doc, {
    head: [["#", "Date", "Worker", "Payment", "Discount (E£)", "Type", "Delivery (E£)", "Total (E£)", "Status", "Reason"]],
-   body: reportOrdersDetailed.map((o) => [
-  o.orderNo,
-  fmtDateTime(o.date),
-  o.worker,
-  o.payment,
-  getOrderDiscountAmount(o).toFixed(2),
-  o.orderType || "",
-  (o.deliveryFee || 0).toFixed(2),
-  o.total.toFixed(2),
-  o.voided ? (o.restockedAt ? "Cancelled" : "Returned") : (o.done ? "Done" : "Not done"),
-  o.voided ? (o.voidReason || "") : "",
-]),
+   body: buildReportOrderRows(reportOrdersDetailed, fmtDateTime),
    startY: y + 4,
    styles: { fontSize: 9 },
  });
@@ -16525,6 +16150,7 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
 )}
       {/* REPORTS */}
       {activeTab === "admin" && adminSubTab === "reports" && (
+        <ReportsTab>
         <div>
          <div style={{ marginBottom: '16px' }}>
       <button
@@ -17133,6 +16759,7 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
   </table>
 )}
         </div>
+        </ReportsTab>
       )}
       {activeTab === "admin" && adminSubTab === "edit" && (
         <div>
