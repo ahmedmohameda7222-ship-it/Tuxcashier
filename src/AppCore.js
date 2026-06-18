@@ -5218,13 +5218,24 @@ const [lastLocalEditAt, setLastLocalEditAt] = useState(0);
       }
       const requiresCleanDevice = ["read_write", "admin"].includes(mode);
       const isCurrentDevice = deviceId === DEVICE_ID;
-      if (requiresCleanDevice && isCurrentDevice && !getDeviceWriteReadyMarker()) {
-        alert("This device must clean its local data before it can become Listen + write or Admin.");
-        return;
+
+      if (requiresCleanDevice && isCurrentDevice) {
+        const localReady = getDeviceWriteReadyMarker();
+        const cloudReady = currentDevice?.writeReadyAt || currentDevice?.localResetAt;
+        if (!localReady && !cloudReady) {
+          // Fallback: check Supabase directly in case syncDevices is stale or localStorage was cleared
+          const dbDevice = await findDeviceRow(DEVICE_ID);
+          if (!dbDevice?.write_ready_at) {
+            alert("This device must clean its local data before it can become Listen + write or Admin.");
+            return;
+          }
+        }
       }
+
       if (requiresCleanDevice && !isCurrentDevice) {
         const targetDevice = syncDevices.find((d) => d.deviceId === deviceId);
-        if (!targetDevice?.writeReadyAt) {
+        const targetReady = targetDevice?.writeReadyAt || targetDevice?.localResetAt;
+        if (!targetReady) {
           alert("That device must clean its local data first. Open that device and run Clean local data for Write/Admin.");
           return;
         }
@@ -5245,7 +5256,7 @@ const [lastLocalEditAt, setLastLocalEditAt] = useState(0);
         alert(`Device update failed: ${String(err?.message || err)}`);
       }
     },
-    [canManageConnectedDevices, dayMeta.currentWorker, refreshDevices, syncDevices]
+    [canManageConnectedDevices, dayMeta.currentWorker, refreshDevices, syncDevices, currentDevice]
   );
     const renameDevice = useCallback(
     async (deviceId, label) => {
@@ -17866,7 +17877,7 @@ setExtraList((arr) => [
                       localResetAt: now,
                     });
                     alert("Local data cleaned. This device is now write-ready. Reloading...");
-                    window.location.reload();
+                    setTimeout(() => window.location.reload(), 300);
                   } catch (err) {
                     console.warn("Device cleanup failed:", err);
                     alert("Device cleanup failed: " + String(err?.message || err));
