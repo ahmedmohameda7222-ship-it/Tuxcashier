@@ -517,14 +517,33 @@ const MAX_ACTIVE_SHIFT_MS = 24 * 60 * 60 * 1000;
 const LS_KEY = "tux_pos_local_state_v1";
 const DEVICE_ID = getDeviceId();
 const DEVICE_IP_CACHE_KEY = "tux_cashier_device_ip_v1";
+const DEVICE_WRITE_READY_KEY = "tux_cashier_device_write_ready_v1";
+
+function getDeviceWriteReadyMarker() {
+  try {
+    const raw = localStorage.getItem(DEVICE_WRITE_READY_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed?.deviceId !== DEVICE_ID) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function markCurrentDeviceWriteReady() {
+  const marker = {
+    deviceId: DEVICE_ID,
+    at: nowIso(),
+  };
+  localStorage.setItem(DEVICE_WRITE_READY_KEY, JSON.stringify(marker));
+  return marker;
+}
 
 const DEVICE_MODE_OPTIONS = [
-  { value: "pending", label: "Pending", canListen: false, canWrite: false, canAdmin: false },
   { value: "listen", label: "Listen only", canListen: true, canWrite: false, canAdmin: false },
-  { value: "write", label: "Write only", canListen: false, canWrite: true, canAdmin: false },
   { value: "read_write", label: "Listen + write", canListen: true, canWrite: true, canAdmin: false },
   { value: "admin", label: "Admin device", canListen: true, canWrite: true, canAdmin: true },
-  { value: "blocked", label: "Blocked", canListen: false, canWrite: false, canAdmin: false },
 ];
 
 function getDeviceModeMeta(mode) {
@@ -3593,6 +3612,8 @@ function deviceFromSupabaseRow(row = {}) {
     lastSeenAt: row.last_seen_at ? new Date(row.last_seen_at) : null,
     approvedBy: row.approved_by || "",
     blockedAt: row.blocked_at ? new Date(row.blocked_at) : null,
+    writeReadyAt: row.write_ready_at ? new Date(row.write_ready_at) : null,
+    localResetAt: row.local_reset_at ? new Date(row.local_reset_at) : null,
     updatedAt: row.updated_at ? new Date(row.updated_at) : null,
   };
 }
@@ -3620,6 +3641,7 @@ async function findDeviceRow(deviceId) {
   return byLegacyId.data || null;
 }
 
+// eslint-disable-next-line no-unused-vars
 async function countDevicesForShop() {
   if (!supabase) return 0;
   const modern = await supabase
@@ -3641,15 +3663,12 @@ async function upsertDeviceHeartbeat(status = {}) {
   const deviceInfo = detectDeviceDetails();
   const now = new Date().toISOString();
   const existing = await findDeviceRow(DEVICE_ID).catch(() => null);
-  const deviceCount = await countDevicesForShop().catch(() => 0);
-  const mode =
-    existing?.mode ||
-    (existing && deviceInfo.appSurface === "local-electron"
-      ? "admin"
-      : Number(deviceCount || 0) === 0
-      ? "admin"
-      : "pending");
-  const row = sanitizeForSupabase({
+  const normalizedExistingMode =
+    ["listen", "read_write", "admin"].includes(existing?.mode)
+      ? existing.mode
+      : "";
+  const mode = normalizedExistingMode || "listen";
+    const row = sanitizeForSupabase({
     id: existing?.id || DEVICE_ID,
     device_id: DEVICE_ID,
     shop_id: SHOP_ID,
@@ -3701,10 +3720,10 @@ async function updateDeviceRecord(deviceId, patch = {}) {
   if (!supabase || !deviceId) return null;
   const row = {};
   if (patch.label != null) row.label = String(patch.label || "");
-  if (patch.mode != null) row.mode = String(patch.mode || "pending");
+  if (patch.mode != null) row.mode = String(patch.mode || "listen");
   if (patch.approvedBy != null) row.approved_by = String(patch.approvedBy || "");
-  if (patch.mode === "blocked") row.blocked_at = new Date().toISOString();
-  if (patch.mode && patch.mode !== "blocked") row.blocked_at = null;
+  if (patch.writeReadyAt != null) row.write_ready_at = toIso(patch.writeReadyAt);
+  if (patch.localResetAt != null) row.local_reset_at = toIso(patch.localResetAt);
 
   const modern = await supabase
     .from("devices")
@@ -5156,20 +5175,15 @@ const [lastLocalEditAt, setLastLocalEditAt] = useState(0);
       ) || null,
     [syncDevices]
   );
-  const currentDeviceMode =
-    currentDevice?.mode ||
-    (deviceStatus.error
-      ? "admin"
-      : currentDeviceInfo.appSurface === "local-electron"
-      ? "admin"
-      : "pending");
-  const currentDeviceModeMeta = getDeviceModeMeta(currentDeviceMode);
+  const currentDeviceMode = currentDevice?.mode || "listen";
+    const currentDeviceModeMeta = getDeviceModeMeta(currentDeviceMode);
   const currentDeviceCanListen =
     currentDeviceModeMeta.canListen || currentDeviceModeMeta.canAdmin || !!deviceStatus.error;
   const currentDeviceCanWrite =
     currentDeviceModeMeta.canWrite || currentDeviceModeMeta.canAdmin || !!deviceStatus.error;
   const currentDeviceCanAdmin = currentDeviceModeMeta.canAdmin || !!deviceStatus.error;
-  const assertDeviceCanWrite = useCallback(
+  const canManageConnectedDevices = adminUnlocked;
+    const assertDeviceCanWrite = useCallback(
     (actionLabel = "write to the system") => {
       if (currentDeviceCanWrite) return true;
       alert(
@@ -5198,9 +5212,22 @@ const [lastLocalEditAt, setLastLocalEditAt] = useState(0);
   }, [fbUser, localDbStatus.pendingCount]);
   const updateDeviceMode = useCallback(
     async (deviceId, mode) => {
-      if (!currentDeviceCanAdmin) {
-        alert("This device is not allowed to manage connected devices.");
+      if (!canManageConnectedDevices) {
+        alert("Admin unlock required to manage connected devices.");
         return;
+      }
+      const requiresCleanDevice = ["read_write", "admin"].includes(mode);
+      const isCurrentDevice = deviceId === DEVICE_ID;
+      if (requiresCleanDevice && isCurrentDevice && !getDeviceWriteReadyMarker()) {
+        alert("This device must clean its local data before it can become Listen + write or Admin.");
+        return;
+      }
+      if (requiresCleanDevice && !isCurrentDevice) {
+        const targetDevice = syncDevices.find((d) => d.deviceId === deviceId);
+        if (!targetDevice?.writeReadyAt) {
+          alert("That device must clean its local data first. Open that device and run Clean local data for Write/Admin.");
+          return;
+        }
       }
       try {
         const updated = await updateDeviceRecord(deviceId, {
@@ -5218,12 +5245,12 @@ const [lastLocalEditAt, setLastLocalEditAt] = useState(0);
         alert(`Device update failed: ${String(err?.message || err)}`);
       }
     },
-    [currentDeviceCanAdmin, dayMeta.currentWorker, refreshDevices]
+    [canManageConnectedDevices, dayMeta.currentWorker, refreshDevices, syncDevices]
   );
-  const renameDevice = useCallback(
+    const renameDevice = useCallback(
     async (deviceId, label) => {
-      if (!currentDeviceCanAdmin) {
-        alert("This device is not allowed to manage connected devices.");
+      if (!canManageConnectedDevices) {
+        alert("Admin unlock required to manage connected devices.");
         return;
       }
       try {
@@ -5239,9 +5266,9 @@ const [lastLocalEditAt, setLastLocalEditAt] = useState(0);
         alert(`Device rename failed: ${String(err?.message || err)}`);
       }
     },
-    [currentDeviceCanAdmin, refreshDevices]
+    [canManageConnectedDevices, refreshDevices]
   );
-  const [hydrated, setHydrated] = useState(false);
+    const [hydrated, setHydrated] = useState(false);
   const [lastAppliedCloudAt, setLastAppliedCloudAt] = useState(0);
   // Prevent our own cloud writes from boomeranging back
 const clientIdRef = useRef(DEVICE_ID);
@@ -6313,41 +6340,43 @@ if (ts && lastLocalEditAtRef.current && ts < lastLocalEditAtRef.current) return;
 
       try {
         const localState = loadLocal();
-        const pendingOrders = (localState.orders || []).filter(o => o.syncStatus === SYNC_STATUS.pending);
-        if (pendingOrders.length > 0) {
-          const updatedLocalOrders = [...(localState.orders || [])];
-          let changed = false;
-          for (let i = 0; i < updatedLocalOrders.length; i++) {
-            const o = updatedLocalOrders[i];
-            if (o.syncStatus === SYNC_STATUS.pending) {
-              try {
-                const existing = await findExistingCloudOrderForSync(o);
-                const dbOrder = normalizeOrderForSupabase(o);
-                if (existing) {
-                  dbOrder.id = existing.id;
-                  await supabase.from("orders").update(dbOrder).eq("id", existing.id);
-                  updatedLocalOrders[i] = { ...o, cloudId: existing.id, syncStatus: SYNC_STATUS.synced };
-                  await markLocalOrderSynced(o, existing.id);
-                  changed = true;
-                } else {
-                  const inserted = await addOrder({ ...o, syncStatus: SYNC_STATUS.synced });
-                  if (inserted) {
-                    updatedLocalOrders[i] = { ...o, cloudId: inserted.id, syncStatus: SYNC_STATUS.synced };
-                    await markLocalOrderSynced(o, inserted.id);
+        if (currentDeviceCanWrite) {
+          const pendingOrders = (localState.orders || []).filter(o => o.syncStatus === SYNC_STATUS.pending);
+          if (pendingOrders.length > 0) {
+            const updatedLocalOrders = [...(localState.orders || [])];
+            let changed = false;
+            for (let i = 0; i < updatedLocalOrders.length; i++) {
+              const o = updatedLocalOrders[i];
+              if (o.syncStatus === SYNC_STATUS.pending) {
+                try {
+                  const existing = await findExistingCloudOrderForSync(o);
+                  const dbOrder = normalizeOrderForSupabase(o);
+                  if (existing) {
+                    dbOrder.id = existing.id;
+                    await supabase.from("orders").update(dbOrder).eq("id", existing.id);
+                    updatedLocalOrders[i] = { ...o, cloudId: existing.id, syncStatus: SYNC_STATUS.synced };
+                    await markLocalOrderSynced(o, existing.id);
                     changed = true;
+                  } else {
+                    const inserted = await addOrder({ ...o, syncStatus: SYNC_STATUS.synced });
+                    if (inserted) {
+                      updatedLocalOrders[i] = { ...o, cloudId: inserted.id, syncStatus: SYNC_STATUS.synced };
+                      await markLocalOrderSynced(o, inserted.id);
+                      changed = true;
+                    }
                   }
+                } catch(e) {
+                  console.warn(`Sync failed for order #${o.orderNo}:`, e);
                 }
-              } catch(e) {
-                console.warn(`Sync failed for order #${o.orderNo}:`, e);
               }
             }
-          }
-          if (changed) {
-            saveLocalPartial({ orders: updatedLocalOrders });
+            if (changed) {
+              saveLocalPartial({ orders: updatedLocalOrders });
+            }
           }
         }
 
-        const remoteState = await loadCompleteCloudState();
+                const remoteState = await loadCompleteCloudState();
         if (!remoteState) {
           const message = "No cloud data yet to load.";
           setCloudStatus((s) => ({ ...s, error: message }));
@@ -6380,7 +6409,7 @@ if (ts && lastLocalEditAtRef.current && ts < lastLocalEditAtRef.current) return;
         return false;
       }
     },
-    [stateDocRef, fbUser, applyRemoteState, currentDeviceCanListen, currentDeviceModeMeta.label]
+    [stateDocRef, fbUser, applyRemoteState, currentDeviceCanListen, currentDeviceModeMeta.label, currentDeviceCanWrite]
   );
 
   // Manual pull: read-only. This loads the latest POS state from Supabase and never writes back.
@@ -17813,6 +17842,48 @@ setExtraList((arr) => [
                 <div><b>Last seen:</b> {deviceStatus.lastSeenAt ? deviceStatus.lastSeenAt.toLocaleString() : "-"}</div>
                 {deviceStatus.error && <div style={{ color: "#c62828" }}>Registry: {deviceStatus.error}</div>}
               </div>
+              <button
+                onClick={async () => {
+                  const adminNum = await promptAdminAndPin();
+                  if (!adminNum) return;
+                  const typed = await promptText(
+                    `Admin ${adminNum}: type CLEAN DEVICE to remove this device's local POS data and mark it write-ready.`,
+                    ""
+                  );
+                  if (norm(typed) !== "CLEAN DEVICE") {
+                    alert("Device cleanup cancelled.");
+                    return;
+                  }
+                  try {
+                    if (typeof localStorage !== "undefined") {
+                      localStorage.removeItem(LS_KEY);
+                    }
+                    await deleteLocalDatabase();
+                    markCurrentDeviceWriteReady();
+                    const now = new Date().toISOString();
+                    await updateDeviceRecord(DEVICE_ID, {
+                      writeReadyAt: now,
+                      localResetAt: now,
+                    });
+                    alert("Local data cleaned. This device is now write-ready. Reloading...");
+                    window.location.reload();
+                  } catch (err) {
+                    console.warn("Device cleanup failed:", err);
+                    alert("Device cleanup failed: " + String(err?.message || err));
+                  }
+                }}
+                style={{
+                  marginTop: 10,
+                  padding: "6px 10px",
+                  borderRadius: 6,
+                  border: `1px solid ${btnBorder}`,
+                  background: dark ? "#2c2c2c" : "#f1f1f1",
+                  color: dark ? "#fff" : "#000",
+                  cursor: "pointer",
+                }}
+              >
+                Clean local data for Write/Admin
+              </button>
             </div>
             <div style={{ padding: 10, borderRadius: 6, border: `1px solid ${cardBorder}` }}>
               <h4 style={{ marginTop: 0 }}>Permissions</h4>
@@ -17820,6 +17891,9 @@ setExtraList((arr) => [
                 <div>Listen: <b>{currentDeviceCanListen ? "Allowed" : "Blocked"}</b></div>
                 <div>Write: <b>{currentDeviceCanWrite ? "Allowed" : "Blocked"}</b></div>
                 <div>Manage devices: <b>{currentDeviceCanAdmin ? "Allowed" : "Blocked"}</b></div>
+                {getDeviceWriteReadyMarker() && (
+                  <div style={{ color: "#2e7d32" }}>Write-ready: cleaned</div>
+                )}
               </div>
               <button
                 onClick={refreshDevices}
@@ -17866,8 +17940,9 @@ setExtraList((arr) => [
                       </td>
                       <td style={{ padding: 8, borderBottom: `1px solid ${cardBorder}` }}>
                         <select
-                          value={device.mode || "pending"}
+                          value={device.mode || "listen"}
                           onChange={(e) => updateDeviceMode(deviceId, e.target.value)}
+                          disabled={!canManageConnectedDevices}
                           style={{ padding: 6, borderRadius: 6, border: `1px solid ${btnBorder}` }}
                         >
                           {DEVICE_MODE_OPTIONS.map((mode) => (
@@ -17884,14 +17959,17 @@ setExtraList((arr) => [
                         {device.lastIp || "-"}
                       </td>
                       <td style={{ padding: 8, borderBottom: `1px solid ${cardBorder}` }}>
-                        Pending: {Number(device.pendingCount || 0)}
+                        <div>Pending: {Number(device.pendingCount || 0)}</div>
+                        {device.writeReadyAt && (
+                          <div style={{ fontSize: 10, color: "#2e7d32" }}>Write-ready</div>
+                        )}
                       </td>
                       <td style={{ padding: 8, borderBottom: `1px solid ${cardBorder}` }}>
                         {device.lastSeenAt ? device.lastSeenAt.toLocaleString() : "-"}
                       </td>
                       <td style={{ padding: 8, borderBottom: `1px solid ${cardBorder}` }}>
                         <button
-                          disabled={!currentDeviceCanAdmin}
+                          disabled={!canManageConnectedDevices}
                           onClick={() => {
                             const label = window.prompt("Device label:", device.label || "");
                             if (label == null) return;
@@ -17901,7 +17979,7 @@ setExtraList((arr) => [
                             padding: "5px 8px",
                             borderRadius: 6,
                             border: `1px solid ${btnBorder}`,
-                            cursor: currentDeviceCanAdmin ? "pointer" : "not-allowed",
+                            cursor: canManageConnectedDevices ? "pointer" : "not-allowed",
                           }}
                         >
                           Rename
@@ -18022,7 +18100,7 @@ setExtraList((arr) => [
           >
             <strong>{device.label || device.deviceId || device.id}</strong>
             <span>{device.appSurface || "app"}</span>
-            <span>Mode: {getDeviceModeMeta(device.mode || "pending").label}</span>
+            <span>Mode: {getDeviceModeMeta(device.mode || "listen").label}</span>
             <span>Pending: {Number(device.pendingCount || 0)}</span>
             <span>Seen: {device.lastSeenAt ? device.lastSeenAt.toLocaleString() : "-"}</span>
           </div>

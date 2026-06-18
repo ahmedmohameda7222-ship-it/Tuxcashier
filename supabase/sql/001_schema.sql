@@ -73,8 +73,8 @@ create table if not exists public.devices (
   shop_id text not null,
   label text,
   app_surface text,
-  mode text not null default 'pending'
-    check (mode in ('pending', 'listen', 'write', 'read_write', 'admin', 'blocked')),
+  mode text not null default 'listen'
+    check (mode in ('listen', 'read_write', 'admin')),
   os text,
   browser text,
   platform text,
