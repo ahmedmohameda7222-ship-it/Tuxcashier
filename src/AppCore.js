@@ -5931,6 +5931,37 @@ const writeFullStateToCloud = useCallback(
   // eslint-disable-next-line react-hooks/exhaustive-deps
   [stateDocRef, fbUser, buildFullStateForCloud, currentDeviceCanWrite, currentDeviceModeMeta.label]
 );
+const pushShiftStateToCloud = useCallback(
+  async (nextDayMeta, extraOverrides = {}) => {
+    if (!cloudEnabled || !stateDocRef || !fbUser || !currentDeviceCanWrite) {
+      return false;
+    }
+
+    try {
+      await writeFullStateToCloud({
+        ...extraOverrides,
+        dayMeta: nextDayMeta,
+      });
+      console.log("Shift state synced to cloud");
+      return true;
+    } catch (err) {
+      const message = String(err?.message || err);
+      console.warn("Shift state cloud sync failed:", err);
+      setCloudStatus((status) => ({
+        ...status,
+        error: `Shift started locally but cloud shift sync failed: ${message}`,
+      }));
+      return false;
+    }
+  },
+  [
+    cloudEnabled,
+    stateDocRef,
+    fbUser,
+    currentDeviceCanWrite,
+    writeFullStateToCloud,
+  ]
+);
 const saveAdminSettings = useCallback(async () => {
   const stamp = nowIso();
   const localState = loadLocal();
@@ -7514,12 +7545,15 @@ const addWorkerProfile = () => {
   setShowAddWorker(false);
   setNewWName(""); setNewWPin(""); setNewWRate("");
 };
-const startDayIfNeeded = (starterName) => {
-  if (!assertDeviceCanWrite("start a shift")) return "";
-  if (dayMeta.startedAt && !dayMeta.endedAt) return currentDayId;
+const startDayIfNeeded = async (starterName) => {
+  if (!assertDeviceCanWrite("start a shift")) return null;
+  if (dayMeta.startedAt && !dayMeta.endedAt) {
+    return { dayId: currentDayId, dayMeta, startedNewShift: false };
+  }
   const startTime = new Date();
   const dayId = `day_${startTime.getTime()}`;
-  setDayMeta({
+  const updatedAt = nowIso();
+  const newMeta = {
     dayId,
     startedBy: starterName || "",
     currentWorker: starterName || "",
@@ -7530,20 +7564,30 @@ const startDayIfNeeded = (starterName) => {
     resetBy: "",
     resetAt: null,
     active: true,
-    updatedAt: nowIso(),
+    updatedAt,
     shiftChanges: [],
-  });
+  };
+  setDayMeta(newMeta);
+  saveLocalPartial(
+    { dayMeta: newMeta },
+    { sections: [DAY_META_SECTION], updatedAt }
+  );
+  setLastLocalEditAt(Date.now());
+  await pushShiftStateToCloud(newMeta);
   if (!inventoryLocked && inventory.length) {
     if (window.confirm("Lock current Inventory as Start-of-Day snapshot?")) {
       lockInventoryForDay();
     }
   }
-  return dayId;
+  return { dayId, dayMeta: newMeta, startedNewShift: true };
 };
-const signInByPin = (pin) => {
+const signInByPin = async (pin) => {
   const prof = findWorkerByPin(pin);
   if (!prof) return alert("Invalid PIN.");
-  const dayId = startDayIfNeeded(prof.name) || currentDayId;
+  const startedShift = await startDayIfNeeded(prof.name);
+  if (!startedShift) return;
+  const dayId = startedShift.dayId || currentDayId;
+  const activeDayMeta = startedShift.dayMeta || dayMeta;
   const open = (workerSessions || []).find(s => !s.signOutAt && s.name === prof.name);
   if (open) {
     alert(`${prof.name} is already on duty.`);
@@ -7561,8 +7605,31 @@ const signInByPin = (pin) => {
     createdAt: new Date(),
     updatedAt: new Date(),
   };
-  setWorkerSessions(arr => [sess, ...arr]);
-  setDayMeta(d => ({ ...d, currentWorker: prof.name, active: true, updatedAt: nowIso() }));
+  const updatedWorkerSessions = [sess, ...(workerSessions || [])];
+  const updatedAt = nowIso();
+  const updatedDayMeta = {
+    ...activeDayMeta,
+    currentWorker: prof.name,
+    active: true,
+    updatedAt,
+  };
+  setWorkerSessions(updatedWorkerSessions);
+  workerSessionsRef.current = updatedWorkerSessions;
+  setDayMeta(updatedDayMeta);
+  saveLocalPartial(
+    {
+      dayMeta: updatedDayMeta,
+      workerSessions: updatedWorkerSessions,
+    },
+    {
+      sections: [DAY_META_SECTION, WORKER_SESSIONS_SECTION],
+      updatedAt,
+    }
+  );
+  setLastLocalEditAt(Date.now());
+  await pushShiftStateToCloud(updatedDayMeta, {
+    workerSessions: updatedWorkerSessions,
+  });
 };
 const signOutByPin = (pin) => {
   const prof = findWorkerByPin(pin);
