@@ -542,6 +542,7 @@ function markCurrentDeviceWriteReady() {
 
 const DEVICE_MODE_OPTIONS = [
   { value: "listen", label: "Listen only", canListen: true, canWrite: false, canAdmin: false },
+  { value: "write_only", label: "Write only", canListen: false, canWrite: true, canAdmin: false },
   { value: "read_write", label: "Listen + write", canListen: true, canWrite: true, canAdmin: false },
   { value: "admin", label: "Admin device", canListen: true, canWrite: true, canAdmin: true },
 ];
@@ -3664,7 +3665,7 @@ async function upsertDeviceHeartbeat(status = {}) {
   const now = new Date().toISOString();
   const existing = await findDeviceRow(DEVICE_ID).catch(() => null);
   const normalizedExistingMode =
-    ["listen", "read_write", "admin"].includes(existing?.mode)
+    ["listen", "write_only", "read_write", "admin"].includes(existing?.mode)
       ? existing.mode
       : "";
   const mode = normalizedExistingMode || "listen";
@@ -5216,7 +5217,7 @@ const [lastLocalEditAt, setLastLocalEditAt] = useState(0);
         alert("Admin unlock required to manage connected devices.");
         return;
       }
-      const requiresCleanDevice = ["read_write", "admin"].includes(mode);
+      const requiresCleanDevice = ["write_only", "read_write", "admin"].includes(mode);
       const isCurrentDevice = deviceId === DEVICE_ID;
 
       if (requiresCleanDevice && isCurrentDevice) {
@@ -5226,7 +5227,7 @@ const [lastLocalEditAt, setLastLocalEditAt] = useState(0);
           // Fallback: check Supabase directly in case syncDevices is stale or localStorage was cleared
           const dbDevice = await findDeviceRow(DEVICE_ID);
           if (!dbDevice?.write_ready_at) {
-            alert("This device must clean its local data before it can become Listen + write or Admin.");
+            alert("This device must be cleaned or marked clean before it can become Write only, Listen + write, or Admin.");
             return;
           }
         }
@@ -5236,7 +5237,7 @@ const [lastLocalEditAt, setLastLocalEditAt] = useState(0);
         const targetDevice = syncDevices.find((d) => d.deviceId === deviceId);
         const targetReady = targetDevice?.writeReadyAt || targetDevice?.localResetAt;
         if (!targetReady) {
-          alert("That device must clean its local data first. Open that device and run Clean local data for Write/Admin.");
+          alert("That device must be cleaned or marked clean first. Use Mark clean in Connected Devices, or open that device and run Clean local data for Write/Admin.");
           return;
         }
       }
@@ -5279,7 +5280,41 @@ const [lastLocalEditAt, setLastLocalEditAt] = useState(0);
     },
     [canManageConnectedDevices, refreshDevices]
   );
-    const [hydrated, setHydrated] = useState(false);
+    const markDeviceClean = useCallback(
+    async (deviceId) => {
+      if (!canManageConnectedDevices) {
+        alert("Admin unlock required to manage connected devices.");
+        return;
+      }
+      const typed = await promptText(
+        `Type MARK CLEAN to approve this device for write mode without clearing its local data.`,
+        ""
+      );
+      if (norm(typed) !== "MARK CLEAN") {
+        alert("Mark clean cancelled.");
+        return;
+      }
+      try {
+        const now = new Date().toISOString();
+        const updated = await updateDeviceRecord(deviceId, {
+          writeReadyAt: now,
+          localResetAt: now,
+          approvedBy: dayMeta.currentWorker || "Admin",
+        });
+        if (updated) {
+          setSyncDevices((list) =>
+            list.map((device) => (device.deviceId === updated.deviceId ? updated : device))
+          );
+        }
+        await refreshDevices();
+      } catch (err) {
+        console.warn("Mark device clean failed:", err);
+        alert(`Mark device clean failed: ${String(err?.message || err)}`);
+      }
+    },
+    [canManageConnectedDevices, dayMeta.currentWorker, refreshDevices]
+  );
+  const [hydrated, setHydrated] = useState(false);
   const [lastAppliedCloudAt, setLastAppliedCloudAt] = useState(0);
   // Prevent our own cloud writes from boomeranging back
 const clientIdRef = useRef(DEVICE_ID);
@@ -18061,6 +18096,21 @@ setExtraList((arr) => [
                           }}
                         >
                           Rename
+                        </button>
+                        <button
+                          disabled={!canManageConnectedDevices}
+                          onClick={() => markDeviceClean(deviceId)}
+                          style={{
+                            marginLeft: 6,
+                            padding: "5px 8px",
+                            borderRadius: 6,
+                            border: `1px solid ${btnBorder}`,
+                            background: "#2e7d32",
+                            color: "#fff",
+                            cursor: canManageConnectedDevices ? "pointer" : "not-allowed",
+                          }}
+                        >
+                          Mark clean
                         </button>
                       </td>
                     </tr>
