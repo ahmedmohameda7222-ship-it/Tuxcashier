@@ -25,6 +25,7 @@ import {
 } from "./shared/utils/moneyUtils";
 import {
   dedupeOrders,
+  getOrderIdentity,
   getStableRecordKey,
   orderDedupeKey,
   recordUpdatedMs,
@@ -78,6 +79,19 @@ const PAYMENT_METHOD_ALIASES = [
   { test: /fawry/i, label: "Fawry" },
   { test: /wallet/i, label: "Wallet" },
 ];
+
+function generateUniqueOrderId() {
+  const cryptoObj =
+    typeof window !== "undefined" && window.crypto
+      ? window.crypto
+      : typeof crypto !== "undefined"
+      ? crypto
+      : null;
+  if (cryptoObj && typeof cryptoObj.randomUUID === "function") {
+    return `order_${cryptoObj.randomUUID()}`;
+  }
+  return `order_${Date.now()}_${Math.random().toString(36).slice(2, 12)}`;
+}
 
 function normalizePaymentMethodName(method) {
   if (method == null) return "";
@@ -1453,6 +1467,19 @@ export function packStateForCloud(state) {
   } = state;
   const stamp = nowIso();
   const localSectionUpdatedAt = loadLocal()?.[SECTION_UPDATED_AT_KEY] || {};
+
+  // State validation guard for order identity
+  const safeOrders = dedupeOrders(orders || []);
+  const safeHistoricalOrders = dedupeOrders(historicalOrders || []);
+  const historicalIds = new Set(safeHistoricalOrders.map(getOrderIdentity));
+  const dedupedOrders = safeOrders.filter((o) => {
+    const id = getOrderIdentity(o);
+    if (!historicalIds.has(id)) return true;
+    // Same order exists in both: keep in orders only if it is NOT ended/historical
+    const isEnded = o.done || o.voided || o.restockedAt;
+    return !isEnded;
+  });
+  const dedupedHistoricalOrders = safeHistoricalOrders;
   const purchases = Array.isArray(state.purchases)
     ? state.purchases.map((p) => ({
       ...p,
@@ -1511,7 +1538,7 @@ export function packStateForCloud(state) {
     menu: normalizeMenuList(menu),
     extras: normalizeExtraList(extraList),
     beverages: normalizeBeverageList(beverageList),
-    orders: (orders || []).map((o) => ({
+    orders: (dedupedOrders || []).map((o) => ({
       ...o,
       id: o.id || getStableRecordKey(o, "order"),
       createdAt: toIso(o.createdAt || o.date || stamp),
@@ -1628,8 +1655,8 @@ export function packStateForCloud(state) {
     lastSeenOnlineOrderTs: Number.isFinite(Number(lastSeenOnlineOrderTs))
       ? Number(lastSeenOnlineOrderTs)
       : undefined,
-    historicalOrders: Array.isArray(historicalOrders)
-      ? stampRecords(historicalOrders, stamp, "historical_order").map((o) => ({
+    historicalOrders: Array.isArray(dedupedHistoricalOrders)
+      ? stampRecords(dedupedHistoricalOrders, stamp, "historical_order").map((o) => ({
         ...o,
         createdAt: toIso(o?.createdAt || o?.date || stamp),
         updatedAt: toIso(o?.updatedAt || stamp),
@@ -4300,17 +4327,18 @@ const [cogsSearch, setCogsSearch] = useState("");
 const [cogsSort, setCogsSort] = useState({ key: "margin", dir: "asc" });
 const [inlinePriceDrafts, setInlinePriceDrafts] = useState({});
   const [historicalOrders, setHistoricalOrders] = useState(() => {
-  const l = loadLocal();
-  const raw = Array.isArray(l.historicalOrders) ? l.historicalOrders : [];
-  return raw.map((order) => {
-    const converted = {
-      ...order,
-      date: order?.date ? new Date(order.date) : order?.date,
-      restockedAt: order?.restockedAt ? new Date(order.restockedAt) : order?.restockedAt,
-    };
-    return enrichOrderWithChannel(converted);
+    const l = loadLocal();
+    const raw = Array.isArray(l.historicalOrders) ? l.historicalOrders : [];
+    const enriched = raw.map((order) => {
+      const converted = {
+        ...order,
+        date: order?.date ? new Date(order.date) : order?.date,
+        restockedAt: order?.restockedAt ? new Date(order.restockedAt) : order?.restockedAt,
+      };
+      return enrichOrderWithChannel(converted);
+    });
+    return dedupeOrders(enriched);
   });
-});
 const [historicalExpenses, setHistoricalExpenses] = useState(() => {
   const l = loadLocal();
   return l.historicalExpenses || [];
@@ -5532,12 +5560,14 @@ if (Array.isArray(l.deliveryZones)) setDeliveryZones(l.deliveryZones);
 if (typeof l.nextOrderNo === "number") setNextOrderNo(l.nextOrderNo);
   if (Array.isArray(l.orders)) {
     setOrders(
-      l.orders.map((o) =>
-        enrichOrderWithChannel({
-          ...o,
-          date: o.date ? new Date(o.date) : new Date(),
-          restockedAt: o.restockedAt ? new Date(o.restockedAt) : undefined,
-        })
+      dedupeOrders(
+        l.orders.map((o) =>
+          enrichOrderWithChannel({
+            ...o,
+            date: o.date ? new Date(o.date) : new Date(),
+            restockedAt: o.restockedAt ? new Date(o.restockedAt) : undefined,
+          })
+        )
       )
     );
   }
@@ -5929,7 +5959,7 @@ const writeFullStateToCloud = useCallback(
       currentLocalState.workerSessions = mergeByIdPreferNewest(currentLocalState.workerSessions, unpacked.workerSessions, { fallbackPrefix: "worker_session" });
       currentLocalState.bankTx = mergeByIdPreferNewest(currentLocalState.bankTx, unpacked.bankTx, { fallbackPrefix: "bank_tx" });
       currentLocalState.reconHistory = mergeByIdPreferNewest(currentLocalState.reconHistory, unpacked.reconHistory, { fallbackPrefix: "recon" });
-      currentLocalState.historicalOrders = mergeByIdPreferNewest(currentLocalState.historicalOrders, unpacked.historicalOrders, { fallbackPrefix: "h_order" });
+      currentLocalState.historicalOrders = dedupeOrders([currentLocalState.historicalOrders, unpacked.historicalOrders]);
       currentLocalState.historicalExpenses = mergeByIdPreferNewest(currentLocalState.historicalExpenses, unpacked.historicalExpenses, { fallbackPrefix: "h_expense" });
       currentLocalState.historicalPurchases = mergeByIdPreferNewest(currentLocalState.historicalPurchases, unpacked.historicalPurchases, { fallbackPrefix: "h_purchase" });
 
@@ -6090,7 +6120,7 @@ const applyRemoteState = useCallback(
     if (unpacked.orders && canUseRemoteKey("orders")) {
       setOrders((prev) => {
         const pending = prev.filter(o => o.syncStatus === SYNC_STATUS.pending);
-        return mergeByIdPreferNewest(force ? pending : prev, unpacked.orders, { fallbackPrefix: "order" }).map(enrichOrderWithChannel);
+        return dedupeOrders([...(force ? pending : prev), ...unpacked.orders]).map(enrichOrderWithChannel);
       });
     }
     if (unpacked.inventory && canUseRemoteKey("inventory")) {
@@ -6200,7 +6230,7 @@ const applyRemoteState = useCallback(
     if (unpacked.historicalOrders && canUseRemoteSection(HISTORY_SECTION)) {
       setHistoricalOrders((prev) => {
         const pending = prev.filter(o => o.syncStatus === SYNC_STATUS.pending);
-        return mergeByIdPreferNewest(force ? pending : prev, unpacked.historicalOrders, { fallbackPrefix: "historical_order" });
+        return dedupeOrders([...(force ? pending : prev), ...unpacked.historicalOrders]);
       });
     }
     if (unpacked.historicalExpenses && canUseRemoteSection(HISTORY_SECTION)) {
@@ -8875,9 +8905,9 @@ const checkout = async () => {
       voided: false,
       restockedAt: undefined,
       note: orderNote.trim(),
-      idemKey: `idk_${fbUser ? fbUser.uid : "anon"}_${Date.now()}_${Math.random()
-        .toString(36)
-        .slice(2)}`,
+      id: generateUniqueOrderId(),
+      orderKey: `ok_${DEVICE_ID}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      idemKey: `idk_${DEVICE_ID}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
       source: "onsite",
     });
     recordCustomerFromOrder(order);
@@ -9145,6 +9175,8 @@ const onlineFallbackId =
   );
 
   let posOrder = enrichOrderWithChannel({
+    id: generateUniqueOrderId(),
+    orderKey: `ok_${DEVICE_ID}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
     orderNo,
     dayId: currentDayId,
     shiftStartedAt: dayMeta.startedAt,
@@ -9163,7 +9195,7 @@ const onlineFallbackId =
     deliveryPhone: phoneDigits,
     deliveryEmail: onlineOrder.deliveryEmail || "",
     deliveryAddress: onlineOrder.deliveryAddress || "",
-  deliveryZoneId: normalizedDeliveryZoneId || "",
+    deliveryZoneId: normalizedDeliveryZoneId || "",
     deliveryZoneName: onlineDeliveryZoneName || "",
     notifyViaWhatsapp: shouldWhatsapp,
     whatsappSentAt: null,
@@ -9180,7 +9212,7 @@ const onlineFallbackId =
     note: onlineOrder.note || "",
     idemKey:
       onlineOrder.idemKey ||
-      `online_${onlineOrder.id || onlineOrder.orderNo || key || Date.now()}`,
+      `online_${DEVICE_ID}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
     source: "online",
     channel: "online",
     channelOrderNo: channelRef,
@@ -9440,12 +9472,14 @@ const onlineFallbackId =
 
   return posOrder;
 };
-const markOrderDone = async (orderNo) => {
+const markOrderDone = async (identity) => {
   if (!assertDeviceCanWrite("update orders")) return;
   const updatedAt = new Date().toISOString();
+  const target = orders.find((o) => getOrderIdentity(o) === identity);
+  if (!target) return;
   setOrders((o) =>
     o.map((ordr) =>
-      ordr.orderNo !== orderNo || ordr.done
+      getOrderIdentity(ordr) !== identity || ordr.done
         ? ordr
         : {
             ...ordr,
@@ -9459,15 +9493,14 @@ const markOrderDone = async (orderNo) => {
 
   try {
     if (!cloudEnabled || !ordersColRef || !fbUser) return;
-    let targetId = orders.find((o) => o.orderNo === orderNo)?.cloudId;
     const payload = {
       done: true,
       updatedAt,
       lastModifiedDeviceId: DEVICE_ID,
       syncStatus: SYNC_STATUS.synced,
     };
-    if (targetId) await updateOrderById(targetId, payload);
-    else await updateOrderByOrderNo(orderNo, payload, currentDayId);
+    if (target.cloudId) await updateOrderById(target.cloudId, payload);
+    else await updateOrderByOrderNo(target.orderNo, payload, currentDayId);
   } catch (e) {
     console.warn("Cloud update (done) failed:", e);
    }
@@ -9475,7 +9508,7 @@ const markOrderDone = async (orderNo) => {
 const markOnlineOrderDone = async (onlineOrder) => {
   const posOrder = findPosOrderForOnline(onlineOrder) || (await integrateOnlineOrder(onlineOrder));
   if (!posOrder) return;
-  await markOrderDone(posOrder.orderNo);
+  await markOrderDone(getOrderIdentity(posOrder));
   try {
     await updateOnlineOrderDoc(onlineOrder, {
       status: "completed",
@@ -9507,7 +9540,7 @@ const voidOnlineOrderAndRestock = async (onlineOrder) => {
     alert("Make the online order in POS before cancelling.");
     return;
   }
-  await voidOrderAndRestock(posOrder.orderNo);
+  await voidOrderAndRestock(getOrderIdentity(posOrder));
   try {
     await updateOnlineOrderDoc(onlineOrder, {
       status: "cancelled",
@@ -9523,7 +9556,7 @@ const voidOnlineOrderToExpense = async (onlineOrder) => {
     alert("Make the online order in POS before returning it.");
     return;
   }
-  await voidOrderToExpense(posOrder.orderNo);
+  await voidOrderToExpense(getOrderIdentity(posOrder));
   try {
     await updateOnlineOrderDoc(onlineOrder, {
       status: "cancelled",
@@ -9533,20 +9566,19 @@ const voidOnlineOrderToExpense = async (onlineOrder) => {
     console.warn("Failed to update online order return status", err);
   }
 };
-const voidOrderAndRestock = async (orderNo) => {
+const voidOrderAndRestock = async (identity) => {
   if (!assertDeviceCanWrite("cancel orders")) return;
-  const ord = orders.find((o) => o.orderNo === orderNo);
+  const ord = orders.find((o) => getOrderIdentity(o) === identity);
   if (!ord) return;
   if (ord.done) return alert("This order is DONE and cannot be cancelled.");
   if (ord.voided) return alert("This order is already cancelled/returned.");
 
   const reasonRaw = await promptText(
-    `Reason for CANCEL (restock) — order #${orderNo}:`,
-    ""
+    `Reason for CANCEL (restock) — order #${ord.orderNo}:`
   );
   const reason = String(reasonRaw || "").trim();
   if (!reason) return alert("A reason is required.");
-  if (!window.confirm(`Cancel order #${orderNo} and restock inventory?`)) return;
+  if (!window.confirm(`Cancel order #${ord.orderNo} and restock inventory?`)) return;
   const giveBack = {};
   for (const line of ord.cart) {
     const uses = line.uses || {};
@@ -9575,7 +9607,7 @@ const voidOrderAndRestock = async (orderNo) => {
   const when = new Date();
   setOrders((o) =>
     o.map((x) =>
-      x.orderNo === orderNo
+      getOrderIdentity(x) === identity
         ? {
             ...x,
             voided: true,
@@ -9601,14 +9633,14 @@ const voidOrderAndRestock = async (orderNo) => {
       syncStatus: SYNC_STATUS.synced,
     };
     if (targetId) await updateOrderById(targetId, payload);
-    else await updateOrderByOrderNo(orderNo, payload, currentDayId);
+    else await updateOrderByOrderNo(ord.orderNo, payload, currentDayId);
   } catch (e) {
     console.warn("Cloud update (cancel/restock) failed:", e);
   }
 };
-const voidOrderToExpense = async (orderNo) => {
+const voidOrderToExpense = async (identity) => {
   if (!assertDeviceCanWrite("return orders")) return;
-  const ord = orders.find((o) => o.orderNo === orderNo);
+  const ord = orders.find((o) => getOrderIdentity(o) === identity);
   if (!ord) return;
   if (ord.done) return alert("This order is DONE and cannot be voided.");
   if (ord.voided) return alert("This order is already voided.");
@@ -9616,8 +9648,7 @@ const voidOrderToExpense = async (orderNo) => {
     return alert("This action is only for non Dine-in / Take-Away orders.");
   }
   const reasonRaw = await promptText(
-    `Reason for RETURN (no restock) — order #${orderNo}:`,
-    ""
+    `Reason for RETURN (no restock) — order #${ord.orderNo}:`
   );
   const reason = String(reasonRaw || "").trim();
   if (!reason) return alert("A reason is required.");
@@ -9627,13 +9658,13 @@ const voidOrderToExpense = async (orderNo) => {
     : Math.max(0, Number(ord.total || 0) - Number(ord.deliveryFee || 0));
 
   const ok = window.confirm(
-    `Void order #${orderNo} WITHOUT restock and add expense for wasted items (E£${itemsOnly.toFixed(2)})?`
+    `Void order #${ord.orderNo} WITHOUT restock and add expense for wasted items (E£${itemsOnly.toFixed(2)})?`
   );
   if (!ok) return;
   const when = new Date();
   const expRow = {
-    id: `exp_ret_${orderNo}_${Date.now()}`,
-    name: `Returned order #${orderNo} — ${ord.orderType || "-"}`,
+    id: `exp_ret_${ord.orderNo}_${Date.now()}`,
+    name: `Returned order #${ord.orderNo} — ${ord.orderType || "-"}`,
     unit: "order",
     qty: 1,
     unitPrice: itemsOnly,
@@ -9641,7 +9672,7 @@ const voidOrderToExpense = async (orderNo) => {
     date: when,
     locked: true,
     source: "order_return",
-    orderNo,
+    orderNo: ord.orderNo,
     createdAt: when,
     updatedAt: when,
     lastModifiedDeviceId: DEVICE_ID,
@@ -9650,7 +9681,7 @@ const voidOrderToExpense = async (orderNo) => {
   setExpenses((arr) => [expRow, ...arr]);
   setOrders((o) =>
     o.map((x) =>
-      x.orderNo === orderNo
+      getOrderIdentity(x) === identity
         ? {
             ...x,
             voided: true,
@@ -9675,7 +9706,7 @@ const voidOrderToExpense = async (orderNo) => {
         syncStatus: SYNC_STATUS.synced,
       };
       if (targetId) await updateOrderById(targetId, payload);
-      else await updateOrderByOrderNo(orderNo, payload, currentDayId);
+      else await updateOrderByOrderNo(ord.orderNo, payload, currentDayId);
     }
   } catch (e) {
     console.warn("Cloud update (void→expense) failed:", e);
@@ -13194,7 +13225,7 @@ const cogs = Number(
                       : displayZoneId || "";
                     return (
                       <li
-                        key={o.id}
+                        key={getOrderIdentity(o)}
                         style={{
                           border: `1px solid ${cardBorder}`,
                           borderRadius: 6,
@@ -13590,7 +13621,7 @@ const cogs = Number(
                       <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                         {!o.done && !o.voided && (
                           <button
-                            onClick={() => markOrderDone(o.orderNo)}
+                            onClick={() => markOrderDone(getOrderIdentity(o))}
                             disabled={!currentDeviceCanWrite}
                             style={{
                               background: currentDeviceCanWrite ? "#43a047" : "#9e9e9e",
@@ -13654,7 +13685,7 @@ const cogs = Number(
                         </button>
 
                         <button
-                          onClick={() => voidOrderAndRestock(o.orderNo)}
+                          onClick={() => voidOrderAndRestock(getOrderIdentity(o))}
                           disabled={o.done || o.voided || !currentDeviceCanWrite}
                           style={{
                             background: o.done || o.voided || !currentDeviceCanWrite ? "#ef9a9a" : "#c62828",
@@ -13670,7 +13701,7 @@ const cogs = Number(
 
                         {!o.done && !o.voided && isExpenseVoidEligible(o.orderType) && (
                           <button
-                            onClick={() => voidOrderToExpense(o.orderNo)}
+                            onClick={() => voidOrderToExpense(getOrderIdentity(o))}
                             disabled={!currentDeviceCanWrite}
                             style={{
                               background: currentDeviceCanWrite ? "#fb8c00" : "#ffb74d",

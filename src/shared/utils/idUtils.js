@@ -63,32 +63,41 @@ export function recordUpdatedMs(record) {
   return candidates.reduce((max, value) => Math.max(max, toMs(value)), 0);
 }
 
-export function orderDedupeKey(order = {}) {
-  const firstStrongKey = [
-    order.cloudId ? `cloud_${order.cloudId}` : "",
-    order.id ? `id_${order.id}` : "",
-    order.idemKey ? `idem_${order.idemKey}` : "",
-    order.onlineOrderId ? `online_id_${order.onlineOrderId}` : "",
-    order.onlineOrderKey ? `online_key_${order.onlineOrderKey}` : "",
-  ].find(Boolean);
-  if (firstStrongKey) return firstStrongKey;
+export function getOrderIdentity(order = {}) {
+  if (!order || typeof order !== "object") return "";
+
+  const strong =
+    order.orderKey ||
+    order.idemKey ||
+    order.cloudId ||
+    order.id;
+  if (strong) return String(strong);
 
   const dayKey = order.dayId || orderDayBucket(order);
-  if (order.channelOrderNo) return `channel_${dayKey}_${order.channelOrderNo}`;
-  if (order.orderNo != null) return `order_${dayKey}_${order.orderNo}`;
+  const ts = toMillis(order.date) || toMillis(order.createdAt) || 0;
   return [
     "fallback",
     dayKey,
-    toMillis(order.date) || toMillis(order.createdAt) || "",
+    order.orderNo != null ? String(order.orderNo) : "",
     order.worker || "",
-    order.total || "",
-  ].join("_");
+    order.payment || "",
+    order.orderType || "",
+    order.total != null ? String(order.total) : "",
+    String(ts || ""),
+  ]
+    .filter(Boolean)
+    .join("_");
+}
+
+export function orderDedupeKey(order = {}) {
+  return getOrderIdentity(order);
 }
 
 export function dedupeOrders(list) {
   const byKey = new Map();
   for (const o of list || []) {
-    const key = orderDedupeKey(o);
+    if (!o || typeof o !== "object") continue;
+    const key = getOrderIdentity(o);
     const prev = byKey.get(key);
     const currentUpdated = recordUpdatedMs(o) || toMillis(o.date) || 0;
     const previousUpdated = recordUpdatedMs(prev) || toMillis(prev?.date) || 0;
