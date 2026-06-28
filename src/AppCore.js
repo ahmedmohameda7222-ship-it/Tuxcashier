@@ -5233,25 +5233,6 @@ const [lastLocalEditAt, setLastLocalEditAt] = useState(0);
         }
       }
 
-      if (requiresCleanDevice && !isCurrentDevice) {
-        const targetDevice = syncDevices.find((d) => d.deviceId === deviceId);
-        const targetReady = targetDevice?.writeReadyAt || targetDevice?.localResetAt;
-        let dbReady = false;
-        if (!targetReady) {
-          const dbDevice = await findDeviceRow(deviceId);
-          dbReady = !!dbDevice && !!(dbDevice.write_ready_at || dbDevice.local_reset_at);
-          console.log("[updateDeviceMode] !isCurrentDevice fallback:", {
-            deviceId,
-            targetReady,
-            dbDeviceFound: !!dbDevice,
-            dbReady,
-          });
-        }
-        if (!targetReady && !dbReady) {
-          alert("That device must be cleaned or marked clean first. Use Mark clean in Connected Devices, or open that device and run Clean local data for Write/Admin.");
-          return;
-        }
-      }
       try {
         const updated = await updateDeviceRecord(deviceId, {
           mode,
