@@ -542,7 +542,7 @@ function markCurrentDeviceWriteReady() {
 
 const DEVICE_MODE_OPTIONS = [
   { value: "listen", label: "Listen only", canListen: true, canWrite: false, canAdmin: false },
-  { value: "write_only", label: "Write only", canListen: false, canWrite: true, canAdmin: false },
+  { value: "write", label: "Write only", canListen: false, canWrite: true, canAdmin: false },
   { value: "read_write", label: "Listen + write", canListen: true, canWrite: true, canAdmin: false },
   { value: "admin", label: "Admin device", canListen: true, canWrite: true, canAdmin: true },
 ];
@@ -3665,7 +3665,7 @@ async function upsertDeviceHeartbeat(status = {}) {
   const now = new Date().toISOString();
   const existing = await findDeviceRow(DEVICE_ID).catch(() => null);
   const normalizedExistingMode =
-    ["listen", "write_only", "read_write", "admin"].includes(existing?.mode)
+    ["listen", "write", "read_write", "admin"].includes(existing?.mode)
       ? existing.mode
       : "";
   const mode = normalizedExistingMode || "listen";
@@ -5217,7 +5217,7 @@ const [lastLocalEditAt, setLastLocalEditAt] = useState(0);
         alert("Admin unlock required to manage connected devices.");
         return;
       }
-      const requiresCleanDevice = ["write_only", "read_write", "admin"].includes(mode);
+      const requiresCleanDevice = ["write", "read_write", "admin"].includes(mode);
       const isCurrentDevice = deviceId === DEVICE_ID;
 
       if (requiresCleanDevice && isCurrentDevice) {
