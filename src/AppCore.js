@@ -5249,7 +5249,7 @@ const [lastLocalEditAt, setLastLocalEditAt] = useState(0);
         alert(`Device update failed: ${String(err?.message || err)}`);
       }
     },
-    [canManageConnectedDevices, dayMeta.currentWorker, refreshDevices, syncDevices, currentDevice]
+    [canManageConnectedDevices, dayMeta.currentWorker, refreshDevices, currentDevice]
   );
     const renameDevice = useCallback(
     async (deviceId, label) => {
