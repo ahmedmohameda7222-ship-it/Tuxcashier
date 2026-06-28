@@ -5959,7 +5959,10 @@ const writeFullStateToCloud = useCallback(
       currentLocalState.workerSessions = mergeByIdPreferNewest(currentLocalState.workerSessions, unpacked.workerSessions, { fallbackPrefix: "worker_session" });
       currentLocalState.bankTx = mergeByIdPreferNewest(currentLocalState.bankTx, unpacked.bankTx, { fallbackPrefix: "bank_tx" });
       currentLocalState.reconHistory = mergeByIdPreferNewest(currentLocalState.reconHistory, unpacked.reconHistory, { fallbackPrefix: "recon" });
-      currentLocalState.historicalOrders = dedupeOrders([currentLocalState.historicalOrders, unpacked.historicalOrders]);
+      currentLocalState.historicalOrders = dedupeOrders([
+        ...(currentLocalState.historicalOrders || []),
+        ...(unpacked.historicalOrders || []),
+      ]);
       currentLocalState.historicalExpenses = mergeByIdPreferNewest(currentLocalState.historicalExpenses, unpacked.historicalExpenses, { fallbackPrefix: "h_expense" });
       currentLocalState.historicalPurchases = mergeByIdPreferNewest(currentLocalState.historicalPurchases, unpacked.historicalPurchases, { fallbackPrefix: "h_purchase" });
 
@@ -8873,6 +8876,7 @@ const checkout = async () => {
     let optimisticNo = nextOrderNo;
 
     const shouldWhatsapp = false;
+    const syncKey = `sync_${DEVICE_ID}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     let order = enrichOrderWithChannel({
       orderNo: optimisticNo,
       dayId: currentDayId,
@@ -8906,8 +8910,8 @@ const checkout = async () => {
       restockedAt: undefined,
       note: orderNote.trim(),
       id: generateUniqueOrderId(),
-      orderKey: `ok_${DEVICE_ID}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-      idemKey: `idk_${DEVICE_ID}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      orderKey: syncKey,
+      idemKey: syncKey,
       source: "onsite",
     });
     recordCustomerFromOrder(order);
@@ -9174,9 +9178,10 @@ const onlineFallbackId =
     onlineDeliveryZoneName
   );
 
+  const syncKey = onlineOrder.idemKey || `sync_${DEVICE_ID}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   let posOrder = enrichOrderWithChannel({
     id: generateUniqueOrderId(),
-    orderKey: `ok_${DEVICE_ID}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    orderKey: syncKey,
     orderNo,
     dayId: currentDayId,
     shiftStartedAt: dayMeta.startedAt,
@@ -9210,9 +9215,7 @@ const onlineFallbackId =
     voided: false,
     restockedAt: undefined,
     note: onlineOrder.note || "",
-    idemKey:
-      onlineOrder.idemKey ||
-      `online_${DEVICE_ID}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    idemKey: syncKey,
     source: "online",
     channel: "online",
     channelOrderNo: channelRef,
