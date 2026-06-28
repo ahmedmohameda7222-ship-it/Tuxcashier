@@ -4264,41 +4264,6 @@ async function previewReceiptHTML(order, widthMm = 80, copy = "Preview", images)
   }
   return { success: openReceiptPreviewWindow(html) };
 }
-function getReconciliationOrders(rec, allOrders, allHistoricalOrders) {
-  if (!rec) return [];
-  const recDayId = rec.dayId || "";
-  const recStart = rec.dayStartedAt ? new Date(rec.dayStartedAt).getTime() : 0;
-  const recEnd = rec.at ? new Date(rec.at).getTime() : Date.now();
-
-  const all = [...(allOrders || []), ...(allHistoricalOrders || [])];
-  const included = all.filter((o) => {
-    if (o.dayId && recDayId) return o.dayId === recDayId;
-    const d = new Date(o.date || o.createdAt || o.updatedAt || 0).getTime();
-    return !Number.isNaN(d) && d >= recStart && d <= recEnd;
-  });
-
-  const seen = new Set();
-  const unique = [];
-  for (const o of included) {
-    const id = getOrderIdentity(o);
-    if (!seen.has(id)) {
-      seen.add(id);
-      unique.push(o);
-    }
-  }
-
-  return unique.sort((a, b) => {
-    const getTs = (o) => {
-      const d = new Date(o.date || o.createdAt || o.updatedAt || 0);
-      return Number.isNaN(d.getTime()) ? 0 : d.getTime();
-    };
-    const tsA = getTs(a);
-    const tsB = getTs(b);
-    if (tsB !== tsA) return tsB - tsA;
-    return (Number(b.orderNo) || 0) - (Number(a.orderNo) || 0);
-  });
-}
-
 const searchCustomersByQuery = (rows = [], query = "") => {
   const q = String(query || "").trim();
   if (!q) return rows;
@@ -15223,7 +15188,10 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
         <div style={{ opacity:.7 }}>No saved sessions yet.</div>
       ) : (
         <div style={{ display:"grid", gap:12 }}>
-          {reconHistory.map(rec => (
+          {reconHistory.slice().sort((a, b) => {
+              const getTs = (r) => new Date(r.at || r.savedAt || r.reconciledAt || 0).getTime();
+              return getTs(b) - getTs(a);
+            }).map(rec => (
             <div key={rec.id} style={{ border:`1px solid ${cardBorder}`, borderRadius:10, padding:12, background:dark?"#1d1d1d":"#fff" }}>
               <div style={{ display:"flex", alignItems:"center", gap:8 }}>
                 <strong>Saved by:</strong> {rec.savedBy}
@@ -15272,48 +15240,6 @@ const purchasesInPeriod = (allPurchases || []).filter(p => {
                     })}
                   </tbody>
                 </table>
-                {(() => {
-                  const reconOrders = getReconciliationOrders(rec, orders, historicalOrders);
-                  if (!reconOrders.length) return null;
-                  return (
-                    <div style={{ marginTop: 12 }}>
-                      <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 6, opacity: 0.9 }}>Orders ({reconOrders.length})</div>
-                      <div style={{ display: "grid", gap: 4 }}>
-                        {reconOrders.map((o) => {
-                          const statusLabel = o.voided
-                            ? (o.restockedAt ? "Cancelled" : "Returned")
-                            : (o.done ? "Done" : "Pending");
-                          return (
-                            <div
-                              key={getOrderIdentity(o)}
-                              style={{
-                                display: "flex",
-                                alignItems: "center",
-                                gap: 8,
-                                padding: "6px 8px",
-                                borderRadius: 6,
-                                background: dark ? "#252525" : "#f5f5f5",
-                                fontSize: 12,
-                              }}
-                            >
-                              <span style={{ fontWeight: 700, minWidth: 40 }}>#{o.orderNo}</span>
-                              <span style={{ opacity: 0.8 }}>{fmtDateTime(o.date || o.createdAt)}</span>
-                              <span>{o.worker || "—"}</span>
-                              <span style={{ marginLeft: "auto", fontWeight: 700 }}>E£{Number(o.total || 0).toFixed(2)}</span>
-                              <span style={{
-                                fontSize: 11,
-                                padding: "2px 6px",
-                                borderRadius: 4,
-                                background: o.voided ? (o.restockedAt ? "#b71c1c" : "#e65100") : (o.done ? "#1b5e20" : "#757575"),
-                                color: "#fff",
-                              }}>{statusLabel}</span>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  );
-                })()}
               </div>
             </div>
           ))}
