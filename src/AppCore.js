@@ -5236,13 +5236,20 @@ const [lastLocalEditAt, setLastLocalEditAt] = useState(0);
       if (requiresCleanDevice && !isCurrentDevice) {
         const targetDevice = syncDevices.find((d) => d.deviceId === deviceId);
         const targetReady = targetDevice?.writeReadyAt || targetDevice?.localResetAt;
+        let dbReady = false;
         if (!targetReady) {
-          // Fallback: check Supabase directly in case syncDevices is stale
           const dbDevice = await findDeviceRow(deviceId);
-          if (!dbDevice?.write_ready_at) {
-            alert("That device must be cleaned or marked clean first. Use Mark clean in Connected Devices, or open that device and run Clean local data for Write/Admin.");
-            return;
-          }
+          dbReady = !!dbDevice && !!(dbDevice.write_ready_at || dbDevice.local_reset_at);
+          console.log("[updateDeviceMode] !isCurrentDevice fallback:", {
+            deviceId,
+            targetReady,
+            dbDeviceFound: !!dbDevice,
+            dbReady,
+          });
+        }
+        if (!targetReady && !dbReady) {
+          alert("That device must be cleaned or marked clean first. Use Mark clean in Connected Devices, or open that device and run Clean local data for Write/Admin.");
+          return;
         }
       }
       try {
@@ -5300,17 +5307,22 @@ const [lastLocalEditAt, setLastLocalEditAt] = useState(0);
       }
       try {
         const now = new Date().toISOString();
+        console.log("[markDeviceClean] updating device:", deviceId);
         const updated = await updateDeviceRecord(deviceId, {
           writeReadyAt: now,
           localResetAt: now,
           approvedBy: dayMeta.currentWorker || "Admin",
         });
-        if (updated) {
-          setSyncDevices((list) =>
-            list.map((device) => (device.deviceId === updated.deviceId ? updated : device))
-          );
+        console.log("[markDeviceClean] update result:", updated ? "success" : "null (no row matched)");
+        if (!updated) {
+          alert("Mark clean failed: device not found in registry. Refresh and try again.");
+          return;
         }
+        setSyncDevices((list) =>
+          list.map((device) => (device.deviceId === updated.deviceId ? updated : device))
+        );
         await refreshDevices();
+        alert("Device marked as clean. It can now be switched to write mode without losing local data.");
       } catch (err) {
         console.warn("Mark device clean failed:", err);
         alert(`Mark device clean failed: ${String(err?.message || err)}`);
