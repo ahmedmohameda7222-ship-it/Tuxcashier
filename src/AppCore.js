@@ -5237,8 +5237,12 @@ const [lastLocalEditAt, setLastLocalEditAt] = useState(0);
         const targetDevice = syncDevices.find((d) => d.deviceId === deviceId);
         const targetReady = targetDevice?.writeReadyAt || targetDevice?.localResetAt;
         if (!targetReady) {
-          alert("That device must be cleaned or marked clean first. Use Mark clean in Connected Devices, or open that device and run Clean local data for Write/Admin.");
-          return;
+          // Fallback: check Supabase directly in case syncDevices is stale
+          const dbDevice = await findDeviceRow(deviceId);
+          if (!dbDevice?.write_ready_at) {
+            alert("That device must be cleaned or marked clean first. Use Mark clean in Connected Devices, or open that device and run Clean local data for Write/Admin.");
+            return;
+          }
         }
       }
       try {
