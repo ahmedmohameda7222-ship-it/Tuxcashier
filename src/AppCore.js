@@ -6677,15 +6677,13 @@ useEffect(() => {
   const endedAtMs = dayMeta?.endedAt
     ? new Date(dayMeta.endedAt).getTime()
     : null;
-  const activeShiftIsStale =
-    !!startedAtMs && !endedAtMs && Date.now() - startedAtMs > MAX_ACTIVE_SHIFT_MS;
   useEffect(() => {
     if (!realtimeOrders || !ordersColRef || !fbUser) return;
     if (!currentDeviceCanListen) {
       setOrders((prev) => prev.filter((order) => order?.syncStatus === SYNC_STATUS.pending));
       return;
     }
-    if (!startedAtMs || endedAtMs || activeShiftIsStale) {
+    if (!startedAtMs || endedAtMs) {
       setOrders((prev) => prev.filter((order) => order?.syncStatus === SYNC_STATUS.pending));
       return;
     }
@@ -6724,7 +6722,6 @@ useEffect(() => {
     startedAtMs,
     endedAtMs,
     currentDayId,
-    activeShiftIsStale,
     currentDeviceCanListen,
   ]);
 const recomputeOnlineOrders = useCallback(() => {
@@ -13087,19 +13084,6 @@ const cogs = Number(
               }}
             >
               This device is set to {currentDeviceModeMeta.label} and cannot listen to live orders.
-            </div>
-          )}
-          {activeShiftIsStale && (
-            <div
-              style={{
-                marginBottom: 10,
-                padding: 10,
-                borderRadius: 6,
-                background: dark ? "#3a2512" : "#fff3e0",
-                border: `1px solid ${dark ? "#8d6e63" : "#ffcc80"}`,
-              }}
-            >
-              This shift started on {dayMeta.startedAt ? fmtDateTime(dayMeta.startedAt) : "-"} and is over 24 hours old. End it or start a fresh shift before loading live orders.
             </div>
           )}
           <div
