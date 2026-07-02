@@ -526,7 +526,6 @@ async function sendEmailJsEmail(templateParams = {}) {
 const SHOP_ID = "tux";
 const POS_STATE_ID = "pos";
 const ONLINE_ORDER_COLLECTIONS = [];
-const MAX_ACTIVE_SHIFT_MS = 24 * 60 * 60 * 1000;
 
 const LS_KEY = "tux_pos_local_state_v1";
 const DEVICE_ID = getDeviceId();
@@ -3389,15 +3388,14 @@ async function loadCompleteCloudState() {
       (remoteStartedAt && !Number.isNaN(+remoteStartedAt)
         ? `day_${remoteStartedAt.getTime()}`
         : "");
-    const activeRemoteShift =
-      remoteStartedAt &&
-      !Number.isNaN(+remoteStartedAt) &&
-      !remoteEndedAt &&
-      Date.now() - remoteStartedAt.getTime() <= MAX_ACTIVE_SHIFT_MS;
+const hasRemoteShift =
+  remoteStartedAt &&
+  !Number.isNaN(+remoteStartedAt) &&
+  !remoteEndedAt;
 
-    cloudOrders = activeRemoteShift
-      ? await loadOrders(remoteStartedAt, null, remoteDayId)
-      : [];
+cloudOrders = hasRemoteShift
+  ? await loadOrders(remoteStartedAt, null, remoteDayId)
+  : [];
   } catch (err) {
     warnings.push(`orders read failed: ${String(err?.message || err)}`);
   }
