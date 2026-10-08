@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
 import { isSupabaseConfigured, supabase } from "./supabaseClient";
+import { getCheckoutDeviceAccess } from "./checkoutPolicy";
 import { getDeviceId } from "./services/deviceId";
 import {
   deleteLocalDatabase,
@@ -5207,11 +5208,15 @@ const [lastLocalEditAt, setLastLocalEditAt] = useState(0);
   );
   const currentDeviceMode = currentDevice?.mode || "listen";
     const currentDeviceModeMeta = getDeviceModeMeta(currentDeviceMode);
-  const currentDeviceCanListen =
-    currentDeviceModeMeta.canListen || currentDeviceModeMeta.canAdmin || !!deviceStatus.error;
-  const currentDeviceCanWrite =
-    currentDeviceModeMeta.canWrite || currentDeviceModeMeta.canAdmin || !!deviceStatus.error;
-  const currentDeviceCanAdmin = currentDeviceModeMeta.canAdmin || !!deviceStatus.error;
+  const deviceAccess = getCheckoutDeviceAccess({
+    device: currentDevice,
+    modeMeta: currentDeviceModeMeta,
+    supabaseConfigured: isSupabaseConfigured,
+    deviceRegistryError: deviceStatus.error,
+  });
+  const currentDeviceCanListen = deviceAccess.canListen;
+  const currentDeviceCanWrite = deviceAccess.canWrite;
+  const currentDeviceCanAdmin = deviceAccess.canAdmin;
   const canManageConnectedDevices = adminUnlocked;
     const assertDeviceCanWrite = useCallback(
     (actionLabel = "write to the system") => {
@@ -6678,7 +6683,7 @@ useEffect(() => {
     ? new Date(dayMeta.endedAt).getTime()
     : null;
   useEffect(() => {
-    if (!realtimeOrders || !ordersColRef || !fbUser) return;
+    if (!cloudEnabled || !realtimeOrders || !ordersColRef || !fbUser) return;
     if (!currentDeviceCanListen) {
       setOrders((prev) => prev.filter((order) => order?.syncStatus === SYNC_STATUS.pending));
       return;
@@ -6717,6 +6722,7 @@ useEffect(() => {
     };
   }, [
     realtimeOrders,
+    cloudEnabled,
     ordersColRef,
     fbUser,
     startedAtMs,
@@ -8426,6 +8432,7 @@ const endDay = async () => {
     alert(`Day ended by ${endBy}. Report downloaded and history preserved ✅`);
   };
   const [isCheckingOut, setIsCheckingOut] = useState(false);
+  const checkoutInFlightRef = useRef(false);
 const multiplyUses = (uses = {}, factor = 1) => {
   const out = {};
   for (const k of Object.keys(uses)) out[k] = Number(uses[k] || 0) * factor;
@@ -8740,7 +8747,8 @@ const buildCurrentReceiptOrder = () => {
   });
 };
 const checkout = async () => {
-  if (isCheckingOut) return;
+  if (checkoutInFlightRef.current) return;
+  checkoutInFlightRef.current = true;
   setIsCheckingOut(true);
   try {
     if (!assertDeviceCanWrite("create orders")) return;
@@ -8830,10 +8838,6 @@ const checkout = async () => {
         });
       }
     }
-    if (newLedgerItems.length > 0) {
-      setInventoryLedger(prev => [...prev, ...newLedgerItems]);
-    }
-
     const itemsTotal = roundMoney(Math.max(0, cartItemsSubtotal - currentDiscountAmount));
     const delFee = currentDeliveryFee;
     const discountPercentage = 0;
@@ -8871,6 +8875,10 @@ const checkout = async () => {
       cashVal = Number(cashReceived || 0);
       changeDue = Math.max(0, cashVal - total);
     }
+    if (newLedgerItems.length > 0) {
+      setInventoryLedger(prev => [...prev, ...newLedgerItems]);
+    }
+
     let optimisticNo = nextOrderNo;
 
     const shouldWhatsapp = false;
@@ -8971,6 +8979,7 @@ const checkout = async () => {
     setAmtA(0); setAmtB(0);
     setCashReceivedSplit(0);
  } finally {
+    checkoutInFlightRef.current = false;
     setIsCheckingOut(false);
   }
 };
