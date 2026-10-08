@@ -5993,9 +5993,9 @@ useEffect(() => {
     ? new Date(dayMeta.endedAt).getTime()
     : null;
   useEffect(() => {
-    if (!realtimeOrders || !ordersColRef || !fbUser) return;
+    if (!cloudEnabled || !realtimeOrders || !ordersColRef || !fbUser) return;
     if (!startedAtMs) {
-      setOrders([]);
+      setOrders(prev => prev.filter(o => o.syncStatus === SYNC_STATUS.pending));
       return;
     }
     let active = true;
@@ -6003,7 +6003,10 @@ useEffect(() => {
     const refreshOrders = async () => {
       try {
         const arr = await loadOrders(new Date(startedAtMs), endedAtMs ? new Date(endedAtMs) : null);
-        if (active) setOrders(dedupeOrders(arr).map(enrichOrderWithChannel));
+        if (active) setOrders(prev => {
+          const pending = prev.filter(o => o.syncStatus === SYNC_STATUS.pending);
+          return dedupeOrders([...pending, ...arr]).map(enrichOrderWithChannel);
+        });
       } catch (err) {
         console.warn("Realtime orders load failed:", err);
         setCloudStatus((s) => ({ ...s, error: String(err) }));
@@ -6020,7 +6023,7 @@ useEffect(() => {
       if (refreshTimer) window.clearTimeout(refreshTimer);
       unsub();
     };
-  }, [realtimeOrders, ordersColRef, fbUser, startedAtMs, endedAtMs]);
+  }, [realtimeOrders, cloudEnabled, ordersColRef, fbUser, startedAtMs, endedAtMs]);
 const recomputeOnlineOrders = useCallback(() => {
     const sources = onlineOrderSourcesRef.current || {};
     const merged = Object.values(sources).flat();
@@ -7598,6 +7601,7 @@ const endDay = async () => {
     alert(`Day ended by ${endBy}. Report downloaded and history preserved ✅`);
   };
   const [isCheckingOut, setIsCheckingOut] = useState(false);
+  const checkoutInFlightRef = useRef(false);
 const multiplyUses = (uses = {}, factor = 1) => {
   const out = {};
   for (const k of Object.keys(uses)) out[k] = Number(uses[k] || 0) * factor;
@@ -7919,7 +7923,8 @@ const previewCurrentReceipt = async () => {
   );
 };
 const checkout = async () => {
-  if (isCheckingOut) return;
+  if (checkoutInFlightRef.current) return;
+  checkoutInFlightRef.current = true;
   setIsCheckingOut(true);
   try {
     if (!dayMeta.startedAt || dayMeta.endedAt)
@@ -7994,13 +7999,6 @@ const checkout = async () => {
         );
       }
     }
-    setInventory((inv) =>
-      inv.map((it) => {
-        const need = Number(required[it.id] || 0);
-        return need ? { ...it, qty: it.qty - need } : it;
-      })
-    );
-
     const itemsTotal = roundMoney(Math.max(0, cartItemsSubtotal - currentDiscountAmount));
     const delFee = currentDeliveryFee;
     const discountPercentage = 0;
@@ -8038,6 +8036,13 @@ const checkout = async () => {
       cashVal = Number(cashReceived || 0);
       changeDue = Math.max(0, cashVal - total);
     }
+    setInventory((inv) =>
+      inv.map((it) => {
+        const need = Number(required[it.id] || 0);
+        return need ? { ...it, qty: it.qty - need } : it;
+      })
+    );
+
     let optimisticNo = nextOrderNo;
 
     const shouldWhatsapp = false;
@@ -8099,7 +8104,7 @@ const checkout = async () => {
         const ref = await addOrder(order);
         setOrders((prev) =>
           prev.map((oo) =>
-            oo.orderNo === order.orderNo ? { ...oo, cloudId: ref.id, syncStatus: SYNC_STATUS.synced } : oo
+            oo.idemKey === order.idemKey ? { ...oo, cloudId: ref.id, syncStatus: SYNC_STATUS.synced } : oo
           )
         );
       } catch (e) {
@@ -8131,6 +8136,7 @@ const checkout = async () => {
     setAmtA(0); setAmtB(0);
     setCashReceivedSplit(0);
  } finally {
+    checkoutInFlightRef.current = false;
     setIsCheckingOut(false);
   }
 };
