@@ -1,0 +1,30 @@
+name: Legacy cashier checkout
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'test/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/legacy-checkout.yml'
+  workflow_dispatch:
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Checkout regression tests
+        run: node --test test/legacy-checkout-regression.test.cjs
+      - name: Existing application tests
+        run: CI=true npm test -- --watch=false --runInBand
+      - name: Production bundle
+        run: CI=false npm run build
